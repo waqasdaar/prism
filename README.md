@@ -35,6 +35,19 @@ If you've ever needed to:
 | tc / netem (optional)                          | Congestion simulation                                |
 | Root / sudo                                    | VRF sysctl tuning, netem rules, binding to low ports |
 
+### Installation
+
+```
+# Clone the repository
+git clone https://github.com/waqasdaar/iperf3-traffic-manager.git
+cd iperf3-traffic-manager
+
+# Make executable
+chmod +x iperf3_manager.sh
+
+# Run (sudo recommended for VRF/DSCP/netem features)
+sudo ./iperf3_manager.sh
+```
 ### Use Case 1: Basic Bandwidth Testing (Single Stream)
 
 #### Scenario
