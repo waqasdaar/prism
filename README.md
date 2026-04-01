@@ -290,3 +290,77 @@ Running test with: bbr
 **Why This Matters**
 
 BBR (Bottleneck Bandwidth and Round-trip propagation time) often outperforms loss-based algorithms on paths with high bandwidth-delay products. But the difference is environment-specific. This feature lets you measure it directly on your network in seconds.
+
+#### Use Case 5: Network Impairment Simulation
+
+##### Scenario
+
+You need to test how your application performs under degraded network conditions — added latency (simulating WAN distance), jitter, or packet loss. The script integrates with Linux tc and netem to add these impairments to an interface during testing.
+
+##### How to Run
+
+Select Option 5: **Congestion Simulation (tc/netem)**.
+```
+=== Congestion Simulation with tc/netem ===
+
+Available interfaces:
+  1) ens192    10.10.10.1    (global)
+  2) ens224    10.20.20.1    (vrf: vrf10)
+Enter interface number: 1
+
+Enter added delay in ms [0]: 50
+Enter jitter in ms [0]: 10
+Enter packet loss percentage [0]: 1
+
+Applying: tc qdisc add dev ens192 root netem delay 50ms 10ms loss 1%
+
+[OK] Impairments applied to ens192
+     Delay: 50ms ± 10ms jitter, 1% loss
+
+Now run your iperf3 test (Options 2 or 3) to measure impact.
+Press Enter when done to remove impairments...
+
+Removing: tc qdisc del dev ens192 root netem
+[OK] Impairments removed from ens192
+```
+**Practical Example**
+
+__Without impairment__:
+```
+TCP throughput: 940 Mbits/sec, RTT: 0.5ms, retransmits: 0
+```
+__With 50ms delay + 1% loss__:
+```
+TCP throughput: 312 Mbits/sec, RTT: 50.5ms, retransmits: 847
+```
+This clearly demonstrates how even small amounts of loss on a high-latency link devastate TCP throughput — invaluable for capacity planning discussions.
+
+#### Use Case 6: Real-Time Bandwidth Monitoring
+##### Scenario
+You have multiple streams running and want a live dashboard showing per-stream throughput with visual bar graphs, updating in-place without scrolling.
+###### How to Run
+Select Option 4: **Bandwidth Monitor while streams are running**.
+
+__Sample Display__
+```
+╔══════════════════════════════════════════════════════════════╗
+║                  Real-Time Bandwidth Monitor                 ║
+║                  Refresh: every 1 second                     ║
+╠══════════════════════════════════════════════════════════════╣
+║                                                              ║
+║  Stream 1 (port 5201) TCP EF                                 ║
+║  [ ████████████████████████████░░ ]  94.2 Mbits/s            ║
+║                                                              ║
+║  Stream 2 (port 5202) TCP AF21                               ║
+║  [ ████████████████████░░░░░░░░░░ ]  67.8 Mbits/s            ║
+║                                                              ║
+║  Stream 3 (port 5203) TCP BE                                 ║
+║  [ ██████████░░░░░░░░░░░░░░░░░░░░ ]  33.1 Mbits/s            ║
+║                                                              ║
+╚══════════════════════════════════════════════════════════════╝
+  Press Ctrl+C to stop monitoring
+```
+The display uses ANSI cursor control (\033[1A\033[2K) to update in-place — no scrolling, clean visual.
+
+
+
