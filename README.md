@@ -1,4 +1,4 @@
-# iperf3 Multi-Stream Traffic Manager 
+# iperf3 Traffic Stream 
 
 The iperf3 traffic stream is an interactive Bash script that wraps the standard iperf3 network testing tool with enterprise-grade capabilities. It transforms iperf3 from a simple point-to-point bandwidth tester into a comprehensive network validation platform.
 
