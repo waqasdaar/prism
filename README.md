@@ -203,3 +203,90 @@ iperf3 -c 10.10.10.2 -p 5203 -t 60 -b 10M -S 0 &
 ```
 And you'd need to remember that DSCP EF = 46, TOS = 184, the -S flag takes TOS not DSCP, etc. The script handles all of this mapping automatically from the 22-entry DSCP reference table.
 
+### Use Case 3: VRF-Aware Traffic Testing
+
+#### Scenario
+Your Linux host participates in multiple VRFs (e.g., vrf10 for management traffic, vrf20 for production traffic). You need to run iperf3 tests that are bound to specific VRFs to validate routing isolation and per-VRF bandwidth.
+
+##### The Problem Without This Tool
+Manually running iperf3 in a VRF requires:
+```
+# Start server in vrf10
+ip vrf exec vrf10 iperf3 -s -p 5201 --bind 10.20.20.1 &
+# Start client in vrf10
+ip vrf exec vrf10 iperf3 -c 10.20.20.2 -p 5201 --bind 10.20.20.1 -t 30 &
+```
+And you need to remember to:
+
+1. Set sysctl net.ipv4.tcp_l3mdev_accept=1 and udp_l3mdev_accept=1
+2. Use ip vrf exec wrapping
+3. Bind to the correct interface IP within that VRF
+4. Not accidentally use a global-table interface
+
+###### How the Script Handles It
+The script automatically detects VRFs using three methods:
+
+1. ip vrf show (if available)
+2. ip -d link show type vrf + ip link show master <vrf>
+3. Per-interface master device check with vrf table verification
+4. 
+When you select an interface, the script shows its VRF membership:
+```
+Available interfaces:
+  1) ens192    10.10.10.1    (global)
+  2) ens224    10.20.20.1    (vrf: vrf10)
+  3) ens256    10.30.30.1    (vrf: vrf20)
+Enter interface number: 2
+Binding to 10.20.20.1 on ens224 (VRF: vrf10)
+```
+The generated iperf3 command is automatically wrapped:
+
+```
+[WARN] sysctl net.ipv4.tcp_l3mdev_accept is not set to 1
+       VRF-aware iperf3 may fail without this setting.
+       Fix now? [Y/n]: y
+[OK] Set net.ipv4.tcp_l3mdev_accept = 1
+```
+#### Use Case 4: Congestion Algorithm Comparison
+
+##### Scenario
+You're evaluating whether switching from TCP Cubic to BBR would improve throughput on a high-latency WAN link. You want a side-by-side comparison.
+
+###### How to Run
+Select Option 6: Compare Congestion Algorithms.
+
+```
+=== Congestion Algorithm Comparison ===
+
+Available congestion control algorithms on this system:
+  cubic  reno  bbr
+
+Enter server IP: 10.10.10.2
+Enter base port [5201]: 5201
+Enter duration per test [10]: 30
+Enter bandwidth [0 = unlimited]: 100M
+
+Running test with: cubic
+  → iperf3 -c 10.10.10.2 -p 5201 -t 30 -b 100M -C cubic
+  Result: 94.2 Mbits/sec avg
+
+Running test with: reno
+  → iperf3 -c 10.10.10.2 -p 5202 -t 30 -b 100M -C reno
+  Result: 87.6 Mbits/sec avg
+
+Running test with: bbr
+  → iperf3 -c 10.10.10.2 -p 5203 -t 30 -b 100M -C bbr
+  Result: 98.1 Mbits/sec avg
+
+=== Comparison Summary ===
+┌────────────┬──────────────────┐
+│ Algorithm  │ Avg Throughput   │
+├────────────┼──────────────────┤
+│ cubic      │   94.2 Mbits/sec │
+│ reno       │   87.6 Mbits/sec │
+│ bbr        │   98.1 Mbits/sec │
+└────────────┴──────────────────┘
+```
+**Why This Matters**
+
+BBR (Bottleneck Bandwidth and Round-trip propagation time) often outperforms loss-based algorithms on paths with high bandwidth-delay products. But the difference is environment-specific. This feature lets you measure it directly on your network in seconds.
