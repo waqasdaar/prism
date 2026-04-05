@@ -347,3 +347,89 @@ Typical scenarios:
 - Cabling or switch troubleshooting
 - Validating link capacity
 
+__Configuration__
+
+| **Parameters** | **Value**    |
+|----------------|--------------|
+| Protocol       | TCP          |
+| Target         | 192.168.1.10 |
+| Port           | 5201         |
+| Bandwidth      | unlimited    |
+| Duration       | 30 seconds   |
+| DSCP           | none         |
+
+**Running the Test**
+
+__Server host__ — **192.168.1.10**
+
+```
+Select [1-6]: 2
+Selection [0]: 0
+How many listeners? [1]: 1
+Listen port [5201]: 5201
+Bind IP: Enter
+VRF: Enter
+One-off mode? [no]: n
+Launch 1 listener(s)? [Y/n]: Y
+
+[STARTED]  server 1  PID 22100  port 5201
+
+  Servers running. Opening dashboard...
+
+```
+
+**Client Host**
+
+```
+Select [1-6]: 3
+Selection [0]: 0
+How many streams? [1]: 1
+Protocol [TCP/UDP]: TCP
+Target server IP/hostname: 192.168.1.10
+Server port [5201]: 5201
+Bandwidth limit (empty=unlimited):
+Duration seconds [10]: 30
+DSCP: Enter
+Parallel threads [1]: 1
+Reverse mode? [no]: n
+Launch 1 stream(s)? [Y/n]: Y
+
+[STARTED]  stream 1  PID 376758  TCP -> 192.168.1.10:5201
+
+  Streams running. Opening dashboard...
+
+```
+
+**Live Dashboard**
+
+```
++==============================================================================+
+|                   iperf3 Traffic Manager -- Live Dashboard                   |
++==============================================================================+
+|  Active:1   Connected:1   Done:0   Failed:0   Elapsed:00:08                  |
++------------------------------------------------------------------------------+
+|  #    Proto  Target         Port   Bandwidth    Time    DSCP   Status        |
++------------------------------------------------------------------------------+
+|  1    TCP    192.168.1.10   5201   941.22 Mbps  00:22   ---    CONNECTED     |
++------------------------------------------------------------------------------+
+|  Ctrl+C to stop all streams                                                  |
++------------------------------------------------------------------------------+
+```
+
+**Final Results**
+
+```
++==============================================================================+
+|                                Final Results                                 |
++==============================================================================+
+
+  #    Proto  Target            Port   Sender BW     Receiver BW   Retx
+  --------------------------------------------------------------------------------
+  1    TCP    192.168.1.10      5201   941.22 Mbps   938.55 Mbps   Retx:2
+  --------------------------------------------------------------------------------
+
+  All 1 stream(s) completed successfully.
+```
+
+
+
