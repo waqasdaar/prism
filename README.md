@@ -863,3 +863,73 @@ iperf3 -c 10.0.0.1 -p 5202 -t 60 -i 1 -C cubic -w 256K -M 1460
 ```
 BBR achieved higher throughput with fewer retransmissions, suggesting better behavior under buffer congestion on this path.
 
+## Use Case 8 — Network Impairment Injection
+**Goal**: Simulate degraded or distant network paths by injecting artificial delay, jitter, and packet loss using tc netem.
+Typical scenarios:
+- WAN simulation in a lab
+- Satellite link emulation
+- Application resilience testing under degraded conditions
+- Validating QoS behavior with packet loss present
+
+**Note:** Requires root privileges and **tc** from i**proute2**.
+
+**Impairment Parameters**
+
+| Parameter   | Description                    | Example Values |
+|-------------|--------------------------------|----------------|
+| Delay (ms)  | Fixed added one-way latency    | 50, 100, 250   |
+| Jitter (ms) | Random variation around delay  | 5, 10, 25      |
+| Loss (%)    | Random packet drop probability | 0.1, 1.0, 5.0  |
+
+**Example — Simulating a Degraded WAN Link**
+
+```
+-- Network Impairment via tc netem (Enter to skip each) --
+Delay ms   [skip]: 100
+Jitter ms  [skip]: 10
+Loss %     [skip]: 0.5
+```
+**Applied command:**
+
+```
+tc qdisc add dev eth0 root netem delay 100ms 10ms loss 0.5%
+```
+**Output**
+```
+[NETEM  ]  dev eth0       delay=100ms jitter=10ms loss=0.5%
+```
+**Live Dashboard**
+```
++==============================================================================+
+|                   iperf3 Traffic Manager -- Live Dashboard                   |
++==============================================================================+
+|  Active:1   Connected:1   Done:0   Failed:0   Elapsed:00:08                  |
++------------------------------------------------------------------------------+
+|  #    Proto  Target         Port   Bandwidth    Time    DSCP   Status        |
++------------------------------------------------------------------------------+
+|  1    UDP    10.0.0.1       5201    96.40 Mbps  00:22   EF     CONNECTED     |
++------------------------------------------------------------------------------+
+|  Ctrl+C to stop all streams                                                  |
++------------------------------------------------------------------------------+
+```
+
+**Final Results**
+
+```
++==============================================================================+
+|                                Final Results                                 |
++==============================================================================+
+
+  #    Proto  Target      Port   Sender BW     Receiver BW   Jitter / Loss
+  --------------------------------------------------------------------------
+  1    UDP    10.0.0.1    5201   100.00 Mbps    96.40 Mbps   9.88ms / 0.49%
+  --------------------------------------------------------------------------
+
+  All 1 stream(s) completed successfully.
+```
+**Automatic Cleanup**
+When the script exits, all _tc rules_ are removed:
+```
+tc netem:
+    [REMOVED]  netem on eth0
+```
