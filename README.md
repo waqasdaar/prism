@@ -500,3 +500,92 @@ Launch 1 stream(s)? [Y/n]: Y
   All 1 stream(s) completed successfully.
 ```
 
+## Use Case 3 — Multi-Stream Parallel Testing
+
+**Goal**: Simulate realistic production traffic using multiple concurrent streams, each with independent protocol, target, bandwidth, and DSCP
+configuration.
+Typical scenarios:
+- Server or path saturation testing
+- Mixed protocol environments
+- Validating per-class QoS behavior simultaneously
+
+**Configuration — 3 Streams**
+| **Stream** | **Protocol** | **Target**    | **Port** | **Bandwidth** | **DSCP** |
+|------------|--------------|---------------|----------|---------------|----------|
+| 1          | TCP          | 192.168.10.10 | 5201     | unlimited     | AF31     |
+| 2          | UDP          | 192.168.10.11 | 5202     | 50M           | EF       |
+| 3          | TCP          | 192.168.10.12 | 5203     | unlimited     | CS3      |
+
+**Running the Test**
+
+```
+How many streams? [1]: 3
+
+── Stream 1 of 3 ──
+Protocol: TCP
+Target:   192.168.10.10
+Port:     5201
+Bandwidth: Enter
+Duration: 60
+DSCP:     AF31
+
+── Stream 2 of 3 ──
+Protocol: UDP
+Target:   192.168.10.11
+Port:     5202
+Bandwidth: 50M
+Duration: 60
+DSCP:     EF
+
+── Stream 3 of 3 ──
+Protocol: TCP
+Target:   192.168.10.12
+Port:     5203
+Bandwidth: Enter
+Duration: 60
+DSCP:     CS3
+
+Launch 3 stream(s)? [Y/n]: Y
+
+[STARTED]  stream 1  PID 44100  TCP -> 192.168.10.10:5201
+[STARTED]  stream 2  PID 44101  UDP -> 192.168.10.11:5202
+[STARTED]  stream 3  PID 44102  TCP -> 192.168.10.12:5203
+
+  Streams running. Opening dashboard...
+
+```
+
+**Live Dashboard**
+
+```
++==============================================================================+
+|                   iperf3 Traffic Manager -- Live Dashboard                   |
++==============================================================================+
+|  Active:3   Connected:3   Done:0   Failed:0   Elapsed:00:14                  |
++------------------------------------------------------------------------------+
+|  #    Proto  Target          Port   Bandwidth    Time    DSCP   Status       |
++------------------------------------------------------------------------------+
+|  1    TCP    192.168.10.10   5201   931.00 Mbps  00:46   AF31   CONNECTED    |
+|  2    UDP    192.168.10.11   5202    50.00 Mbps  00:46   EF     CONNECTED    |
+|  3    TCP    192.168.10.12   5203   420.14 Mbps  00:46   CS3    CONNECTED    |
++------------------------------------------------------------------------------+
+|  Ctrl+C to stop all streams                                                  |
++------------------------------------------------------------------------------+
+```
+
+**Final Results**
+
+```
++==============================================================================+
+|                                Final Results                                 |
++==============================================================================+
+
+  #    Proto  Target          Port   Sender BW     Receiver BW   Retx / Jitter+Loss
+  -----------------------------------------------------------------------------------
+  1    TCP    192.168.10.10   5201   931.00 Mbps   929.22 Mbps   Retx:1
+  2    UDP    192.168.10.11   5202    50.00 Mbps    49.91 Mbps   J:0.030ms L:0.0%
+  3    TCP    192.168.10.12   5203   420.14 Mbps   418.90 Mbps   Retx:0
+  -----------------------------------------------------------------------------------
+
+  All 3 stream(s) completed successfully.
+```
