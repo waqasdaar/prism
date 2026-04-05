@@ -657,6 +657,8 @@ Typical scenarios:
 - Network segmentation verification
 - VRF routing policy testing
 - Multi-tenant connectivity validation
+
+  
 __The script automatically__:
 - Discovers all configured VRFs via ip vrf show
 - Maps each interface to its VRF via ip link show master
