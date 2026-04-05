@@ -1205,7 +1205,7 @@ View raw log for stream # (or press Enter/q to quit): 1
 
 ## Troubleshooting
 
-**Stream Stuck at STARTING**
+### 1. **Stream Stuck at STARTING**
 
 **Symptoms**: Status does not advance after several seconds.
 
@@ -1223,7 +1223,7 @@ ss -tlnp | grep 5201
 tail -20 /tmp/iperf3_mgr.*/stream_1.log
 ```
 
-**Bandwidth Shows ---**
+### 2. **Bandwidth Shows ---**
 
 **Symptoms**: Bandwidth column remains at --- after connection.
 
@@ -1237,15 +1237,17 @@ Possible causes:
 tail -f /tmp/iperf3_mgr.*/stream_1.log
 cat /tmp/iperf3_mgr.*/stream_1.sh
 ```
-**VRF Test Fails**
+
+### 3. **VRF Test Fails**
 
 **Symptoms**: ip vrf exec fails or produces a permission error.
 **Cause**: ip vrf exec requires root privileges.
 **Fix:**
 ```
-sudo ./iperf3_manager.sh
+sudo ./iperf3-traffic-streams.sh
 ```
-**tc netem Not Applied**
+
+### 4. **tc netem Not Applied**
 
 **Symptoms**: [NETEM] line does not appear after configuration.
 **Possible causes**:
@@ -1259,10 +1261,10 @@ sudo ./iperf3_manager.sh
 which tc
 sudo tc qdisc show
 ip route get <target_ip>
-sudo ./iperf3_manager.sh
+sudo ./iperf3-traffic-streams.sh
 ```
 
-**Dashboard Scrolls or Reprints**
+### 5. **Dashboard Scrolls or Reprints**
 
 **Symptoms**: Dashboard prints new headers instead of updating in place.
 
@@ -1276,10 +1278,10 @@ sudo ./iperf3_manager.sh
 # Resize terminal to at least 80 columns
 # Or explicitly set columns
 export COLUMNS=80
-./iperf3_manager.sh
+./iperf3-traffic-streams.sh
 ```
 
-**iperf3 Not Found**
+### 6. **iperf3 Not Found**
 
 **Symptoms**: Script exits with ERROR: iperf3 not found.
 
@@ -1296,7 +1298,7 @@ which iperf3
 iperf3 --version
 ```
 
-**Bash Version Too Old**
+### 7. **Bash Version Too Old**
 
 **Symptoms**: declare: -A: invalid option or unexpected syntax errors.
 
