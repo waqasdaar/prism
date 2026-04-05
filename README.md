@@ -41,8 +41,6 @@ DSCP/QoS marking, TCP tuning, and network impairment injection.*
 - [Cleanup and Signal Handling](#cleanup-and-signal-handling)
 - [Troubleshooting](#troubleshooting)
 - [Known Limitations](#known-limitations)
-- [License](#license)
-
 ---
 
 ## Introduction
