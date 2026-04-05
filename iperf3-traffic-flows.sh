@@ -1,1414 +1,1927 @@
 #!/usr/bin/env bash
-# ============================================================================
-# iperf3 Multi-Stream Traffic Manager v6.2
-# Interactive menu-driven iperf3 wrapper with VRF support, DSCP, monitoring
-# ============================================================================
+# =============================================================================
+# iperf3_traffic-flows.sh — Enterprise-grade iperf3 multi-stream traffic manager
+# Version: 7.7
+# =============================================================================
 
-# --- Safety: NO set -euo pipefail (breaks VRF detection, grep, command -v) ---
+RED=$'\033[0;31m'
+GREEN=$'\033[0;32m'
+YELLOW=$'\033[1;33m'
+BLUE=$'\033[0;34m'
+CYAN=$'\033[0;36m'
+BOLD=$'\033[1m'
+NC=$'\033[0m'
 
-# ============================================================================
-# COLOR SCHEME — Black/Green/Blue ONLY (no yellow anywhere)
-# ============================================================================
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-BLUE='\033[0;34m'
-CYAN='\033[0;36m'
-WHITE='\033[1;37m'
-BOLD='\033[1m'
-DIM='\033[2m'
-NC='\033[0m'
+# Pre-computed byte lengths of each colour constant.
+# These are used in vlen() to subtract invisible bytes from string length.
+# By measuring ${#RED}, ${#GREEN} etc. at startup we know exactly how many
+# bytes each escape sequence occupies, so vlen() = total_byte_len - sum_of_ansi_bytes.
+_LEN_RED=0
+_LEN_GREEN=0
+_LEN_YELLOW=0
+_LEN_BLUE=0
+_LEN_CYAN=0
+_LEN_BOLD=0
+_LEN_NC=0
 
-# Semantic aliases (all map to green/blue/white — NO yellow)
-HEADER_COLOR="$BLUE"
-TITLE_COLOR="$GREEN"
-PROMPT_COLOR="$CYAN"
-WARN_COLOR="$RED"
-INFO_COLOR="$GREEN"
-ACCENT_COLOR="$BLUE"
-LABEL_COLOR="$WHITE"
-VALUE_COLOR="$GREEN"
-MENU_NUM="$CYAN"
-MENU_TEXT="$WHITE"
-BAR_COLOR="$GREEN"
-BAR_BG="$DIM"
-BORDER_COLOR="$BLUE"
-PKT_BORDER="$BLUE"
-PKT_LABEL="$CYAN"
-PKT_VALUE="$GREEN"
-
-# ============================================================================
-# GLOBAL VARIABLES
-# ============================================================================
-WORK_DIR="/tmp/iperf3_manager"
-SCRIPT_DIR="$WORK_DIR/scripts"
-LOG_DIR="$WORK_DIR"
-PIDS=()
-MONITOR_PIDS=()
-declare -A VRF_DEVICE_MAP   # vrf_name -> vrf_device
-declare -A VRF_IFACE_MAP    # interface -> vrf_name
-declare -A DSCP_MAP
-declare -a STREAM_CONFIGS    # array of stream config strings
-
-# Stream config fields (per stream)
-declare -a S_PROTO S_PORT S_BITRATE S_DURATION S_DSCP S_CONGESTION S_REVERSE S_LABEL
-
-mkdir -p "$SCRIPT_DIR" 2>/dev/null || true
-mkdir -p "$LOG_DIR" 2>/dev/null || true
-
-# ============================================================================
-# DSCP REFERENCE TABLE (22 entries, TOS = DSCP << 2)
-# ============================================================================
-init_dscp_map() {
-    DSCP_MAP=(
-        ["default"]="0"
-        ["cs1"]="32"
-        ["cs2"]="64"
-        ["cs3"]="96"
-        ["cs4"]="128"
-        ["cs5"]="160"
-        ["cs6"]="192"
-        ["cs7"]="224"
-        ["af11"]="40"
-        ["af12"]="48"
-        ["af13"]="56"
-        ["af21"]="72"
-        ["af22"]="80"
-        ["af23"]="88"
-        ["af31"]="104"
-        ["af32"]="112"
-        ["af33"]="120"
-        ["af41"]="136"
-        ["af42"]="144"
-        ["af43"]="152"
-        ["ef"]="184"
-        ["va"]="172"
-    )
+_init_ansi_lengths() {
+    _LEN_RED=${#RED}
+    _LEN_GREEN=${#GREEN}
+    _LEN_YELLOW=${#YELLOW}
+    _LEN_BLUE=${#BLUE}
+    _LEN_CYAN=${#CYAN}
+    _LEN_BOLD=${#BOLD}
+    _LEN_NC=${#NC}
 }
 
-# ============================================================================
-# UTILITY FUNCTIONS
-# ============================================================================
-print_header() {
-    local title="$1"
-    local width=70
-    local pad
-    pad=$(( (width - ${#title} - 2) / 2 ))
-    echo ""
-    echo -e "${BORDER_COLOR}$(printf '═%.0s' $(seq 1 $width))${NC}"
-    echo -e "${BORDER_COLOR}║${NC}$(printf ' %.0s' $(seq 1 $pad))${TITLE_COLOR}${BOLD}${title}${NC}$(printf ' %.0s' $(seq 1 $((width - pad - ${#title} - 2))))${BORDER_COLOR}║${NC}"
-    echo -e "${BORDER_COLOR}$(printf '═%.0s' $(seq 1 $width))${NC}"
+COLS=80
+
+IPERF3_BIN=""
+IPERF3_MAJOR=0; IPERF3_MINOR=0; IPERF3_PATCH=0
+FORCEFLUSH_SUPPORTED=0
+NOFQ_SUPPORTED=0
+IS_ROOT=0
+TMPDIR=""
+CLEANUP_DONE=0
+
+declare -a STREAM_PIDS=()
+declare -a SERVER_PIDS=()
+declare -a NETEM_IFACES=()
+declare -a S_PROTO=()
+declare -a S_TARGET=()
+declare -a S_PORT=()
+declare -a S_BW=()
+declare -a S_DURATION=()
+declare -a S_DSCP_NAME=()
+declare -a S_DSCP_VAL=()
+declare -a S_PARALLEL=()
+declare -a S_REVERSE=()
+declare -a S_CCA=()
+declare -a S_WINDOW=()
+declare -a S_MSS=()
+declare -a S_BIND=()
+declare -a S_VRF=()
+declare -a S_DELAY=()
+declare -a S_JITTER=()
+declare -a S_LOSS=()
+declare -a S_NOFQ=()
+declare -a S_LOGFILE=()
+declare -a S_SCRIPT=()
+declare -a S_START_TS=()
+declare -a S_STATUS_CACHE=()
+declare -a S_ERROR_MSG=()
+declare -a SRV_PORT=()
+declare -a SRV_BIND=()
+declare -a SRV_VRF=()
+declare -a SRV_ONEOFF=()
+declare -a SRV_LOGFILE=()
+declare -a SRV_SCRIPT=()
+declare -A IFACE_TO_VRF=()
+declare -A VRF_MASTERS=()
+declare -a VRF_LIST=()
+declare -a IFACE_NAMES=()
+declare -a IFACE_IPS=()
+declare -a IFACE_STATES=()
+declare -a IFACE_SPEEDS=()
+declare -a IFACE_VRFS=()
+
+STREAM_COUNT=0
+SERVER_COUNT=0
+FRAME_LINES=0
+PROMPT_DSCP_NAME=""
+PROMPT_DSCP_VAL=-1
+SELECTED_IFACE=""
+SELECTED_IP=""
+SELECTED_VRF=""
+
+# =============================================================================
+# SECTION 1 — PRIMITIVES
+# =============================================================================
+
+# vlen TEXT
+#
+# Returns the visible (printable) character count of TEXT by subtracting
+# the byte lengths of all known ANSI colour sequences.
+#
+# This approach avoids all sed/python/perl portability issues by using
+# pure bash arithmetic. It works because:
+#   1. Our colour constants are defined with $'...' and their byte lengths
+#      are pre-measured at startup.
+#   2. We count how many times each constant appears in TEXT and subtract
+#      total_bytes × count from ${#TEXT}.
+#
+# This correctly handles nested colour sequences like:
+#   "${BOLD}${CYAN}text${NC}"
+#   "${GREEN}OK${NC}  ${RED}FAIL${NC}"
+#
+# Limitation: only handles our 7 defined colour constants. Any other ANSI
+# sequences (e.g. from external commands) would be miscounted — but we
+# never embed external ANSI sequences in box-drawing text.
+vlen() {
+    local text="$1"
+    local total=${#text}
+
+    # Count occurrences of each ANSI constant and subtract their byte lengths
+    local plain="$text"
+    local count ansi_bytes=0
+
+    # For each colour constant: count occurrences, subtract bytes
+    # We replace each constant with an empty string and count how many
+    # characters were removed.
+    local temp
+
+    # RED
+    temp="${plain//$RED/}"; count=$(( (${#plain} - ${#temp}) / _LEN_RED )); (( _LEN_RED > 0 )) && ansi_bytes=$(( ansi_bytes + count * _LEN_RED )); plain="$temp"
+
+    # GREEN
+    temp="${plain//$GREEN/}"; count=$(( (${#plain} - ${#temp}) / _LEN_GREEN )); (( _LEN_GREEN > 0 )) && ansi_bytes=$(( ansi_bytes + count * _LEN_GREEN )); plain="$temp"
+
+    # YELLOW
+    temp="${plain//$YELLOW/}"; count=$(( (${#plain} - ${#temp}) / _LEN_YELLOW )); (( _LEN_YELLOW > 0 )) && ansi_bytes=$(( ansi_bytes + count * _LEN_YELLOW )); plain="$temp"
+
+    # BLUE
+    temp="${plain//$BLUE/}"; count=$(( (${#plain} - ${#temp}) / _LEN_BLUE )); (( _LEN_BLUE > 0 )) && ansi_bytes=$(( ansi_bytes + count * _LEN_BLUE )); plain="$temp"
+
+    # CYAN
+    temp="${plain//$CYAN/}"; count=$(( (${#plain} - ${#temp}) / _LEN_CYAN )); (( _LEN_CYAN > 0 )) && ansi_bytes=$(( ansi_bytes + count * _LEN_CYAN )); plain="$temp"
+
+    # BOLD
+    temp="${plain//$BOLD/}"; count=$(( (${#plain} - ${#temp}) / _LEN_BOLD )); (( _LEN_BOLD > 0 )) && ansi_bytes=$(( ansi_bytes + count * _LEN_BOLD )); plain="$temp"
+
+    # NC
+    temp="${plain//$NC/}"; count=$(( (${#plain} - ${#temp}) / _LEN_NC )); (( _LEN_NC > 0 )) && ansi_bytes=$(( ansi_bytes + count * _LEN_NC )); plain="$temp"
+
+    printf '%d' $(( total - ansi_bytes ))
 }
 
-print_section() {
-    local title="$1"
-    echo ""
-    echo -e "${ACCENT_COLOR}── ${WHITE}${BOLD}${title} ${ACCENT_COLOR}$(printf '─%.0s' $(seq 1 $((55 - ${#title}))))${NC}"
+rpt() {
+    local char="$1" n="$2" i out=""
+    (( n <= 0 )) && printf '%s' "" && return
+    for (( i=0; i<n; i++ )); do out+="$char"; done
+    printf '%s' "$out"
 }
 
-print_info() {
-    echo -e "  ${INFO_COLOR}●${NC} $1"
-}
-
-print_warn() {
-    echo -e "  ${WARN_COLOR}⚠${NC} $1"
-}
-
-print_error() {
-    echo -e "  ${RED}✖${NC} $1"
-}
-
-print_success() {
-    echo -e "  ${GREEN}✔${NC} $1"
-}
-
-prompt_input() {
-    local prompt_text="$1"
-    local var_name="$2"
-    local default_val="${3:-}"
-    local display_default=""
-    if [[ -n "$default_val" ]]; then
-        display_default=" ${DIM}[${default_val}]${NC}"
+pad_to() {
+    local text="$1" width="$2" len=${#1}
+    if (( len >= width )); then
+        printf '%s' "${text:0:$((width-1))}~"
+    else
+        printf '%s%s' "$text" "$(rpt ' ' $(( width - len )))"
     fi
-    echo -ne "  ${PROMPT_COLOR}▶${NC} ${prompt_text}${display_default}: "
-    local input
-    read -r input
-    if [[ -z "$input" && -n "$default_val" ]]; then
-        input="$default_val"
-    fi
-    eval "$var_name=\"$input\""
 }
 
-press_enter() {
-    echo ""
-    echo -ne "  ${DIM}Press Enter to continue...${NC}"
-    read -r
-}
+validate_port()      { [[ "$1" =~ ^[0-9]+$ ]] && (( 10#$1 >= 1 && 10#$1 <= 65535 )); }
+validate_bandwidth() { local b="$1"; [[ -z "$b" ]] && return 0; [[ "$b" =~ ^[0-9]+([KMGkmg])?$ ]]; }
+validate_duration()  { local d="$1"; [[ "$d" == "unlimited" || "$d" == "inf" ]] && return 0; [[ "$d" =~ ^[0-9]+$ ]]; }
+validate_float()     { [[ "$1" =~ ^[0-9]+(\.[0-9]+)?$ ]]; }
 
-# ============================================================================
-# CLEANUP
-# ============================================================================
-cleanup_all() {
-    echo ""
-    echo -e "${INFO_COLOR}Cleaning up...${NC}"
-    for pid in "${MONITOR_PIDS[@]}"; do
-        kill "$pid" 2>/dev/null || true
-        wait "$pid" 2>/dev/null || true
-    done
-    MONITOR_PIDS=()
-    for pid in "${PIDS[@]}"; do
-        kill "$pid" 2>/dev/null || true
-        wait "$pid" 2>/dev/null || true
-    done
-    PIDS=()
-    # Kill any lingering iperf3 processes we started
-    pkill -f "iperf3_manager/scripts" 2>/dev/null || true
-    rm -f "$SCRIPT_DIR"/*.sh 2>/dev/null || true
-    echo -e "  ${GREEN}✔${NC} Cleanup complete"
-}
-
-trap cleanup_all EXIT INT TERM
-
-# ============================================================================
-# IPERF3 CHECK / INSTALL
-# ============================================================================
-check_iperf3() {
-    if command -v iperf3 >/dev/null 2>&1; then
-        local ver
-        ver=$(iperf3 --version 2>&1 | head -1)
-        print_success "iperf3 found: ${VALUE_COLOR}${ver}${NC}"
+validate_ip() {
+    local ip="$1"
+    [[ -z "$ip" ]] && return 1
+    if [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+        local o1 o2 o3 o4
+        IFS='.' read -r o1 o2 o3 o4 <<< "$ip"
+        local o
+        for o in "$o1" "$o2" "$o3" "$o4"; do
+            [[ "$o" =~ ^[0-9]+$ ]] || return 1
+            (( 10#$o > 255 )) && return 1
+        done
         return 0
-    else
-        print_warn "iperf3 not found"
-        echo -ne "  ${PROMPT_COLOR}▶${NC} Install iperf3? (y/n): "
-        local ans
-        read -r ans
-        if [[ "$ans" =~ ^[Yy] ]]; then
-            if command -v apt-get >/dev/null 2>&1; then
-                sudo apt-get update && sudo apt-get install -y iperf3
-            elif command -v yum >/dev/null 2>&1; then
-                sudo yum install -y iperf3
-            elif command -v dnf >/dev/null 2>&1; then
-                sudo dnf install -y iperf3
-            elif command -v pacman >/dev/null 2>&1; then
-                sudo pacman -S --noconfirm iperf3
-            else
-                print_error "Package manager not detected. Install iperf3 manually."
-                return 1
-            fi
-            if command -v iperf3 >/dev/null 2>&1; then
-                print_success "iperf3 installed successfully"
-                return 0
-            else
-                print_error "iperf3 installation failed"
-                return 1
-            fi
-        else
-            print_error "iperf3 is required"
-            return 1
-        fi
     fi
+    [[ "$ip" =~ ^[a-zA-Z0-9]([a-zA-Z0-9\-\.]*[a-zA-Z0-9])?$ ]] && return 0
+    return 1
 }
 
-# ============================================================================
-# VRF DETECTION (3-method)
-# ============================================================================
-build_vrf_maps() {
-    VRF_DEVICE_MAP=()
-    VRF_IFACE_MAP=()
+# =============================================================================
+# SECTION 2 — BOX DRAWING
+# =============================================================================
 
-    # Method 1: ip vrf show
-    if ip vrf show >/dev/null 2>&1; then
-        while read -r vrf_name vrf_dev rest; do
-            if [[ -n "$vrf_name" && "$vrf_name" != "Name" ]]; then
-                # Verify it is actually a VRF master device
-                local link_info
-                link_info=$(ip -d link show "$vrf_name" 2>/dev/null || true)
-                if echo "$link_info" | grep -q "vrf table"; then
-                    VRF_DEVICE_MAP["$vrf_name"]="$vrf_name"
-                fi
-            fi
-        done < <(ip vrf show 2>/dev/null || true)
+bline() {
+    local char="${1:--}" inner=$(( COLS - 2 ))
+    printf '+%s+\033[K\n' "$(rpt "$char" "$inner")"
+}
+
+bcenter() {
+    local text="$1" inner=$(( COLS - 2 ))
+    local vl; vl=$(vlen "$text")
+    local tp=$(( inner - vl ))
+    local lp=$(( tp / 2 ))
+    local rp=$(( tp - lp ))
+    (( lp < 0 )) && lp=0
+    (( rp < 0 )) && rp=0
+    printf '|%s' "$(rpt ' ' $lp)"
+    printf '%b' "$text"
+    printf '%s|\033[K\n' "$(rpt ' ' $rp)"
+}
+
+bleft() {
+    local text="$1" indent="${2:-1}" inner=$(( COLS - 2 ))
+    local vl; vl=$(vlen "$text")
+    local rp=$(( inner - indent - vl ))
+    (( rp < 0 )) && rp=0
+    printf '|%s' "$(rpt ' ' $indent)"
+    printf '%b' "$text"
+    printf '%s|\033[K\n' "$(rpt ' ' $rp)"
+}
+
+bempty() {
+    local inner=$(( COLS - 2 ))
+    printf '|%s|\033[K\n' "$(rpt ' ' $inner)"
+}
+
+print_header() {
+    local t="${1:-iperf3 Manager}"
+    bline '='; bempty; bcenter "${BOLD}${CYAN}${t}${NC}"; bempty; bline '='
+}
+
+print_separator() { bline '-'; }
+
+confirm_proceed() {
+    local prompt="${1:-Proceed?}" answer
+    printf '\n'; read -r -p "  ${prompt} [Y/n]: " answer </dev/tty
+    case "$answer" in [Nn]*) return 1 ;; *) return 0 ;; esac
+}
+
+format_seconds() {
+    local s="$1"; (( s < 0 )) && s=0
+    printf '%02d:%02d' "$(( s / 60 ))" "$(( s % 60 ))"
+}
+
+# =============================================================================
+# SECTION 3 — BANDWIDTH FORMATTING & PARSING
+# =============================================================================
+
+_format_bps() {
+    local bps="$1"
+    if [[ ! "$bps" =~ ^[0-9]+(\.[0-9]+)?$ ]] || [[ "$bps" == "0" ]]; then
+        printf '%s' '---'; return
     fi
-
-    # Method 2: ip -d link show type vrf
-    while read -r line; do
-        local dev_name
-        dev_name=$(echo "$line" | grep -oP '^\d+: \K[^@:]+' || true)
-        if [[ -n "$dev_name" ]]; then
-            local detail
-            detail=$(ip -d link show "$dev_name" 2>/dev/null || true)
-            if echo "$detail" | grep -q "vrf table"; then
-                VRF_DEVICE_MAP["$dev_name"]="$dev_name"
-            fi
-        fi
-    done < <(ip -d link show type vrf 2>/dev/null || true)
-
-    # Method 3: Check each interface for master VRF
-    while read -r line; do
-        local iface
-        iface=$(echo "$line" | awk '{print $2}' | tr -d ':')
-        # Remove @xxx suffix
-        iface="${iface%%@*}"
-        local master
-        master=$(ip -d link show "$iface" 2>/dev/null | grep -oP 'master \K\S+' || true)
-        if [[ -n "$master" ]]; then
-            # Verify master is a VRF device
-            local master_detail
-            master_detail=$(ip -d link show "$master" 2>/dev/null || true)
-            if echo "$master_detail" | grep -q "vrf table"; then
-                VRF_IFACE_MAP["$iface"]="$master"
-                VRF_DEVICE_MAP["$master"]="$master"
-            fi
-        fi
-    done < <(ip -o link show 2>/dev/null || true)
+    printf '%s' "$(awk -v b="$bps" 'BEGIN {
+        if      (b >= 1e9) printf "%.2f Gbps", b/1e9
+        else if (b >= 1e6) printf "%.2f Mbps", b/1e6
+        else if (b >= 1e3) printf "%.2f Kbps", b/1e3
+        else               printf "%.0f bps",  b
+    }')"
 }
 
-get_iface_vrf() {
-    local iface="$1"
-    echo "${VRF_IFACE_MAP[$iface]:-}"
+_normalise_text_bw() {
+    local val unit
+    val=$(awk '{print $1}' <<< "$1")
+    unit=$(awk '{print $2}' <<< "$1")
+    if [[ ! "$val" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+        printf '%s' '---'; return
+    fi
+    printf '%s' "$(awk -v v="$val" -v u="$unit" 'BEGIN {
+        b = v
+        if      (u ~ /^Gbits/) b = v * 1e9
+        else if (u ~ /^Mbits/) b = v * 1e6
+        else if (u ~ /^Kbits/) b = v * 1e3
+        if      (b >= 1e9) printf "%.2f Gbps", b/1e9
+        else if (b >= 1e6) printf "%.2f Mbps", b/1e6
+        else if (b >= 1e3) printf "%.2f Kbps", b/1e3
+        else               printf "%.0f bps",  b
+    }')"
 }
 
-# ============================================================================
-# INTERFACE LISTING & SELECTION
-# ============================================================================
-list_interfaces() {
-    print_section "Network Interfaces"
-    local idx=0
-    local -a ifaces=()
-    while read -r line; do
-        local iface
-        iface=$(echo "$line" | awk '{print $2}' | tr -d ':')
-        iface="${iface%%@*}"
-        # Skip VRF master devices themselves
-        if [[ -n "${VRF_DEVICE_MAP[$iface]:-}" ]]; then
-            continue
-        fi
-        # Skip loopback for non-loopback modes
-        local state
-        state=$(ip -o link show "$iface" 2>/dev/null | grep -oP 'state \K\S+' || echo "UNKNOWN")
-        local addrs
-        addrs=$(ip -o -4 addr show "$iface" 2>/dev/null | grep -oP 'inet \K[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(/[0-9]+)?' || true)
-        local vrf_name
-        vrf_name=$(get_iface_vrf "$iface")
-        local vrf_display=""
-        if [[ -n "$vrf_name" ]]; then
-            vrf_display=" ${ACCENT_COLOR}[VRF:${vrf_name}]${NC}"
-        fi
-        idx=$((idx + 1))
-        ifaces+=("$iface")
-        local addr_display="${DIM}no IPv4${NC}"
-        if [[ -n "$addrs" ]]; then
-            addr_display="${VALUE_COLOR}${addrs}${NC}"
-        fi
-        echo -e "  ${MENU_NUM}${idx})${NC} ${MENU_TEXT}${iface}${NC} - ${addr_display} [${state}]${vrf_display}"
-    done < <(ip -o link show 2>/dev/null || true)
+parse_live_bandwidth_from_log() {
+    local logfile="$1"
+    [[ ! -f "$logfile" || ! -s "$logfile" ]] && { printf '%s' '---'; return; }
 
-    IFACE_LIST=("${ifaces[@]}")
-}
+    local ll=""
 
-select_interface() {
-    local prompt_msg="${1:-Select interface}"
-    list_interfaces
-    echo ""
-    prompt_input "$prompt_msg (number, or 'any' for 0.0.0.0)" IFACE_CHOICE "any"
+    # Prefer [SUM] lines (parallel -P streams), excluding final summary lines
+    ll=$(grep -E '^\[SUM\][[:space:]]+[0-9.]+-[0-9.]+[[:space:]]+sec' \
+         "$logfile" 2>/dev/null \
+         | grep -vE '[[:space:]]sender[[:space:]]*$|[[:space:]]receiver[[:space:]]*$' \
+         | tail -1)
 
-    SELECTED_IFACE=""
-    SELECTED_IP=""
-    SELECTED_VRF=""
-
-    if [[ "$IFACE_CHOICE" == "any" ]]; then
-        SELECTED_IP="0.0.0.0"
-        return
+    # Fall back to single-stream interval lines
+    if [[ -z "$ll" ]]; then
+        ll=$(grep -E '^\[[[:space:]]*[0-9]+\][[:space:]]+[0-9.]+-[0-9.]+[[:space:]]+sec' \
+             "$logfile" 2>/dev/null \
+             | grep -vE '[[:space:]]sender[[:space:]]*$|[[:space:]]receiver[[:space:]]*$' \
+             | tail -1)
     fi
 
-    if [[ "$IFACE_CHOICE" =~ ^[0-9]+$ ]] && (( IFACE_CHOICE >= 1 && IFACE_CHOICE <= ${#IFACE_LIST[@]} )); then
-        SELECTED_IFACE="${IFACE_LIST[$((IFACE_CHOICE - 1))]}"
-        SELECTED_IP=$(ip -o -4 addr show "$SELECTED_IFACE" 2>/dev/null | grep -oP 'inet \K[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(/[0-9]+)?' | head -1 || true)
-        SELECTED_IP="${SELECTED_IP%%/*}"
-        SELECTED_VRF=$(get_iface_vrf "$SELECTED_IFACE")
-        if [[ -z "$SELECTED_IP" ]]; then
-            print_warn "No IPv4 on ${SELECTED_IFACE}, using 0.0.0.0"
-            SELECTED_IP="0.0.0.0"
-        fi
-        print_info "Selected: ${VALUE_COLOR}${SELECTED_IFACE}${NC} (${SELECTED_IP})"
-        if [[ -n "$SELECTED_VRF" ]]; then
-            print_info "VRF: ${VALUE_COLOR}${SELECTED_VRF}${NC}"
-        fi
-    else
-        print_warn "Invalid choice, using 0.0.0.0"
-        SELECTED_IP="0.0.0.0"
-    fi
-}
-
-# ============================================================================
-# DSCP REFERENCE TABLE
-# ============================================================================
-show_dscp_table() {
-    print_header "DSCP Reference Table"
-    echo ""
-    printf "  ${LABEL_COLOR}%-12s %-8s %-10s %-14s %-8s${NC}\n" "Name" "DSCP" "TOS Dec" "TOS Hex" "Binary"
-    echo -e "  ${BORDER_COLOR}$(printf '─%.0s' $(seq 1 58))${NC}"
-
-    local -a ordered_keys=("default" "cs1" "af11" "af12" "af13" "cs2" "af21" "af22" "af23"
-        "cs3" "af31" "af32" "af33" "cs4" "af41" "af42" "af43" "cs5"
-        "ef" "va" "cs6" "cs7")
-
-    for key in "${ordered_keys[@]}"; do
-        local tos="${DSCP_MAP[$key]}"
-        local dscp=$((tos >> 2))
-        local hex
-        hex=$(printf "0x%02X" "$tos")
-        local bin=""
-        for i in 7 6 5 4 3 2 1 0; do
-            bin="${bin}$(( (tos >> i) & 1 ))"
-        done
-        printf "  ${VALUE_COLOR}%-12s${NC} %-8s ${GREEN}%-10s${NC} %-14s ${DIM}%s${NC}\n" \
-            "$key" "$dscp" "$tos" "$hex" "$bin"
-    done
-    echo ""
-}
-
-# ============================================================================
-# PACKET FORMAT VISUALIZATION
-# ============================================================================
-draw_packet_detail() {
-    local stream_num="$1"
-    local protocol="$2"
-    local src_ip="$3"
-    local dst_ip="$4"
-    local dst_port="$5"
-    local dscp_name="$6"
-    local bitrate="$7"
-
-    local tos_dec="${DSCP_MAP[${dscp_name,,}]:-0}"
-    local dscp_val=$((tos_dec >> 2))
-    local tos_hex
-    tos_hex=$(printf "0x%02X" "$tos_dec")
-
-    # DSCP binary (6 bits)
-    local dscp_bin=""
-    for i in 5 4 3 2 1 0; do
-        dscp_bin="${dscp_bin}$(( (dscp_val >> i) & 1 ))"
-    done
-
-    local proto_upper="${protocol^^}"
-    local proto_num="6"
-    if [[ "$proto_upper" == "UDP" ]]; then
-        proto_num="17"
+    if [[ -n "$ll" ]]; then
+        local bs
+        bs=$(echo "$ll" | grep -oE '[0-9.]+ [KMG]?bits/sec' | head -1)
+        [[ -n "$bs" ]] && { _normalise_text_bw "$bs"; return; }
     fi
 
-    local src_mac="xx:xx:xx:xx:xx:xx"
-    local dst_mac="xx:xx:xx:xx:xx:xx"
-
-    # Try to get real MACs if interface is known
-    if [[ -n "$SELECTED_IFACE" ]]; then
-        local real_mac
-        real_mac=$(ip link show "$SELECTED_IFACE" 2>/dev/null | grep -oP 'link/ether \K[0-9a-f:]+' || true)
-        if [[ -n "$real_mac" ]]; then
-            src_mac="$real_mac"
-        fi
-    fi
-
-    local w=68
-    echo ""
-    echo -e "  ${PKT_BORDER}┌$(printf '─%.0s' $(seq 1 $((w-2))))┐${NC}"
-    echo -e "  ${PKT_BORDER}│${NC} ${WHITE}${BOLD}Stream #${stream_num} — Packet Structure${NC}$(printf ' %.0s' $(seq 1 $((w - 35 - ${#stream_num}))))${PKT_BORDER}│${NC}"
-    echo -e "  ${PKT_BORDER}├$(printf '─%.0s' $(seq 1 $((w-2))))┤${NC}"
-
-    # L2 - Ethernet
-    echo -e "  ${PKT_BORDER}│${NC} ${PKT_LABEL}${BOLD}L2 Ethernet${NC}$(printf ' %.0s' $(seq 1 $((w - 14))))${PKT_BORDER}│${NC}"
-    printf "  ${PKT_BORDER}│${NC}   Dst MAC : ${PKT_VALUE}%-42s${NC}${PKT_BORDER}│${NC}\n" "$dst_mac"
-    printf "  ${PKT_BORDER}│${NC}   Src MAC : ${PKT_VALUE}%-42s${NC}${PKT_BORDER}│${NC}\n" "$src_mac"
-    printf "  ${PKT_BORDER}│${NC}   EtherType : ${PKT_VALUE}%-39s${NC}${PKT_BORDER}│${NC}\n" "0x0800 (IPv4)"
-    echo -e "  ${PKT_BORDER}├$(printf '─%.0s' $(seq 1 $((w-2))))┤${NC}"
-
-    # L3 - IPv4
-    echo -e "  ${PKT_BORDER}│${NC} ${PKT_LABEL}${BOLD}L3 IPv4${NC}$(printf ' %.0s' $(seq 1 $((w - 10))))${PKT_BORDER}│${NC}"
-    printf "  ${PKT_BORDER}│${NC}   Src IP    : ${PKT_VALUE}%-39s${NC}${PKT_BORDER}│${NC}\n" "$src_ip"
-    printf "  ${PKT_BORDER}│${NC}   Dst IP    : ${PKT_VALUE}%-39s${NC}${PKT_BORDER}│${NC}\n" "$dst_ip"
-    printf "  ${PKT_BORDER}│${NC}   DSCP      : ${PKT_VALUE}%-39s${NC}${PKT_BORDER}│${NC}\n" "${dscp_name^^} (${dscp_val}) [${dscp_bin}]"
-    printf "  ${PKT_BORDER}│${NC}   TOS       : ${PKT_VALUE}%-39s${NC}${PKT_BORDER}│${NC}\n" "${tos_dec} (${tos_hex})"
-    printf "  ${PKT_BORDER}│${NC}   TTL       : ${PKT_VALUE}%-39s${NC}${PKT_BORDER}│${NC}\n" "64"
-    printf "  ${PKT_BORDER}│${NC}   Protocol  : ${PKT_VALUE}%-39s${NC}${PKT_BORDER}│${NC}\n" "${proto_num} (${proto_upper})"
-    echo -e "  ${PKT_BORDER}├$(printf '─%.0s' $(seq 1 $((w-2))))┤${NC}"
-
-    # L4
-    echo -e "  ${PKT_BORDER}│${NC} ${PKT_LABEL}${BOLD}L4 ${proto_upper}${NC}$(printf ' %.0s' $(seq 1 $((w - 7 - ${#proto_upper}))))${PKT_BORDER}│${NC}"
-    printf "  ${PKT_BORDER}│${NC}   Src Port  : ${PKT_VALUE}%-39s${NC}${PKT_BORDER}│${NC}\n" "ephemeral (49152-65535)"
-    printf "  ${PKT_BORDER}│${NC}   Dst Port  : ${PKT_VALUE}%-39s${NC}${PKT_BORDER}│${NC}\n" "$dst_port"
-    printf "  ${PKT_BORDER}│${NC}   Bandwidth : ${PKT_VALUE}%-39s${NC}${PKT_BORDER}│${NC}\n" "$bitrate"
-    echo -e "  ${PKT_BORDER}└$(printf '─%.0s' $(seq 1 $((w-2))))┘${NC}"
+    printf '%s' '---'
 }
 
-# ============================================================================
-# BAR GRAPH
-# ============================================================================
-draw_bar() {
-    local value="$1"
-    local max="$2"
-    local width="${3:-30}"
+parse_final_bw_from_log() {
+    local logfile="$1" direction="$2"
+    [[ ! -f "$logfile" || ! -s "$logfile" ]] && printf '%s' "" && return
 
-    if [[ "$max" == "0" || -z "$max" ]]; then
-        max=1
+    local line=""
+    line=$(grep -E '^\[SUM\].*[[:space:]]'"$direction"'[[:space:]]*$' \
+           "$logfile" 2>/dev/null | tail -1)
+    if [[ -z "$line" ]]; then
+        line=$(grep -E '^\[[[:space:]]*[0-9]+\].*[[:space:]]'"$direction"'[[:space:]]*$' \
+               "$logfile" 2>/dev/null | tail -1)
     fi
-
-    local pct=$((value * 100 / max))
-    if (( pct > 100 )); then pct=100; fi
-    local filled=$((pct * width / 100))
-    local empty=$((width - filled))
-
-    local bar=""
-    local i
-    for (( i=0; i<filled; i++ )); do
-        bar+="█"
-    done
-    for (( i=0; i<empty; i++ )); do
-        bar+="░"
-    done
-
-    echo -e "${BAR_COLOR}${bar}${NC} ${WHITE}${pct}%${NC}"
+    if [[ -n "$line" ]]; then
+        local bw; bw=$(echo "$line" | grep -oE '[0-9.]+ [KMG]?bits/sec' | head -1)
+        [[ -n "$bw" ]] && { _normalise_text_bw "$bw"; return; }
+    fi
+    printf '%s' ""
 }
 
-# ============================================================================
-# IN-PLACE BANDWIDTH MONITOR
-# ============================================================================
-start_bandwidth_monitor() {
-    local log_file="$1"
-    local label="$2"
-    local target_bw="${3:-0}"  # target in Mbits for bar scaling
-    local num_streams="${4:-1}"
-
-    if [[ "$target_bw" == "0" || -z "$target_bw" ]]; then
-        target_bw=1000
+parse_retransmits_from_log() {
+    local logfile="$1"
+    [[ ! -f "$logfile" || ! -s "$logfile" ]] && printf '%s' "0" && return
+    local line
+    line=$(grep -E '[[:space:]]sender[[:space:]]*$' "$logfile" 2>/dev/null | tail -1)
+    if [[ -n "$line" ]]; then
+        local rtx; rtx=$(awk '{for(i=1;i<=NF;i++) if($i=="sender") print $(i-1)}' <<< "$line")
+        if [[ "$rtx" =~ ^[0-9]+$ ]]; then printf '%s' "$rtx"; return; fi
     fi
-
-    # Background subshell that updates in-place
-    (
-        # Wait for log file to appear
-        local wait_count=0
-        while [[ ! -f "$log_file" ]]; do
-            sleep 0.5
-            wait_count=$((wait_count + 1))
-            if (( wait_count > 60 )); then
-                exit 0
-            fi
-        done
-
-        local header_printed=0
-        local display_lines=$((num_streams + 2))
-        local last_bw=""
-
-        tail -f "$log_file" 2>/dev/null | while IFS= read -r line; do
-            # Parse iperf3 bandwidth lines: [  5]   0.00-1.00   sec  112 MBytes  941 Mbits/sec
-            # Also handles: [ 4]   ... Mbits/sec  or Kbits/sec or Gbits/sec
-            local bw_val=""
-            local bw_unit=""
-
-            if echo "$line" | grep -qP '\d+(\.\d+)?\s+(M|K|G)bits/sec'; then
-                bw_val=$(echo "$line" | grep -oP '[\d.]+(?=\s+(M|K|G)bits/sec)' | tail -1 || true)
-                bw_unit=$(echo "$line" | grep -oP '(M|K|G)bits/sec' | tail -1 || true)
-
-                if [[ -n "$bw_val" && -n "$bw_unit" ]]; then
-                    # Convert to Mbits
-                    local bw_mbits
-                    case "$bw_unit" in
-                        Gbits/sec) bw_mbits=$(echo "$bw_val * 1000" | bc 2>/dev/null || echo "$bw_val");;
-                        Mbits/sec) bw_mbits="$bw_val";;
-                        Kbits/sec) bw_mbits=$(echo "scale=2; $bw_val / 1000" | bc 2>/dev/null || echo "0");;
-                        *) bw_mbits="$bw_val";;
-                    esac
-
-                    # Convert to integer for bar
-                    local bw_int
-                    bw_int=$(printf "%.0f" "$bw_mbits" 2>/dev/null || echo "0")
-
-                    # Skip if same as last (avoid flicker)
-                    if [[ "$bw_int" == "$last_bw" ]]; then
-                        continue
-                    fi
-                    last_bw="$bw_int"
-
-                    local bar
-                    bar=$(draw_bar "$bw_int" "$target_bw" 30)
-
-                    # Move cursor up if we've printed before, erase line, rewrite
-                    if (( header_printed == 1 )); then
-                        # Move up 1 line, clear it
-                        printf '\033[1A\033[2K'
-                    fi
-
-                    printf "\r  ${GREEN}●${NC} ${LABEL_COLOR}%-15s${NC} ${VALUE_COLOR}%8s Mbps${NC}  %s\n" \
-                        "$label" "$bw_mbits" "$bar"
-
-                    header_printed=1
-                fi
-            fi
-
-            # Detect connection events
-            if echo "$line" | grep -qi "connected to\|accepted connection"; then
-                # Print above the bar — move up if needed, insert event line
-                if (( header_printed == 1 )); then
-                    printf '\033[1A\033[2K'
-                fi
-                echo -e "  ${INFO_COLOR}⚡${NC} ${DIM}$(date '+%H:%M:%S')${NC} ${line}"
-                # Re-flag so next bar prints fresh
-                header_printed=0
-            fi
-
-            # Detect completion
-            if echo "$line" | grep -qi "iperf done\|sender\|receiver"; then
-                if echo "$line" | grep -qP '\d+(\.\d+)?\s+(M|K|G)bits/sec'; then
-                    # Final summary line
-                    echo -e "  ${GREEN}✔${NC} ${WHITE}${BOLD}Final:${NC} ${line}"
-                fi
-            fi
-        done
-    ) &
-    local mon_pid=$!
-    MONITOR_PIDS+=("$mon_pid")
+    printf '%s' "0"
 }
 
-# Multi-stream in-place monitor: handles N streams each on their own line
-start_multi_bandwidth_monitor() {
-    local num_streams="$1"
-    shift
-    # Remaining args: pairs of (log_file, label, target_bw)
-    local -a log_files=()
-    local -a labels=()
-    local -a targets=()
+# =============================================================================
+# SECTION 4 — CLEANUP AND SIGNALS
+# =============================================================================
 
-    while (( $# >= 3 )); do
-        log_files+=("$1")
-        labels+=("$2")
-        targets+=("$3")
-        shift 3
-    done
+tty_echo() { printf '%b\n' "$1" >/dev/tty 2>/dev/null || printf '%b\n' "$1"; }
 
-    (
-        # Wait for at least one log file
-        local wait_count=0
-        local any_exists=0
-        while (( any_exists == 0 )); do
-            for lf in "${log_files[@]}"; do
-                if [[ -f "$lf" ]]; then
-                    any_exists=1
-                    break
-                fi
-            done
-            sleep 0.5
-            wait_count=$((wait_count + 1))
-            if (( wait_count > 60 )); then
-                exit 0
+cleanup() {
+    [[ $CLEANUP_DONE -eq 1 ]] && return 0
+    CLEANUP_DONE=1
+    local sn="${1:-EXIT}"
+    printf '\033[?25h' >/dev/tty 2>/dev/null; printf '\n' >/dev/tty 2>/dev/null
+    local sep; sep=$(rpt '=' $(( COLS - 2 )))
+    tty_echo "${BOLD}${CYAN}+${sep}+${NC}"
+    tty_echo "${BOLD}${CYAN}  iperf3 Manager -- Cleanup  [signal: ${sn}]${NC}"
+    tty_echo "${BOLD}${CYAN}+${sep}+${NC}"
+    local killed=0 already=0
+
+    if (( ${#STREAM_PIDS[@]} > 0 )); then
+        tty_echo ""; tty_echo "${BOLD}  Client Streams:${NC}"
+        local i
+        for i in "${!STREAM_PIDS[@]}"; do
+            local pid="${STREAM_PIDS[$i]}"
+            local lbl="stream $((i+1)) [${S_PROTO[$i]:-?}->${S_TARGET[$i]:-?}:${S_PORT[$i]:-?}]"
+            if [[ -z "$pid" || "$pid" == "0" ]]; then
+                tty_echo "    ${YELLOW}[SKIP ]${NC}  $lbl  -- no PID"; continue
             fi
-        done
-
-        # Print initial placeholder lines
-        echo ""
-        echo -e "  ${ACCENT_COLOR}── ${WHITE}${BOLD}Live Bandwidth Monitor ${ACCENT_COLOR}$(printf '─%.0s' $(seq 1 35))${NC}"
-        for (( s=0; s<num_streams; s++ )); do
-            printf "  ${DIM}●${NC} ${LABEL_COLOR}%-15s${NC} ${DIM}waiting...${NC}\n" "${labels[$s]}"
-        done
-        local printed_lines=$((num_streams))
-
-        # Last known values
-        local -a last_bw=()
-        for (( s=0; s<num_streams; s++ )); do
-            last_bw+=("0")
-        done
-
-        # Polling loop
-        while true; do
-            local any_update=0
-
-            for (( s=0; s<num_streams; s++ )); do
-                local lf="${log_files[$s]}"
-                if [[ ! -f "$lf" ]]; then
-                    continue
-                fi
-
-                # Get last bandwidth line
-                local last_line
-                last_line=$(grep -P '\d+(\.\d+)?\s+(M|K|G)bits/sec' "$lf" 2>/dev/null | tail -1 || true)
-                if [[ -z "$last_line" ]]; then
-                    continue
-                fi
-
-                local bw_val
-                bw_val=$(echo "$last_line" | grep -oP '[\d.]+(?=\s+(M|K|G)bits/sec)' | tail -1 || true)
-                local bw_unit
-                bw_unit=$(echo "$last_line" | grep -oP '(M|K|G)bits/sec' | tail -1 || true)
-
-                if [[ -n "$bw_val" && -n "$bw_unit" ]]; then
-                    local bw_mbits
-                    case "$bw_unit" in
-                        Gbits/sec) bw_mbits=$(echo "$bw_val * 1000" | bc 2>/dev/null || echo "$bw_val");;
-                        Mbits/sec) bw_mbits="$bw_val";;
-                        Kbits/sec) bw_mbits=$(echo "scale=2; $bw_val / 1000" | bc 2>/dev/null || echo "0");;
-                        *) bw_mbits="$bw_val";;
-                    esac
-
-                    local bw_int
-                    bw_int=$(printf "%.0f" "$bw_mbits" 2>/dev/null || echo "0")
-
-                    if [[ "$bw_int" != "${last_bw[$s]}" ]]; then
-                        last_bw[$s]="$bw_int"
-                        any_update=1
-                    fi
-                fi
-            done
-
-            if (( any_update == 1 )); then
-                # Move cursor up N lines
-                printf "\033[${printed_lines}A"
-
-                for (( s=0; s<num_streams; s++ )); do
-                    local tgt="${targets[$s]}"
-                    if [[ "$tgt" == "0" || -z "$tgt" ]]; then tgt=1000; fi
-                    local bw_int="${last_bw[$s]}"
-                    local bar
-                    bar=$(draw_bar "$bw_int" "$tgt" 30)
-                    # Clear line and print
-                    printf "\033[2K\r  ${GREEN}●${NC} ${LABEL_COLOR}%-15s${NC} ${VALUE_COLOR}%8s Mbps${NC}  %s\n" \
-                        "${labels[$s]}" "${bw_int}" "$bar"
-                done
-            fi
-
-            sleep 1
-
-            # Check if any iperf3 is still running
-            local any_alive=0
-            for pid in "${PIDS[@]}"; do
+            if kill -0 "$pid" 2>/dev/null; then
+                kill -TERM "$pid" 2>/dev/null
+                local w=0
+                while kill -0 "$pid" 2>/dev/null && (( w < 6 )); do sleep 0.5; (( w++ )); done
                 if kill -0 "$pid" 2>/dev/null; then
-                    any_alive=1
-                    break
-                fi
-            done
-            if (( any_alive == 0 )); then
-                sleep 2  # Final read
-                # Print final summary
-                printf "\033[${printed_lines}A"
-                for (( s=0; s<num_streams; s++ )); do
-                    local lf="${log_files[$s]}"
-                    local final_line=""
-                    if [[ -f "$lf" ]]; then
-                        final_line=$(grep -P '(sender|receiver)' "$lf" 2>/dev/null | tail -1 || true)
-                    fi
-                    local tgt="${targets[$s]}"
-                    if [[ "$tgt" == "0" || -z "$tgt" ]]; then tgt=1000; fi
-                    local bw_int="${last_bw[$s]}"
-                    local bar
-                    bar=$(draw_bar "$bw_int" "$tgt" 30)
-                    printf "\033[2K\r  ${GREEN}✔${NC} ${LABEL_COLOR}%-15s${NC} ${VALUE_COLOR}%8s Mbps${NC}  %s ${DIM}(done)${NC}\n" \
-                        "${labels[$s]}" "${bw_int}" "$bar"
-                done
-                echo ""
-                echo -e "  ${GREEN}✔${NC} ${WHITE}${BOLD}All streams completed${NC}"
-                break
-            fi
-        done
-    ) &
-    local mon_pid=$!
-    MONITOR_PIDS+=("$mon_pid")
-}
-
-# ============================================================================
-# SCRIPT BUILDERS
-# ============================================================================
-build_server_script() {
-    local script_file="$1"
-    local port="$2"
-    local bind_ip="$3"
-    local vrf="$4"
-    local log_file="$5"
-    local one_off="${6:-no}"
-
-    cat > "$script_file" << 'SCRIPT_HEADER'
-#!/usr/bin/env bash
-SCRIPT_HEADER
-
-    # VRF sysctl check
-    if [[ -n "$vrf" && "$vrf" != "" ]]; then
-        cat >> "$script_file" << VRFCHECK
-# VRF sysctl checks
-sysctl -w net.ipv4.tcp_l3mdev_accept=1 2>/dev/null || true
-sysctl -w net.ipv4.udp_l3mdev_accept=1 2>/dev/null || true
-VRFCHECK
-    fi
-
-    # Build command
-    local cmd=""
-    if [[ -n "$vrf" && "$vrf" != "" ]]; then
-        cmd="ip vrf exec ${vrf} "
-    fi
-    cmd+="iperf3 -s"
-    cmd+=" -p ${port}"
-    if [[ -n "$bind_ip" && "$bind_ip" != "0.0.0.0" ]]; then
-        cmd+=" --bind ${bind_ip}"
-    fi
-    cmd+=" -i 1 --forceflush"
-    if [[ "$one_off" == "yes" ]]; then
-        cmd+=" -1"
-    fi
-
-    cat >> "$script_file" << SCRIPT_CMD
-exec ${cmd} >> "${log_file}" 2>&1
-SCRIPT_CMD
-
-    chmod +x "$script_file"
-}
-
-build_client_script() {
-    local script_file="$1"
-    local server_ip="$2"
-    local port="$3"
-    local protocol="$4"   # tcp or udp
-    local bitrate="$5"    # e.g., 100M, 1G, 0 for unlimited
-    local duration="$6"
-    local dscp_name="$7"
-    local congestion="$8"
-    local reverse="$9"
-    local bind_ip="${10:-}"
-    local vrf="${11:-}"
-    local log_file="${12}"
-
-    cat > "$script_file" << 'SCRIPT_HEADER'
-#!/usr/bin/env bash
-SCRIPT_HEADER
-
-    if [[ -n "$vrf" && "$vrf" != "" ]]; then
-        cat >> "$script_file" << VRFCHECK
-sysctl -w net.ipv4.tcp_l3mdev_accept=1 2>/dev/null || true
-sysctl -w net.ipv4.udp_l3mdev_accept=1 2>/dev/null || true
-VRFCHECK
-    fi
-
-    local cmd=""
-    if [[ -n "$vrf" && "$vrf" != "" ]]; then
-        cmd="ip vrf exec ${vrf} "
-    fi
-    cmd+="iperf3 -c ${server_ip}"
-    cmd+=" -p ${port}"
-
-    if [[ "${protocol,,}" == "udp" ]]; then
-        cmd+=" -u"
-    fi
-
-    if [[ -n "$bitrate" && "$bitrate" != "0" ]]; then
-        cmd+=" -b ${bitrate}"
-    fi
-
-    if [[ -n "$duration" && "$duration" != "0" ]]; then
-        cmd+=" -t ${duration}"
-    fi
-
-    # DSCP via -S (TOS value)
-    if [[ -n "$dscp_name" && "$dscp_name" != "default" && "$dscp_name" != "" ]]; then
-        local tos_val="${DSCP_MAP[${dscp_name,,}]:-}"
-        if [[ -n "$tos_val" && "$tos_val" != "0" ]]; then
-            cmd+=" -S ${tos_val}"
-        fi
-    fi
-
-    if [[ -n "$congestion" && "$congestion" != "" && "$congestion" != "default" ]]; then
-        cmd+=" -C ${congestion}"
-    fi
-
-    if [[ "$reverse" == "yes" ]]; then
-        cmd+=" -R"
-    fi
-
-    if [[ -n "$bind_ip" && "$bind_ip" != "0.0.0.0" && "$bind_ip" != "" ]]; then
-        cmd+=" --bind ${bind_ip}"
-    fi
-
-    cmd+=" -i 1 --forceflush"
-
-    cat >> "$script_file" << SCRIPT_CMD
-exec ${cmd} >> "${log_file}" 2>&1
-SCRIPT_CMD
-
-    chmod +x "$script_file"
-}
-
-# ============================================================================
-# STREAM CONFIGURATION
-# ============================================================================
-configure_stream() {
-    local stream_num="$1"
-    local total_streams="$2"
-
-    print_section "Configure Stream #${stream_num} of ${total_streams}"
-
-    # Protocol
-    echo -e "  ${MENU_NUM}1)${NC} TCP"
-    echo -e "  ${MENU_NUM}2)${NC} UDP"
-    prompt_input "Protocol" PROTO_CHOICE "1"
-    local proto="tcp"
-    if [[ "$PROTO_CHOICE" == "2" ]]; then
-        proto="udp"
-    fi
-
-    # Port
-    local default_port=$((5201 + stream_num - 1))
-    prompt_input "Destination port" STREAM_PORT "$default_port"
-
-    # Bitrate
-    prompt_input "Bitrate (e.g., 100M, 1G, 0=unlimited)" STREAM_BITRATE "100M"
-
-    # Duration
-    prompt_input "Duration (seconds)" STREAM_DURATION "10"
-
-    # DSCP
-    echo ""
-    echo -e "  ${DIM}Common: default, ef, af11, af21, af31, af41, cs1-cs7${NC}"
-    echo -e "  ${DIM}Type 'list' to see full DSCP table${NC}"
-    prompt_input "DSCP class" STREAM_DSCP "default"
-    if [[ "${STREAM_DSCP,,}" == "list" ]]; then
-        show_dscp_table
-        prompt_input "DSCP class" STREAM_DSCP "default"
-    fi
-
-    # Validate DSCP
-    if [[ -z "${DSCP_MAP[${STREAM_DSCP,,}]:-}" ]]; then
-        print_warn "Unknown DSCP '${STREAM_DSCP}', using 'default'"
-        STREAM_DSCP="default"
-    fi
-
-    # Congestion control (TCP only)
-    local cong="default"
-    if [[ "$proto" == "tcp" ]]; then
-        local available_cc
-        available_cc=$(cat /proc/sys/net/ipv4/tcp_allowed_congestion_control 2>/dev/null || echo "cubic reno")
-        echo -e "  ${DIM}Available: ${available_cc}${NC}"
-        prompt_input "Congestion control" cong "cubic"
-    fi
-
-    # Reverse mode
-    prompt_input "Reverse mode (server sends)? (y/n)" REV_CHOICE "n"
-    local rev="no"
-    if [[ "$REV_CHOICE" =~ ^[Yy] ]]; then
-        rev="yes"
-    fi
-
-    # Store config
-    S_PROTO[$stream_num]="$proto"
-    S_PORT[$stream_num]="$STREAM_PORT"
-    S_BITRATE[$stream_num]="$STREAM_BITRATE"
-    S_DURATION[$stream_num]="$STREAM_DURATION"
-    S_DSCP[$stream_num]="${STREAM_DSCP,,}"
-    S_CONGESTION[$stream_num]="$cong"
-    S_REVERSE[$stream_num]="$rev"
-    S_LABEL[$stream_num]="S${stream_num}:${proto^^}:${STREAM_PORT}"
-
-    print_success "Stream #${stream_num} configured: ${VALUE_COLOR}${proto^^}${NC} port ${VALUE_COLOR}${STREAM_PORT}${NC} @ ${VALUE_COLOR}${STREAM_BITRATE}${NC} DSCP=${VALUE_COLOR}${STREAM_DSCP}${NC}"
-}
-
-# ============================================================================
-# SERVER MODE
-# ============================================================================
-run_server_mode() {
-    print_header "Server Mode"
-
-    select_interface "Bind to interface"
-    local bind_ip="$SELECTED_IP"
-    local vrf="$SELECTED_VRF"
-
-    prompt_input "Number of server ports" NUM_PORTS "1"
-    prompt_input "Starting port" START_PORT "5201"
-    prompt_input "One-off mode (exit after one client)? (y/n)" ONE_OFF "n"
-    local one_off="no"
-    if [[ "$ONE_OFF" =~ ^[Yy] ]]; then
-        one_off="yes"
-    fi
-
-    print_section "Launching Servers"
-
-    for (( i=0; i<NUM_PORTS; i++ )); do
-        local port=$((START_PORT + i))
-        local script_file="${SCRIPT_DIR}/server_${port}.sh"
-        local log_file="${LOG_DIR}/server_${port}.log"
-
-        : > "$log_file"
-
-        build_server_script "$script_file" "$port" "$bind_ip" "$vrf" "$log_file" "$one_off"
-
-        bash "$script_file" &
-        local pid=$!
-        PIDS+=("$pid")
-
-        print_success "Server on port ${VALUE_COLOR}${port}${NC} (PID: ${pid})"
-
-        # Start single-stream monitor for each server port
-        start_bandwidth_monitor "$log_file" "Server:${port}" "1000"
-    done
-
-    print_info "Servers running. Press Enter to stop..."
-    read -r
-    cleanup_all
-}
-
-# ============================================================================
-# CLIENT MODE (single stream)
-# ============================================================================
-run_client_mode() {
-    print_header "Client Mode"
-
-    prompt_input "Server IP address" SERVER_IP "127.0.0.1"
-
-    select_interface "Bind to interface (source)"
-    local bind_ip="$SELECTED_IP"
-    local src_ip="$bind_ip"
-    local vrf="$SELECTED_VRF"
-
-    if [[ "$src_ip" == "0.0.0.0" ]]; then
-        src_ip="(auto)"
-    fi
-
-    configure_stream 1 1
-
-    local proto="${S_PROTO[1]}"
-    local port="${S_PORT[1]}"
-    local bitrate="${S_BITRATE[1]}"
-    local duration="${S_DURATION[1]}"
-    local dscp="${S_DSCP[1]}"
-    local cong="${S_CONGESTION[1]}"
-    local rev="${S_REVERSE[1]}"
-
-    # --- Packet Visualization ---
-    draw_packet_detail "1" "$proto" "$src_ip" "$SERVER_IP" "$port" "$dscp" "$bitrate"
-
-    # Confirm launch
-    echo ""
-    echo -ne "  ${PROMPT_COLOR}▶${NC} Launch this stream? (y/n): "
-    local confirm
-    read -r confirm
-    if [[ ! "$confirm" =~ ^[Yy] ]]; then
-        print_warn "Cancelled"
-        return
-    fi
-
-    print_section "Launching Client"
-
-    local script_file="${SCRIPT_DIR}/client_1.sh"
-    local log_file="${LOG_DIR}/client_1.log"
-    : > "$log_file"
-
-    build_client_script "$script_file" "$SERVER_IP" "$port" "$proto" \
-        "$bitrate" "$duration" "$dscp" "$cong" "$rev" "$bind_ip" "$vrf" "$log_file"
-
-    bash "$script_file" &
-    local pid=$!
-    PIDS+=("$pid")
-    print_success "Client PID: ${pid}"
-
-    # Parse target Mbps for bar scaling
-    local target_mbps=1000
-    if [[ "$bitrate" =~ ^([0-9]+)[Mm]$ ]]; then
-        target_mbps="${BASH_REMATCH[1]}"
-    elif [[ "$bitrate" =~ ^([0-9]+)[Gg]$ ]]; then
-        target_mbps=$(( ${BASH_REMATCH[1]} * 1000 ))
-    elif [[ "$bitrate" =~ ^([0-9]+)[Kk]$ ]]; then
-        target_mbps=1
-    fi
-
-    start_bandwidth_monitor "$log_file" "${S_LABEL[1]}" "$target_mbps"
-
-    # Wait for completion
-    echo ""
-    print_info "Stream running for ${duration}s... (Press Enter to abort)"
-    read -t "$((duration + 5))" -r || true
-
-    # Wait for iperf3 to finish
-    wait "$pid" 2>/dev/null || true
-    sleep 1
-
-    print_section "Results"
-    if [[ -f "$log_file" ]]; then
-        # Show summary lines
-        grep -E '(sender|receiver|iperf Done)' "$log_file" 2>/dev/null | while IFS= read -r line; do
-            echo -e "  ${VALUE_COLOR}${line}${NC}"
-        done
-    fi
-}
-
-# ============================================================================
-# MULTI-STREAM MODE
-# ============================================================================
-run_multi_stream_mode() {
-    print_header "Multi-Stream Mode"
-
-    prompt_input "Server IP address" SERVER_IP "127.0.0.1"
-
-    select_interface "Bind to interface (source)"
-    local bind_ip="$SELECTED_IP"
-    local src_ip="$bind_ip"
-    local vrf="$SELECTED_VRF"
-
-    if [[ "$src_ip" == "0.0.0.0" ]]; then
-        src_ip="(auto)"
-    fi
-
-    prompt_input "Number of streams" NUM_STREAMS "2"
-
-    if ! [[ "$NUM_STREAMS" =~ ^[0-9]+$ ]] || (( NUM_STREAMS < 1 || NUM_STREAMS > 20 )); then
-        print_warn "Invalid number. Using 2."
-        NUM_STREAMS=2
-    fi
-
-    # Configure each stream
-    for (( s=1; s<=NUM_STREAMS; s++ )); do
-        configure_stream "$s" "$NUM_STREAMS"
-    done
-
-    # --- Packet Visualization for ALL streams ---
-    print_section "Packet Format Preview"
-    for (( s=1; s<=NUM_STREAMS; s++ )); do
-        draw_packet_detail "$s" "${S_PROTO[$s]}" "$src_ip" "$SERVER_IP" \
-            "${S_PORT[$s]}" "${S_DSCP[$s]}" "${S_BITRATE[$s]}"
-    done
-
-    # Summary table
-    print_section "Stream Summary"
-    printf "  ${LABEL_COLOR}%-6s %-6s %-7s %-10s %-8s %-8s %-10s %-5s${NC}\n" \
-        "Stream" "Proto" "Port" "Bitrate" "DSCP" "TOS" "Congestion" "Rev"
-    echo -e "  ${BORDER_COLOR}$(printf '─%.0s' $(seq 1 62))${NC}"
-    for (( s=1; s<=NUM_STREAMS; s++ )); do
-        local tos_val="${DSCP_MAP[${S_DSCP[$s]}]:-0}"
-        local tos_hex
-        tos_hex=$(printf "0x%02X" "$tos_val")
-        printf "  ${VALUE_COLOR}%-6s${NC} %-6s %-7s %-10s %-8s %-8s %-10s %-5s\n" \
-            "#${s}" "${S_PROTO[$s]^^}" "${S_PORT[$s]}" "${S_BITRATE[$s]}" \
-            "${S_DSCP[$s]}" "${tos_hex}" "${S_CONGESTION[$s]}" "${S_REVERSE[$s]}"
-    done
-
-    # Confirm launch
-    echo ""
-    echo -ne "  ${PROMPT_COLOR}▶${NC} Launch all ${NUM_STREAMS} streams? (y/n): "
-    local confirm
-    read -r confirm
-    if [[ ! "$confirm" =~ ^[Yy] ]]; then
-        print_warn "Cancelled"
-        return
-    fi
-
-    print_section "Launching Streams"
-
-    local -a log_files=()
-    local -a labels=()
-    local -a target_list=()
-
-    for (( s=1; s<=NUM_STREAMS; s++ )); do
-        local script_file="${SCRIPT_DIR}/client_stream_${s}.sh"
-        local log_file="${LOG_DIR}/client_stream_${s}.log"
-        : > "$log_file"
-
-        build_client_script "$script_file" "$SERVER_IP" "${S_PORT[$s]}" \
-            "${S_PROTO[$s]}" "${S_BITRATE[$s]}" "${S_DURATION[$s]}" \
-            "${S_DSCP[$s]}" "${S_CONGESTION[$s]}" "${S_REVERSE[$s]}" \
-            "$bind_ip" "$vrf" "$log_file"
-
-        bash "$script_file" &
-        local pid=$!
-        PIDS+=("$pid")
-        print_success "Stream #${s} launched (PID: ${pid})"
-
-        log_files+=("$log_file")
-        labels+=("${S_LABEL[$s]}")
-
-        # Parse target for bar
-        local target_mbps=1000
-        local br="${S_BITRATE[$s]}"
-        if [[ "$br" =~ ^([0-9]+)[Mm]$ ]]; then
-            target_mbps="${BASH_REMATCH[1]}"
-        elif [[ "$br" =~ ^([0-9]+)[Gg]$ ]]; then
-            target_mbps=$(( ${BASH_REMATCH[1]} * 1000 ))
-        elif [[ "$br" =~ ^([0-9]+)[Kk]$ ]]; then
-            target_mbps=1
-        fi
-        target_list+=("$target_mbps")
-    done
-
-    # Build args for multi-monitor
-    local -a mon_args=()
-    for (( s=0; s<NUM_STREAMS; s++ )); do
-        mon_args+=("${log_files[$s]}" "${labels[$s]}" "${target_list[$s]}")
-    done
-
-    start_multi_bandwidth_monitor "$NUM_STREAMS" "${mon_args[@]}"
-
-    # Find max duration
-    local max_dur=10
-    for (( s=1; s<=NUM_STREAMS; s++ )); do
-        if (( S_DURATION[$s] > max_dur )); then
-            max_dur="${S_DURATION[$s]}"
-        fi
-    done
-
-    echo ""
-    print_info "Streams running (max ${max_dur}s)... Press Enter to abort."
-    read -t "$((max_dur + 10))" -r || true
-
-    # Wait for all pids
-    for pid in "${PIDS[@]}"; do
-        wait "$pid" 2>/dev/null || true
-    done
-    sleep 2
-
-    # Show final results
-    print_section "Final Results"
-    for (( s=1; s<=NUM_STREAMS; s++ )); do
-        local lf="${LOG_DIR}/client_stream_${s}.log"
-        echo -e "  ${ACCENT_COLOR}── Stream #${s} (${S_LABEL[$s]}) ──${NC}"
-        if [[ -f "$lf" ]]; then
-            grep -E '(sender|receiver)' "$lf" 2>/dev/null | while IFS= read -r line; do
-                echo -e "    ${VALUE_COLOR}${line}${NC}"
-            done
-        fi
-    done
-}
-
-# ============================================================================
-# CONGESTION COMPARISON MODE
-# ============================================================================
-run_congestion_comparison() {
-    print_header "Congestion Algorithm Comparison"
-
-    local available_cc
-    available_cc=$(cat /proc/sys/net/ipv4/tcp_allowed_congestion_control 2>/dev/null || echo "cubic reno")
-    print_info "Available algorithms: ${VALUE_COLOR}${available_cc}${NC}"
-
-    prompt_input "Server IP" SERVER_IP "127.0.0.1"
-    prompt_input "Port" CMP_PORT "5201"
-    prompt_input "Bitrate" CMP_BITRATE "100M"
-    prompt_input "Duration per test (seconds)" CMP_DURATION "10"
-
-    echo ""
-    echo -e "  ${DIM}Enter algorithms to compare, space-separated${NC}"
-    prompt_input "Algorithms" CMP_ALGOS "cubic reno bbr"
-
-    read -ra algo_list <<< "$CMP_ALGOS"
-
-    print_section "Running Comparison"
-
-    local -a results=()
-
-    for algo in "${algo_list[@]}"; do
-        print_info "Testing ${VALUE_COLOR}${algo}${NC}..."
-
-        local script_file="${SCRIPT_DIR}/cmp_${algo}.sh"
-        local log_file="${LOG_DIR}/cmp_${algo}.log"
-        : > "$log_file"
-
-        build_client_script "$script_file" "$SERVER_IP" "$CMP_PORT" \
-            "tcp" "$CMP_BITRATE" "$CMP_DURATION" "default" "$algo" "no" "" "" "$log_file"
-
-        bash "$script_file" &
-        local pid=$!
-
-        start_bandwidth_monitor "$log_file" "$algo" "1000"
-
-        wait "$pid" 2>/dev/null || true
-        sleep 1
-
-        # Extract sender result
-        local sender_line
-        sender_line=$(grep -i "sender" "$log_file" 2>/dev/null | tail -1 || true)
-        local sender_bw="N/A"
-        if [[ -n "$sender_line" ]]; then
-            sender_bw=$(echo "$sender_line" | grep -oP '[\d.]+\s+(M|K|G)bits/sec' | tail -1 || echo "N/A")
-        fi
-        results+=("${algo}:${sender_bw}")
-
-        # Kill monitor
-        for mpid in "${MONITOR_PIDS[@]}"; do
-            kill "$mpid" 2>/dev/null || true
-        done
-        MONITOR_PIDS=()
-
-        echo ""
-    done
-
-    # Summary
-    print_section "Comparison Results"
-    printf "  ${LABEL_COLOR}%-15s %-20s${NC}\n" "Algorithm" "Bandwidth"
-    echo -e "  ${BORDER_COLOR}$(printf '─%.0s' $(seq 1 36))${NC}"
-    for entry in "${results[@]}"; do
-        local a="${entry%%:*}"
-        local b="${entry#*:}"
-        printf "  ${VALUE_COLOR}%-15s${NC} %-20s\n" "$a" "$b"
-    done
-}
-
-# ============================================================================
-# QUICK LOOPBACK TEST
-# ============================================================================
-run_loopback_test() {
-    print_header "Quick Loopback Test"
-
-    prompt_input "Protocol (tcp/udp)" LB_PROTO "tcp"
-    prompt_input "Bitrate" LB_BITRATE "100M"
-    prompt_input "Duration" LB_DURATION "5"
-    prompt_input "DSCP" LB_DSCP "default"
-
-    local port=5201
-    local server_script="${SCRIPT_DIR}/lb_server.sh"
-    local server_log="${LOG_DIR}/lb_server.log"
-    local client_script="${SCRIPT_DIR}/lb_client.sh"
-    local client_log="${LOG_DIR}/lb_client.log"
-
-    : > "$server_log"
-    : > "$client_log"
-
-    # Build and start server
-    build_server_script "$server_script" "$port" "127.0.0.1" "" "$server_log" "yes"
-    bash "$server_script" &
-    local srv_pid=$!
-    PIDS+=("$srv_pid")
-    print_success "Loopback server started (PID: ${srv_pid})"
-
-    sleep 1
-
-    # Draw packet
-    draw_packet_detail "1" "$LB_PROTO" "127.0.0.1" "127.0.0.1" "$port" "$LB_DSCP" "$LB_BITRATE"
-
-    # Build and start client
-    build_client_script "$client_script" "127.0.0.1" "$port" "$LB_PROTO" \
-        "$LB_BITRATE" "$LB_DURATION" "$LB_DSCP" "default" "no" "" "" "$client_log"
-
-    bash "$client_script" &
-    local cli_pid=$!
-    PIDS+=("$cli_pid")
-    print_success "Loopback client started (PID: ${cli_pid})"
-
-    start_bandwidth_monitor "$client_log" "Loopback" "1000"
-
-    wait "$cli_pid" 2>/dev/null || true
-    sleep 1
-    kill "$srv_pid" 2>/dev/null || true
-
-    print_section "Results"
-    if [[ -f "$client_log" ]]; then
-        grep -E '(sender|receiver)' "$client_log" 2>/dev/null | while IFS= read -r line; do
-            echo -e "  ${VALUE_COLOR}${line}${NC}"
-        done
-    fi
-}
-
-# ============================================================================
-# LOG MANAGEMENT
-# ============================================================================
-manage_logs() {
-    print_header "Log Management"
-
-    echo -e "  ${MENU_NUM}1)${NC} ${MENU_TEXT}View logs${NC}"
-    echo -e "  ${MENU_NUM}2)${NC} ${MENU_TEXT}Clear all logs${NC}"
-    echo -e "  ${MENU_NUM}3)${NC} ${MENU_TEXT}Export logs${NC}"
-    echo -e "  ${MENU_NUM}4)${NC} ${MENU_TEXT}Back${NC}"
-    echo ""
-    prompt_input "Choice" LOG_CHOICE "1"
-
-    case "$LOG_CHOICE" in
-        1)
-            local logs
-            logs=$(ls -1 "$LOG_DIR"/*.log 2>/dev/null || true)
-            if [[ -z "$logs" ]]; then
-                print_info "No logs found"
+                    kill -KILL "$pid" 2>/dev/null; wait "$pid" 2>/dev/null
+                    tty_echo "    ${RED}[KILLED]${NC}  PID $pid  $lbl"
+                else
+                    wait "$pid" 2>/dev/null; tty_echo "    ${GREEN}[STOP  ]${NC}  PID $pid  $lbl"
+                fi; (( killed++ ))
             else
-                echo ""
-                local idx=0
-                local -a log_arr=()
-                while IFS= read -r lf; do
-                    idx=$((idx + 1))
-                    local size
-                    size=$(wc -c < "$lf" 2>/dev/null || echo "0")
-                    echo -e "  ${MENU_NUM}${idx})${NC} $(basename "$lf") ${DIM}(${size} bytes)${NC}"
-                    log_arr+=("$lf")
-                done <<< "$logs"
-                echo ""
-                prompt_input "View log number (0 to cancel)" LOG_VIEW "0"
-                if [[ "$LOG_VIEW" =~ ^[0-9]+$ ]] && (( LOG_VIEW >= 1 && LOG_VIEW <= ${#log_arr[@]} )); then
-                    echo ""
-                    echo -e "  ${BORDER_COLOR}$(printf '─%.0s' $(seq 1 60))${NC}"
-                    cat "${log_arr[$((LOG_VIEW - 1))]}"
-                    echo -e "  ${BORDER_COLOR}$(printf '─%.0s' $(seq 1 60))${NC}"
-                fi
+                wait "$pid" 2>/dev/null
+                tty_echo "    ${CYAN}[DONE  ]${NC}  PID $pid  $lbl  (already exited)"; (( already++ ))
             fi
-            ;;
-        2)
-            rm -f "$LOG_DIR"/*.log 2>/dev/null || true
-            print_success "All logs cleared"
-            ;;
-        3)
-            local export_dir="${HOME}/iperf3_logs_$(date +%Y%m%d_%H%M%S)"
-            mkdir -p "$export_dir"
-            cp "$LOG_DIR"/*.log "$export_dir/" 2>/dev/null || true
-            print_success "Logs exported to ${VALUE_COLOR}${export_dir}${NC}"
-            ;;
-        4) return ;;
+        done
+    fi
+
+    if (( ${#SERVER_PIDS[@]} > 0 )); then
+        tty_echo ""; tty_echo "${BOLD}  Server Listeners:${NC}"
+        local i
+        for i in "${!SERVER_PIDS[@]}"; do
+            local pid="${SERVER_PIDS[$i]}"
+            local lbl="listener $((i+1)) [port ${SRV_PORT[$i]:-?} bind ${SRV_BIND[$i]:-0.0.0.0}]"
+            if [[ -z "$pid" || "$pid" == "0" ]]; then
+                tty_echo "    ${YELLOW}[SKIP ]${NC}  $lbl  -- no PID"; continue
+            fi
+            if kill -0 "$pid" 2>/dev/null; then
+                kill -TERM "$pid" 2>/dev/null
+                local w=0
+                while kill -0 "$pid" 2>/dev/null && (( w < 6 )); do sleep 0.5; (( w++ )); done
+                if kill -0 "$pid" 2>/dev/null; then
+                    kill -KILL "$pid" 2>/dev/null; wait "$pid" 2>/dev/null
+                    tty_echo "    ${RED}[KILLED]${NC}  PID $pid  $lbl"
+                else
+                    wait "$pid" 2>/dev/null; tty_echo "    ${GREEN}[STOP  ]${NC}  PID $pid  $lbl"
+                fi; (( killed++ ))
+            else
+                wait "$pid" 2>/dev/null
+                tty_echo "    ${CYAN}[DONE  ]${NC}  PID $pid  $lbl  (already exited)"; (( already++ ))
+            fi
+        done
+    fi
+
+    if (( ${#NETEM_IFACES[@]} > 0 )); then
+        tty_echo ""; tty_echo "${BOLD}  tc netem:${NC}"
+        local iface
+        for iface in "${NETEM_IFACES[@]}"; do
+            [[ -z "$iface" ]] && continue
+            tc qdisc del dev "$iface" root 2>/dev/null \
+                && tty_echo "    ${GREEN}[REMOVED]${NC}  netem on $iface" \
+                || tty_echo "    ${YELLOW}[SKIP   ]${NC}  netem on $iface  (already gone)"
+        done
+    fi
+
+    tty_echo ""; tty_echo "${BOLD}  Temporary Files:${NC}"
+    if [[ -n "$TMPDIR" && -d "$TMPDIR" ]]; then
+        local fc=0
+        while IFS= read -r -d '' fp; do
+            local fsz; fsz=$(wc -c < "$fp" 2>/dev/null); fsz="${fsz// /}"
+            tty_echo "    ${CYAN}[DEL]${NC}  $fp  (${fsz:-0} bytes)"; (( fc++ ))
+        done < <(find "$TMPDIR" -maxdepth 3 -type f -print0 2>/dev/null)
+        (( fc == 0 )) && tty_echo "    ${YELLOW}[INFO ]${NC}  No files in $TMPDIR"
+        rm -rf "$TMPDIR" 2>/dev/null \
+            && tty_echo "    ${GREEN}[REMOVED]${NC}  $TMPDIR" \
+            || tty_echo "    ${RED}[ERROR  ]${NC}  Cannot remove $TMPDIR"
+    else
+        tty_echo "    ${YELLOW}[INFO ]${NC}  Temp dir not found or already removed"
+    fi
+
+    tty_echo ""; tty_echo "${BOLD}${CYAN}+${sep}+${NC}"
+    tty_echo "  ${GREEN}Processes stopped : ${killed}${NC}"
+    tty_echo "  ${CYAN}Already exited    : ${already}${NC}"
+    tty_echo "${BOLD}${GREEN}  Cleanup complete. All resources released.${NC}"
+    tty_echo "${BOLD}${CYAN}+${sep}+${NC}"; tty_echo ""
+}
+
+_trap_int()  { printf '\n'>/dev/tty 2>/dev/null; tty_echo "${BOLD}${YELLOW}  [SIGINT]  Ctrl+C -- stopping...${NC}";         cleanup "SIGINT (Ctrl+C)"; exit 130; }
+_trap_term() { printf '\n'>/dev/tty 2>/dev/null; tty_echo "${BOLD}${YELLOW}  [SIGTERM] Stopping...${NC}";                    cleanup "SIGTERM";         exit 143; }
+_trap_quit() { printf '\n'>/dev/tty 2>/dev/null; tty_echo "${BOLD}${YELLOW}  [SIGQUIT] Ctrl+\\ -- stopping...${NC}";         cleanup "SIGQUIT";         exit 131; }
+_trap_hup()  { printf '\n'>/dev/tty 2>/dev/null; tty_echo "${BOLD}${YELLOW}  [SIGHUP]  Terminal closed -- stopping...${NC}"; cleanup "SIGHUP";          exit 129; }
+_trap_tstp() {
+    printf '\n'>/dev/tty 2>/dev/null
+    tty_echo "${BOLD}${YELLOW}  [Ctrl+Z blocked]${NC}  Backgrounding orphans iperf3 processes."
+    tty_echo "${YELLOW}  Use Ctrl+C to stop cleanly.${NC}"
+}
+_trap_exit() { local ec=$?; (( CLEANUP_DONE == 0 )) && cleanup "exit (code ${ec})"; }
+
+register_traps() {
+    trap '_trap_exit' EXIT; trap '_trap_int' INT; trap '_trap_term' TERM
+    trap '_trap_quit' QUIT; trap '_trap_hup' HUP; trap '_trap_tstp' TSTP
+}
+
+# =============================================================================
+# SECTION 5 — INITIALIZATION
+# =============================================================================
+
+find_iperf3() {
+    local candidates=(
+        "$(which iperf3 2>/dev/null)"
+        "/usr/bin/iperf3" "/usr/local/bin/iperf3"
+        "/usr/sbin/iperf3" "/snap/bin/iperf3"
+        "$HOME/.local/bin/iperf3"
+    )
+    local c
+    for c in "${candidates[@]}"; do
+        [[ -n "$c" && -x "$c" ]] && { IPERF3_BIN="$c"; return 0; }
+    done
+    printf '%b\n' "${RED}ERROR: iperf3 not found.${NC}"
+    printf '%b\n' "${YELLOW}Install: apt install iperf3 | yum install iperf3 | brew install iperf3${NC}"
+    exit 1
+}
+
+get_iperf3_version() {
+    local out; out=$("$IPERF3_BIN" --version 2>&1)
+    local ver
+    ver=$(printf '%s' "$out" | grep -oE 'iperf[[:space:]]+[0-9]+\.[0-9]+(\.[0-9]+)?' \
+          | grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?' | head -1)
+    [[ -z "$ver" ]] && ver=$(printf '%s' "$out" | grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?' | head -1)
+    IPERF3_MAJOR=$(printf '%s' "$ver" | cut -d. -f1); IPERF3_MAJOR="${IPERF3_MAJOR:-3}"
+    IPERF3_MINOR=$(printf '%s' "$ver" | cut -d. -f2); IPERF3_MINOR="${IPERF3_MINOR:-0}"
+    IPERF3_PATCH=$(printf '%s' "$ver" | cut -d. -f3); IPERF3_PATCH="${IPERF3_PATCH:-0}"
+}
+
+version_ge() {
+    local mj="$1" mn="${2:-0}" pt="${3:-0}"
+    (( IPERF3_MAJOR > mj )) && return 0; (( IPERF3_MAJOR < mj )) && return 1
+    (( IPERF3_MINOR > mn )) && return 0; (( IPERF3_MINOR < mn )) && return 1
+    (( IPERF3_PATCH >= pt ))
+}
+
+detect_forceflush() {
+    "$IPERF3_BIN" --help 2>&1 | grep -q 'forceflush' \
+        && FORCEFLUSH_SUPPORTED=1 || FORCEFLUSH_SUPPORTED=0
+    version_ge 3 12 && NOFQ_SUPPORTED=1 || NOFQ_SUPPORTED=0
+}
+
+check_root() {
+    if [[ $EUID -eq 0 ]]; then IS_ROOT=1
+    else
+        IS_ROOT=0
+        printf '%b\n' "${YELLOW}WARNING: Not root -- VRF/netem/ports <1024 need root.${NC}"
+    fi
+}
+
+init_tmpdir() {
+    TMPDIR=$(mktemp -d /tmp/iperf3_mgr.XXXXXX)
+    [[ -d "$TMPDIR" ]] || { printf '%b\n' "${RED}ERROR: cannot create temp dir.${NC}"; exit 1; }
+}
+
+# =============================================================================
+# SECTION 6 — VRF & INTERFACE DISCOVERY
+# =============================================================================
+
+build_vrf_maps() {
+    IFACE_TO_VRF=(); VRF_MASTERS=(); VRF_LIST=()
+    command -v ip >/dev/null 2>&1 || return
+    local line vn
+
+    while IFS= read -r line; do
+        [[ "$line" =~ ^[[:space:]]*$ ]] && continue
+        vn=$(awk '{print $1}' <<< "$line")
+        [[ -z "$vn" || "$vn" == "Name" ]] && continue
+        local d=0 v
+        for v in "${VRF_LIST[@]}"; do [[ "$v" == "$vn" ]] && d=1 && break; done
+        (( d )) || VRF_LIST+=("$vn")
+    done < <(ip vrf show 2>/dev/null)
+
+    while IFS= read -r line; do
+        [[ "$line" =~ ^[0-9]+: ]] || continue
+        local mn; mn=$(echo "$line" | grep -oE '^[0-9]+:[[:space:]]+[^@: ]+' | awk '{print $2}')
+        [[ -z "$mn" ]] && continue
+        VRF_MASTERS["$mn"]=1
+        local d=0 v
+        for v in "${VRF_LIST[@]}"; do [[ "$v" == "$mn" ]] && d=1 && break; done
+        (( d )) || VRF_LIST+=("$mn")
+    done < <(ip -d link show type vrf 2>/dev/null)
+
+    for vn in "${VRF_LIST[@]}"; do
+        while IFS= read -r line; do
+            [[ "$line" =~ ^[0-9]+: ]] || continue
+            local iface; iface=$(echo "$line" | grep -oE '^[0-9]+:[[:space:]]+[^@: ]+' | awk '{print $2}')
+            [[ -n "$iface" ]] && IFACE_TO_VRF["$iface"]="$vn"
+        done < <(ip link show master "$vn" 2>/dev/null)
+    done
+}
+
+get_iface_state() {
+    local iface="$1" fl=""
+    command -v ip >/dev/null 2>&1 && fl=$(ip link show dev "$iface" 2>/dev/null | head -1)
+    if [[ -n "$fl" ]]; then
+        local flags; flags=$(echo "$fl" | grep -oE '<[^>]+>')
+        [[ "$flags" == *"LOWER_UP"*   ]] && printf '%s' 'up'         && return
+        [[ "$flags" == *"NO-CARRIER"* ]] && printf '%s' 'no-carrier' && return
+        [[ "$flags" =~ (^|,)UP(,|>)  ]] && printf '%s' 'no-carrier' && return
+        printf '%s' 'down'; return
+    fi
+    local op=""
+    [[ -r /sys/class/net/$iface/operstate ]] && op=$(< /sys/class/net/$iface/operstate 2>/dev/null)
+    op="${op%$'\n'}"
+    if [[ "$op" == "unknown" || -z "$op" ]]; then
+        if [[ -r /sys/class/net/$iface/carrier ]]; then
+            local c; c=$(< /sys/class/net/$iface/carrier 2>/dev/null); c="${c%$'\n'}"
+            [[ "$c" == "1" ]] && printf '%s' 'up'   && return
+            [[ "$c" == "0" ]] && printf '%s' 'down' && return
+        fi
+        printf '%s' 'unknown'; return
+    fi
+    printf '%s' "$op"
+}
+
+get_iface_speed() {
+    local iface="$1"
+    if [[ -r /sys/class/net/$iface/speed ]]; then
+        local rs; rs=$(cat /sys/class/net/$iface/speed 2>/dev/null); rs="${rs//[[:space:]]/}"
+        if [[ "$rs" =~ ^[0-9]+$ ]] && (( rs > 0 )); then
+            (( rs >= 1000000 )) && printf '%s' "$((rs/1000000)) Tb/s" && return
+            (( rs >= 1000    )) && printf '%s' "$((rs/1000)) Gb/s"    && return
+            printf '%s' "${rs} Mb/s"; return
+        fi
+    fi
+    command -v ethtool >/dev/null 2>&1 && {
+        local es; es=$(ethtool "$iface" 2>/dev/null | grep -oE 'Speed: [0-9]+Mb/s' | grep -oE '[0-9]+')
+        if [[ -n "$es" && "$es" =~ ^[0-9]+$ ]]; then
+            (( es >= 1000000 )) && printf '%s' "$((es/1000000)) Tb/s" && return
+            (( es >= 1000    )) && printf '%s' "$((es/1000)) Gb/s"    && return
+            printf '%s' "${es} Mb/s"; return
+        fi
+    }
+    printf '%s' 'N/A'
+}
+
+get_interface_list() {
+    IFACE_NAMES=(); IFACE_IPS=(); IFACE_STATES=(); IFACE_SPEEDS=(); IFACE_VRFS=()
+    [[ -d /sys/class/net ]] || return
+    local iface
+    for iface in /sys/class/net/*/; do
+        iface=$(basename "$iface")
+        [[ "$iface" == "lo"     ]] && continue; [[ "$iface" == docker*  ]] && continue
+        [[ "$iface" == veth*    ]] && continue; [[ "$iface" == br-*     ]] && continue
+        [[ "$iface" == virbr*   ]] && continue; [[ "$iface" == dummy*   ]] && continue
+        [[ "$iface" == pimreg*  ]] && continue; [[ "$iface" == pim6reg* ]] && continue
+        [[ -n "${VRF_MASTERS[$iface]+x}" ]] && continue
+        local ip_addr="N/A"
+        command -v ip >/dev/null 2>&1 && {
+            local ri; ri=$(ip -4 addr show dev "$iface" 2>/dev/null \
+                | grep -oE 'inet [0-9.]+' | awk '{print $2}' | head -1)
+            [[ -n "$ri" ]] && ip_addr="$ri"
+        }
+        local state; state="$(get_iface_state "$iface")"
+        local speed; speed="$(get_iface_speed "$iface")"
+        local vrf="GRT"
+        [[ -n "${IFACE_TO_VRF[$iface]+x}" ]] && vrf="${IFACE_TO_VRF[$iface]}"
+        IFACE_NAMES+=("$iface"); IFACE_IPS+=("$ip_addr")
+        IFACE_STATES+=("$state"); IFACE_SPEEDS+=("$speed"); IFACE_VRFS+=("$vrf")
+    done
+}
+
+# =============================================================================
+# SECTION 7 — INTERFACE TABLE
+# =============================================================================
+# Column widths: NUM=4  IFACE=15  IP=20  STATE=10  SPEED=10  VRF=14
+# Sum: 4+15+20+10+10+14=73  + 7 border chars = 80 = COLS ✓
+_CN=4; _CI=15; _CIP=20; _CS=10; _CSP=10; _CV=14
+
+_iface_rule() {
+    printf '+%s+%s+%s+%s+%s+%s+\033[K\n' \
+        "$(rpt '-' $_CN)" "$(rpt '-' $_CI)" "$(rpt '-' $_CIP)" \
+        "$(rpt '-' $_CS)" "$(rpt '-' $_CSP)" "$(rpt '-' $_CV)"
+}
+_iface_hdr() {
+    printf '|%s|%s|%s|%s|%s|%s|\033[K\n' \
+        "$(pad_to " #"          $_CN )" "$(pad_to " Interface"  $_CI )" \
+        "$(pad_to " IP Address" $_CIP)" "$(pad_to " State"      $_CS )" \
+        "$(pad_to " Speed"      $_CSP)" "$(pad_to " VRF"        $_CV )"
+}
+_iface_banner() {
+    local lbl="$1" inner=$(( COLS - 2 ))
+    local visible_len=$(( ${#lbl} + 2 ))
+    local rp=$(( inner - visible_len )); (( rp < 0 )) && rp=0
+    printf '|'; printf '%b' "${BOLD}${CYAN}  ${lbl}${NC}"
+    printf '%s|\033[K\n' "$(rpt ' ' $rp)"
+}
+_iface_row() {
+    local num="$1" iface="$2" ip="$3" state="$4" speed="$5" vrf="$6"
+    local sc; case "$state" in up) sc="$GREEN";; down) sc="$RED";; *) sc="$YELLOW";; esac
+    local fs; fs=$(pad_to " $state" $_CS)
+    printf '|%s|%s|%s|%b%s%b|%s|%s|\033[K\n' \
+        "$(pad_to " $num"   $_CN)" "$(pad_to " $iface" $_CI)" \
+        "$(pad_to " $ip"    $_CIP)" "$sc" "$fs" "$NC" \
+        "$(pad_to " $speed" $_CSP)" "$(pad_to " $vrf"  $_CV)"
+}
+
+show_interface_table() {
+    local total=${#IFACE_NAMES[@]}
+    bline '='; bcenter "${BOLD}Network Interfaces${NC}"; bline '='
+    if (( total == 0 )); then
+        bempty; bleft "  No interfaces found."; bempty; bline '='; return
+    fi
+    _iface_rule; _iface_hdr; _iface_rule
+    local i gc=0
+    for (( i=0; i<total; i++ )); do [[ "${IFACE_VRFS[$i]}" == "GRT" ]] && (( gc++ )); done
+    if (( gc > 0 )); then
+        _iface_banner "[ GRT -- Global Routing Table ]  (${gc} interface(s))"; _iface_rule
+        for (( i=0; i<total; i++ )); do
+            [[ "${IFACE_VRFS[$i]}" != "GRT" ]] && continue
+            _iface_row "$((i+1))" "${IFACE_NAMES[$i]}" "${IFACE_IPS[$i]}" \
+                "${IFACE_STATES[$i]}" "${IFACE_SPEEDS[$i]}" "GRT"
+        done
+    fi
+    local vn
+    for vn in "${VRF_LIST[@]}"; do
+        local mc=0
+        for (( i=0; i<total; i++ )); do [[ "${IFACE_VRFS[$i]}" == "$vn" ]] && (( mc++ )); done
+        (( mc == 0 )) && continue
+        _iface_rule; _iface_banner "[ VRF: ${vn} ]  (${mc} interface(s))"; _iface_rule
+        for (( i=0; i<total; i++ )); do
+            [[ "${IFACE_VRFS[$i]}" != "$vn" ]] && continue
+            _iface_row "$((i+1))" "${IFACE_NAMES[$i]}" "${IFACE_IPS[$i]}" \
+                "${IFACE_STATES[$i]}" "${IFACE_SPEEDS[$i]}" "$vn"
+        done
+    done
+    _iface_rule; bline '='
+}
+
+select_bind_interface() {
+    local mode="${1:-client}" total=${#IFACE_NAMES[@]}
+    SELECTED_IFACE=""; SELECTED_IP=""; SELECTED_VRF=""
+    show_interface_table; echo ""
+    [[ "$mode" == "server" ]] \
+        && echo "  Enter interface # to bind, or 0 for all (0.0.0.0):" \
+        || echo "  Enter interface # as source bind, or 0 to skip (auto):"
+    echo ""
+    local sel
+    while true; do
+        read -r -p "  Selection [0]: " sel </dev/tty; sel="${sel:-0}"
+        if [[ ! "$sel" =~ ^[0-9]+$ ]]; then
+            printf '%b\n' "${RED}  Please enter a number (0-${total}).${NC}"; continue
+        fi
+        if (( sel == 0 )); then
+            SELECTED_IFACE=""; SELECTED_IP=""; SELECTED_VRF=""; return 0
+        elif (( sel >= 1 && sel <= total )); then
+            local idx=$(( sel - 1 ))
+            SELECTED_IFACE="${IFACE_NAMES[$idx]}"; SELECTED_IP="${IFACE_IPS[$idx]}"
+            SELECTED_VRF="${IFACE_VRFS[$idx]}"
+            [[ "${IFACE_STATES[$idx]}" != "up" ]] && \
+                printf '%b\n' "${YELLOW}  WARNING: ${SELECTED_IFACE} state='${IFACE_STATES[$idx]}'. Proceeding.${NC}"
+            [[ "$SELECTED_VRF" == "GRT" ]] && SELECTED_VRF=""
+            return 0
+        else
+            printf '%b\n' "${RED}  Invalid. Enter 0 or 1-${total}.${NC}"
+        fi
+    done
+}
+
+# =============================================================================
+# SECTION 8 — DSCP SUPPORT
+# =============================================================================
+
+dscp_name_to_value() {
+    local u; u=$(printf '%s' "$1" | tr '[:lower:]' '[:upper:]')
+    if [[ "$u" =~ ^[0-9]+$ ]]; then
+        (( u >= 0 && u <= 63 )) && printf '%d' "$u" && return 0
+        printf '%s' '-1'; return 1
+    fi
+    case "$u" in
+        DEFAULT|CS0) printf '%s' '0'  ;; CS1)  printf '%s' '8'  ;; CS2)  printf '%s' '16' ;; CS3)  printf '%s' '24' ;;
+        CS4)  printf '%s' '32' ;; CS5)  printf '%s' '40' ;; CS6)  printf '%s' '48' ;; CS7)  printf '%s' '56' ;;
+        AF11) printf '%s' '10' ;; AF12) printf '%s' '12' ;; AF13) printf '%s' '14' ;;
+        AF21) printf '%s' '18' ;; AF22) printf '%s' '20' ;; AF23) printf '%s' '22' ;;
+        AF31) printf '%s' '26' ;; AF32) printf '%s' '28' ;; AF33) printf '%s' '30' ;;
+        AF41) printf '%s' '34' ;; AF42) printf '%s' '36' ;; AF43) printf '%s' '38' ;;
+        EF)   printf '%s' '46' ;; VA)   printf '%s' '44' ;;
+        *)    printf '%s' '-1'; return 1 ;;
     esac
 }
 
-# ============================================================================
-# MAIN MENU
-# ============================================================================
-main_menu() {
-    while true; do
-        print_header "iperf3 Multi-Stream Traffic Manager v6.2"
-        echo ""
-        echo -e "  ${MENU_NUM}1)${NC} ${MENU_TEXT}Check / Install iperf3${NC}"
-        echo -e "  ${MENU_NUM}2)${NC} ${MENU_TEXT}Server Mode${NC}"
-        echo -e "  ${MENU_NUM}3)${NC} ${MENU_TEXT}Client Mode (Single Stream)${NC}"
-        echo -e "  ${MENU_NUM}4)${NC} ${MENU_TEXT}Client Mode (Multi-Stream)${NC}"
-        echo -e "  ${MENU_NUM}5)${NC} ${MENU_TEXT}Congestion Algorithm Comparison${NC}"
-        echo -e "  ${MENU_NUM}6)${NC} ${MENU_TEXT}Quick Loopback Test${NC}"
-        echo -e "  ${MENU_NUM}7)${NC} ${MENU_TEXT}DSCP Reference Table${NC}"
-        echo -e "  ${MENU_NUM}8)${NC} ${MENU_TEXT}Log Management${NC}"
-        echo -e "  ${MENU_NUM}9)${NC} ${MENU_TEXT}Network Interfaces & VRF${NC}"
-        echo -e "  ${MENU_NUM}0)${NC} ${MENU_TEXT}Exit${NC}"
-        echo ""
-        prompt_input "Select option" MENU_CHOICE ""
+show_dscp_table() {
+    echo ""; print_header "DSCP Quick Reference Table"; bempty
+    printf '  %-12s  %-4s  %-4s  %-44s\n' "Name" "DSCP" "TOS" "Typical Use Case"
+    printf '  %s  %s  %s  %s\n' "$(rpt '-' 12)" "$(rpt '-' 4)" "$(rpt '-' 4)" "$(rpt '-' 44)"
+    local rows=(
+        "Default/CS0:0:0:Best Effort"            "CS1:8:32:Scavenger / Low-priority bulk"
+        "AF11:10:40:Low data (assured, low drop)" "AF12:12:48:Low data (assured, med drop)"
+        "AF13:14:56:Low data (assured, high drop)" "CS2:16:64:OAM / Network management"
+        "AF21:18:72:High-throughput data (low drop)" "AF22:20:80:High-throughput data (med drop)"
+        "AF23:22:88:High-throughput data (high drop)" "CS3:24:96:Broadcast video / Signaling"
+        "AF31:26:104:Multimedia streaming (low drop)" "AF32:28:112:Multimedia streaming (med drop)"
+        "AF33:30:120:Multimedia streaming (high drop)" "CS4:32:128:Real-time interactive"
+        "AF41:34:136:Multimedia conf (low drop)" "AF42:36:144:Multimedia conf (med drop)"
+        "AF43:38:152:Multimedia conf (high drop)" "CS5:40:160:Signaling -- call control"
+        "VA:44:176:Voice Admit (CAC admitted)"    "EF:46:184:Expedited Forwarding -- VoIP"
+        "CS6:48:192:Network Control (BGP/OSPF)"   "CS7:56:224:Reserved / Network Critical"
+    )
+    local e
+    for e in "${rows[@]}"; do
+        IFS=':' read -r nm dv tv uc <<< "$e"
+        printf '  %-12s  %-4s  %-4s  %-44s\n' "$nm" "$dv" "$tv" "$uc"
+    done
+    printf '  %s  %s  %s  %s\n' "$(rpt '-' 12)" "$(rpt '-' 4)" "$(rpt '-' 4)" "$(rpt '-' 44)"
+    echo ""; echo "  TOS = DSCP * 4  |  Enter name, 0-63, 'list', or press Enter for none."; echo ""
+}
 
-        case "$MENU_CHOICE" in
-            1) check_iperf3; press_enter ;;
-            2) run_server_mode; press_enter ;;
-            3) run_client_mode; press_enter ;;
-            4) run_multi_stream_mode; press_enter ;;
-            5) run_congestion_comparison; press_enter ;;
-            6) run_loopback_test; press_enter ;;
-            7) show_dscp_table; press_enter ;;
-            8) manage_logs; press_enter ;;
-            9)
-                build_vrf_maps
-                list_interfaces
-                if [[ ${#VRF_DEVICE_MAP[@]} -gt 0 ]]; then
-                    print_section "VRF Devices"
-                    for vrf in "${!VRF_DEVICE_MAP[@]}"; do
-                        print_info "${VALUE_COLOR}${vrf}${NC}"
-                    done
-                    print_section "VRF Interface Mappings"
-                    for iface in "${!VRF_IFACE_MAP[@]}"; do
-                        print_info "${iface} → ${VALUE_COLOR}${VRF_IFACE_MAP[$iface]}${NC}"
-                    done
-                else
-                    print_info "No VRF devices detected"
+prompt_dscp() {
+    local snum="${1:-1}"; PROMPT_DSCP_NAME=""; PROMPT_DSCP_VAL=-1
+    while true; do
+        echo ""
+        printf "  Stream %d - DSCP (name/0-63/'list'/Enter=none) [none]: " "$snum"
+        local inp; read -r inp </dev/tty; inp="${inp:-}"
+        [[ -z "$inp" ]] && return 0
+        local lo; lo=$(printf '%s' "$inp" | tr '[:upper:]' '[:lower:]')
+        if [[ "$lo" == "list" ]]; then show_dscp_table; continue; fi
+        local val; val=$(dscp_name_to_value "$inp")
+        if [[ "$val" == "-1" ]]; then
+            printf '%b\n' "${RED}  Invalid DSCP. Try EF, AF41, CS3, 0-63, 'list', or press Enter.${NC}"; continue
+        fi
+        PROMPT_DSCP_NAME=$(printf '%s' "$inp" | tr '[:lower:]' '[:upper:]')
+        PROMPT_DSCP_VAL="$val"; return 0
+    done
+}
+
+# =============================================================================
+# SECTION 9 — STREAM CONFIGURATION
+# =============================================================================
+
+configure_client_streams() {
+    local num="$1" dbind="${2:-}" dvrf="${3:-}"
+    S_PROTO=();    S_TARGET=();    S_PORT=();      S_BW=()
+    S_DURATION=(); S_DSCP_NAME=(); S_DSCP_VAL=();  S_PARALLEL=()
+    S_REVERSE=();  S_CCA=();       S_WINDOW=();     S_MSS=()
+    S_BIND=();     S_VRF=();       S_DELAY=();      S_JITTER=()
+    S_LOSS=();     S_NOFQ=();      S_LOGFILE=();    S_SCRIPT=()
+    S_START_TS=(); S_STATUS_CACHE=(); S_ERROR_MSG=()
+    local lt="" lp=5200 i
+
+    for (( i=0; i<num; i++ )); do
+        local sn=$(( i + 1 ))
+        echo ""; bline '='; bcenter "${BOLD}Client Stream ${sn} of ${num}${NC}"; bline '='; echo ""
+
+        local proto
+        while true; do
+            read -r -p "  Protocol [TCP/UDP] (default TCP): " proto </dev/tty
+            proto="${proto:-TCP}"; proto=$(printf '%s' "$proto" | tr '[:lower:]' '[:upper:]')
+            [[ "$proto" == "TCP" || "$proto" == "UDP" ]] && break
+            printf '%b\n' "${RED}  Enter TCP or UDP.${NC}"
+        done; S_PROTO+=("$proto")
+
+        local tprompt
+        [[ -n "$lt" ]] && tprompt="  Target server IP/hostname [$lt]" \
+                       || tprompt="  Target server IP/hostname"
+        local tgt
+        while true; do
+            read -r -p "${tprompt}: " tgt </dev/tty; tgt="${tgt:-$lt}"
+            if [[ -z "$tgt" ]]; then printf '%b\n' "${RED}  Target is required.${NC}"; continue; fi
+            validate_ip "$tgt" || \
+                printf '%b\n' "${YELLOW}  Warning: '${tgt}' may not be a valid IP/hostname. Continuing.${NC}"
+            break
+        done; lt="$tgt"; S_TARGET+=("$tgt")
+
+        local dp=$(( lp + 1 )) port
+        while true; do
+            read -r -p "  Server port [$dp]: " port </dev/tty; port="${port:-$dp}"
+            if validate_port "$port"; then
+                port=$(( 10#$port ))
+                (( port < 1024 && IS_ROOT == 0 )) && \
+                    printf '%b\n' "${YELLOW}  WARNING: port $port < 1024 requires root.${NC}"
+                break
+            fi; printf '%b\n' "${RED}  Invalid port. Enter 1-65535.${NC}"
+        done; lp="$port"; S_PORT+=("$port")
+
+        local bw=""
+        if [[ "$proto" == "UDP" ]]; then
+            while true; do
+                read -r -p "  Bandwidth (required for UDP, e.g. 100M): " bw </dev/tty; bw="${bw:-100M}"
+                validate_bandwidth "$bw" && break; printf '%b\n' "${RED}  Invalid bandwidth.${NC}"
+            done
+        else
+            while true; do
+                read -r -p "  Bandwidth limit (empty=unlimited): " bw </dev/tty; bw="${bw:-}"
+                validate_bandwidth "$bw" && break; printf '%b\n' "${RED}  Invalid bandwidth.${NC}"
+            done
+        fi; S_BW+=("$bw")
+
+        local din dval
+        while true; do
+            read -r -p "  Duration seconds (0=unlimited) [10]: " din </dev/tty; din="${din:-10}"
+            if validate_duration "$din"; then
+                [[ "$din" == "unlimited" || "$din" == "inf" ]] && dval=0 || dval=$(( 10#$din ))
+                break
+            fi; printf '%b\n' "${RED}  Invalid. Enter non-negative integer or 'unlimited'.${NC}"
+        done; S_DURATION+=("$dval")
+
+        prompt_dscp "$sn"; S_DSCP_NAME+=("$PROMPT_DSCP_NAME"); S_DSCP_VAL+=("$PROMPT_DSCP_VAL")
+
+        local pv
+        while true; do
+            read -r -p "  Parallel threads (-P) [1]: " pv </dev/tty; pv="${pv:-1}"
+            if [[ "$pv" =~ ^[0-9]+$ ]] && (( 10#$pv >= 1 && 10#$pv <= 128 )); then
+                pv=$(( 10#$pv )); break
+            fi; printf '%b\n' "${RED}  Enter 1-128.${NC}"
+        done; S_PARALLEL+=("$pv")
+
+        local ri; read -r -p "  Reverse mode -R? [no]: " ri </dev/tty
+        local rev=0; [[ "$ri" =~ ^[Yy] ]] && rev=1; S_REVERSE+=("$rev")
+
+        local cca="" win="" mss=""
+        if [[ "$proto" == "TCP" ]]; then
+            echo ""; printf '%b\n' "${CYAN}  -- TCP Options (press Enter to skip each) --${NC}"
+            [[ -r /proc/sys/net/ipv4/tcp_available_congestion_control ]] && \
+                printf '%b  Available CCAs: %s%b\n' "$CYAN" \
+                "$(< /proc/sys/net/ipv4/tcp_available_congestion_control)" "$NC"
+            read -r -p "  CCA [kernel default]: " cca </dev/tty; cca="${cca:-}"
+            while true; do
+                read -r -p "  Window size (e.g. 256K, empty=default): " win </dev/tty; win="${win:-}"
+                [[ -z "$win" || "$win" =~ ^[0-9]+[KMGkmg]?$ ]] && break
+                printf '%b\n' "${RED}  Invalid.${NC}"
+            done
+            while true; do
+                read -r -p "  MSS (e.g. 1460, empty=default): " mss </dev/tty; mss="${mss:-}"
+                [[ -z "$mss" ]] && break
+                [[ "$mss" =~ ^[0-9]+$ ]] && (( 10#$mss >= 512 && 10#$mss <= 9000 )) && break
+                printf '%b\n' "${RED}  Enter 512-9000 or press Enter.${NC}"
+            done
+        fi
+        S_CCA+=("$cca"); S_WINDOW+=("$win"); S_MSS+=("$mss")
+
+        local bip
+        if [[ -n "$dbind" && "$dbind" != "N/A" ]]; then
+            read -r -p "  Bind source IP [$dbind]: " bip </dev/tty; bip="${bip:-$dbind}"
+        else
+            read -r -p "  Bind source IP (press Enter for auto): " bip </dev/tty; bip="${bip:-}"
+        fi; S_BIND+=("$bip")
+
+        local vval
+        if [[ -n "$dvrf" ]]; then
+            read -r -p "  VRF [$dvrf]: " vval </dev/tty; vval="${vval:-$dvrf}"
+        else
+            read -r -p "  VRF (press Enter for GRT/none): " vval </dev/tty; vval="${vval:-}"
+        fi
+        [[ -n "$vval" && $IS_ROOT -eq 0 ]] && \
+            printf '%b\n' "${YELLOW}  WARNING: ip vrf exec requires root.${NC}"
+        S_VRF+=("$vval")
+
+        echo ""; printf '%b\n' "${CYAN}  -- Network Impairment via tc netem (Enter to skip each) --${NC}"
+        local dly
+        while true; do
+            read -r -p "  Delay ms   [skip]: " dly </dev/tty; dly="${dly:-}"
+            [[ -z "$dly" ]] && break; validate_float "$dly" && break
+            printf '%b\n' "${RED}  Invalid.${NC}"
+        done
+        local jit=""
+        if [[ -n "$dly" ]]; then
+            while true; do
+                read -r -p "  Jitter ms  [skip]: " jit </dev/tty; jit="${jit:-}"
+                [[ -z "$jit" ]] && break; validate_float "$jit" && break
+                printf '%b\n' "${RED}  Invalid.${NC}"
+            done
+        fi
+        local loss
+        while true; do
+            read -r -p "  Loss %     [skip]: " loss </dev/tty; loss="${loss:-}"
+            [[ -z "$loss" ]] && break
+            if validate_float "$loss"; then
+                local li; li=$(printf '%.0f' "$loss" 2>/dev/null)
+                (( li > 100 )) && printf '%b\n' "${RED}  Loss must be 0-100.${NC}" && continue; break
+            fi; printf '%b\n' "${RED}  Invalid.${NC}"
+        done
+        [[ ( -n "$dly" || -n "$jit" || -n "$loss" ) && $IS_ROOT -eq 0 ]] && \
+            printf '%b\n' "${YELLOW}  WARNING: tc netem requires root.${NC}"
+        S_DELAY+=("$dly"); S_JITTER+=("$jit"); S_LOSS+=("$loss")
+
+        local nofq=0
+        (( NOFQ_SUPPORTED )) && {
+            local nfi; read -r -p "  Disable FQ socket pacing? [no]: " nfi </dev/tty
+            [[ "$nfi" =~ ^[Yy] ]] && nofq=1
+        }; S_NOFQ+=("$nofq")
+
+        S_LOGFILE+=(""); S_SCRIPT+=(""); S_START_TS+=(0)
+        S_STATUS_CACHE+=("STARTING"); S_ERROR_MSG+=("")
+    done
+    STREAM_COUNT="$num"
+}
+
+configure_server_streams() {
+    local num="$1" dbind="${2:-}" dvrf="${3:-}"
+    SRV_PORT=(); SRV_BIND=(); SRV_VRF=(); SRV_ONEOFF=(); SRV_LOGFILE=(); SRV_SCRIPT=()
+    local lp=5200 i
+    for (( i=0; i<num; i++ )); do
+        local sn=$(( i + 1 ))
+        echo ""; bline '='; bcenter "${BOLD}Server Listener ${sn} of ${num}${NC}"; bline '='; echo ""
+        local dp=$(( lp + 1 )) port
+        while true; do
+            read -r -p "  Listen port [$dp]: " port </dev/tty; port="${port:-$dp}"
+            if validate_port "$port"; then
+                port=$(( 10#$port ))
+                (( port < 1024 && IS_ROOT == 0 )) && \
+                    printf '%b\n' "${YELLOW}  WARNING: port $port < 1024 requires root.${NC}"
+                break
+            fi; printf '%b\n' "${RED}  Invalid port. Enter 1-65535.${NC}"
+        done; lp="$port"; SRV_PORT+=("$port")
+        local bip
+        if [[ -n "$dbind" && "$dbind" != "N/A" ]]; then
+            read -r -p "  Bind IP [$dbind]: " bip </dev/tty; bip="${bip:-$dbind}"
+        else
+            read -r -p "  Bind IP (press Enter for 0.0.0.0): " bip </dev/tty; bip="${bip:-}"
+        fi; SRV_BIND+=("$bip")
+        local vval
+        if [[ -n "$dvrf" ]]; then
+            read -r -p "  VRF [$dvrf]: " vval </dev/tty; vval="${vval:-$dvrf}"
+        else
+            read -r -p "  VRF (press Enter for GRT/none): " vval </dev/tty; vval="${vval:-}"
+        fi
+        [[ -n "$vval" && $IS_ROOT -eq 0 ]] && \
+            printf '%b\n' "${YELLOW}  WARNING: ip vrf exec requires root.${NC}"
+        SRV_VRF+=("$vval")
+        local oi; read -r -p "  One-off mode -1 (exit after one client)? [no]: " oi </dev/tty
+        local oo=0; [[ "$oi" =~ ^[Yy] ]] && oo=1
+        SRV_ONEOFF+=("$oo"); SRV_LOGFILE+=(""); SRV_SCRIPT+=("")
+    done; SERVER_COUNT="$num"
+}
+
+show_stream_summary() {
+    local mode="${1:-client}"; echo ""; print_header "Stream Configuration Summary"; echo ""
+    if [[ "$mode" == "client" ]]; then
+        printf '  %-3s  %-5s  %-18s  %-6s  %-10s  %-5s  %-5s  %-10s\n' \
+            "#" "Proto" "Target" "Port" "Bandwidth" "Dur" "DSCP" "VRF"
+        printf '  %s\n' "$(rpt '-' 72)"
+        local i
+        for (( i=0; i<STREAM_COUNT; i++ )); do
+            local dd; (( S_DURATION[$i] == 0 )) && dd="inf" || dd="${S_DURATION[$i]}s"
+            printf '  %-3d  %-5s  %-18s  %-6s  %-10s  %-5s  %-5s  %-10s\n' \
+                "$((i+1))" "${S_PROTO[$i]}" "${S_TARGET[$i]}" "${S_PORT[$i]}" \
+                "${S_BW[$i]:-unlimited}" "$dd" "${S_DSCP_NAME[$i]:-none}" "${S_VRF[$i]:-GRT}"
+            local ex=""
+            [[ -n "${S_CCA[$i]}"    ]] && ex+=" CCA:${S_CCA[$i]}"
+            [[ -n "${S_WINDOW[$i]}" ]] && ex+=" Win:${S_WINDOW[$i]}"
+            [[ -n "${S_MSS[$i]}"    ]] && ex+=" MSS:${S_MSS[$i]}"
+            (( S_REVERSE[$i]  == 1  )) && ex+=" [REV]"
+            (( S_PARALLEL[$i] >  1  )) && ex+=" P:${S_PARALLEL[$i]}"
+            [[ -n "${S_DELAY[$i]}"  ]] && ex+=" delay:${S_DELAY[$i]}ms"
+            [[ -n "${S_LOSS[$i]}"   ]] && ex+=" loss:${S_LOSS[$i]}%"
+            [[ -n "$ex" ]] && printf '%b    %s%b\n' "$CYAN" "$ex" "$NC"
+        done
+        printf '  %s\n' "$(rpt '-' 72)"
+    else
+        printf '  %-3s  %-7s  %-18s  %-12s  %-6s\n' "#" "Port" "Bind IP" "VRF" "1-off"
+        printf '  %s\n' "$(rpt '-' 52)"
+        local i
+        for (( i=0; i<SERVER_COUNT; i++ )); do
+            local oo="no"; (( SRV_ONEOFF[$i] )) && oo="yes"
+            printf '  %-3d  %-7s  %-18s  %-12s  %-6s\n' \
+                "$((i+1))" "${SRV_PORT[$i]}" "${SRV_BIND[$i]:-0.0.0.0}" \
+                "${SRV_VRF[$i]:-GRT}" "$oo"
+        done
+        printf '  %s\n' "$(rpt '-' 52)"
+    fi; echo ""
+}
+
+# =============================================================================
+# SECTION 10 — COMMAND BUILDING AND LAUNCHING
+# =============================================================================
+
+build_server_command() {
+    local idx="$1" cmd=""
+    [[ -n "${SRV_VRF[$idx]}" ]] && cmd="ip vrf exec ${SRV_VRF[$idx]} "
+    cmd+="${IPERF3_BIN} -s -p ${SRV_PORT[$idx]}"
+    [[ -n "${SRV_BIND[$idx]}" ]] && cmd+=" -B ${SRV_BIND[$idx]}"
+    (( SRV_ONEOFF[$idx] )) && cmd+=" -1"
+    cmd+=" -i 1"
+    printf '%s' "$cmd"
+}
+
+build_client_command() {
+    local idx="$1" cmd=""
+    [[ -n "${S_VRF[$idx]}" ]] && cmd="ip vrf exec ${S_VRF[$idx]} "
+    cmd+="${IPERF3_BIN} -c ${S_TARGET[$idx]} -p ${S_PORT[$idx]}"
+    [[ "${S_PROTO[$idx]}" == "UDP" ]] && cmd+=" -u"
+    [[ -n "${S_BW[$idx]}" ]]          && cmd+=" -b ${S_BW[$idx]}"
+    if (( S_DURATION[$idx] == 0 )); then
+        version_ge 3 1 && cmd+=" -t 0" || cmd+=" -t 86400"
+    else
+        cmd+=" -t ${S_DURATION[$idx]}"
+    fi
+    cmd+=" -i 1"
+    (( S_PARALLEL[$idx] > 1 ))  && cmd+=" -P ${S_PARALLEL[$idx]}"
+    (( S_REVERSE[$idx]  == 1 )) && cmd+=" -R"
+    if [[ -n "${S_DSCP_VAL[$idx]}" ]] && (( S_DSCP_VAL[$idx] >= 0 )); then
+        cmd+=" -S $(( S_DSCP_VAL[$idx] * 4 ))"
+    fi
+    [[ -n "${S_CCA[$idx]}"    ]] && cmd+=" -C ${S_CCA[$idx]}"
+    [[ -n "${S_WINDOW[$idx]}" ]] && cmd+=" -w ${S_WINDOW[$idx]}"
+    [[ -n "${S_MSS[$idx]}"    ]] && cmd+=" -M ${S_MSS[$idx]}"
+    [[ -n "${S_BIND[$idx]}"   ]] && cmd+=" -B ${S_BIND[$idx]}"
+    (( S_NOFQ[$idx] )) && (( NOFQ_SUPPORTED )) && cmd+=" --no-fq-socket-pacing"
+    printf '%s' "$cmd"
+}
+
+write_launch_script() {
+    local sf="$1" cmd="$2"
+    [[ -d "$TMPDIR" ]] || { printf '%b\n' "${RED}ERROR: TMPDIR missing.${NC}"; return 1; }
+    printf '#!/usr/bin/env bash\n%s\n' "$cmd" > "$sf"; chmod +x "$sf"
+}
+
+launch_servers() {
+    SERVER_PIDS=()
+    local i
+    for (( i=0; i<SERVER_COUNT; i++ )); do
+        local sn=$(( i + 1 )) sf="${TMPDIR}/server_${sn}.sh" lf="${TMPDIR}/server_${sn}.log"
+        if ! write_launch_script "$sf" "$(build_server_command "$i")"; then
+            printf '%b\n' "${RED}  [ERROR] Cannot write script for server ${sn}.${NC}"
+            SERVER_PIDS+=(0); SRV_LOGFILE[$i]="$lf"; continue
+        fi
+        SRV_SCRIPT[$i]="$sf"; SRV_LOGFILE[$i]="$lf"
+        bash "$sf" > "$lf" 2>&1 &
+        local pid=$!; SERVER_PIDS+=("$pid")
+        printf '%b[STARTED]%b  server %d  PID %-6d  port %s\n' \
+            "$GREEN" "$NC" "$sn" "$pid" "${SRV_PORT[$i]}"
+    done
+}
+
+launch_clients() {
+    STREAM_PIDS=()
+    local i
+    for (( i=0; i<STREAM_COUNT; i++ )); do
+        local sn=$(( i + 1 )) sf="${TMPDIR}/stream_${sn}.sh" lf="${TMPDIR}/stream_${sn}.log"
+        if ! write_launch_script "$sf" "$(build_client_command "$i")"; then
+            printf '%b\n' "${RED}  [ERROR] Cannot write script for stream ${sn}.${NC}"
+            STREAM_PIDS+=(0); S_LOGFILE[$i]="$lf"
+            S_STATUS_CACHE[$i]="FAILED"; S_ERROR_MSG[$i]="Script creation failed"; continue
+        fi
+        S_SCRIPT[$i]="$sf"; S_LOGFILE[$i]="$lf"
+        S_START_TS[$i]=$(date +%s); S_STATUS_CACHE[$i]="STARTING"; S_ERROR_MSG[$i]=""
+        bash "$sf" > "$lf" 2>&1 &
+        local pid=$!; STREAM_PIDS+=("$pid")
+        printf '%b[STARTED]%b  stream %d  PID %-6d  %s -> %s:%s\n' \
+            "$GREEN" "$NC" "$sn" "$pid" "${S_PROTO[$i]}" "${S_TARGET[$i]}" "${S_PORT[$i]}"
+    done
+}
+
+wait_for_servers() {
+    local timeout=15 i all_ok=1
+    printf '%b\n' "  ${CYAN}Waiting for servers to start listening...${NC}"
+    for (( i=0; i<SERVER_COUNT; i++ )); do
+        local sn=$(( i + 1 )) port="${SRV_PORT[$i]}" elapsed=0 ready=0
+        while (( elapsed < timeout * 2 )); do
+            ss -tlnp 2>/dev/null | grep -qE ":${port}([[:space:]]|$|:)" && ready=1 && break
+            sleep 0.5; (( elapsed++ ))
+        done
+        (( ready )) \
+            && printf '%b[READY  ]%b  server %d  port %s\n' "$GREEN" "$NC" "$sn" "$port" \
+            || { printf '%b[TIMEOUT]%b  server %d  port %s -- not listening after %ds\n' \
+                    "$RED" "$NC" "$sn" "$port" "$timeout"; all_ok=0; }
+    done; return $(( 1 - all_ok ))
+}
+
+apply_netem() {
+    NETEM_IFACES=()
+    local i
+    for (( i=0; i<STREAM_COUNT; i++ )); do
+        local dly="${S_DELAY[$i]:-}" jit="${S_JITTER[$i]:-}" loss="${S_LOSS[$i]:-}"
+        [[ -z "$dly" && -z "$jit" && -z "$loss" ]] && continue
+        if (( IS_ROOT == 0 )); then
+            printf '%b\n' "${YELLOW}  WARNING: tc netem skipped for stream $((i+1)) -- not root.${NC}"; continue
+        fi
+        local oif=""
+        command -v ip >/dev/null 2>&1 && \
+            oif=$(ip route get "${S_TARGET[$i]}" 2>/dev/null \
+                | grep -oE 'dev [^ ]+' | awk '{print $2}')
+        [[ -z "$oif" ]] && { printf '%b\n' "${YELLOW}  WARNING: no route for ${S_TARGET[$i]}.${NC}"; continue; }
+        tc qdisc del dev "$oif" root 2>/dev/null
+        local nc="tc qdisc add dev ${oif} root netem"
+        [[ -n "$dly" ]]              && nc+=" delay ${dly}ms"
+        [[ -n "$dly" && -n "$jit" ]] && nc+=" ${jit}ms"
+        [[ -n "$loss" ]]             && nc+=" loss ${loss}%"
+        bash -c "$nc" 2>/dev/null \
+            && { printf '%b[NETEM  ]%b  dev %-10s  delay=%s jitter=%s loss=%s\n' \
+                    "$GREEN" "$NC" "$oif" "${dly:-0}ms" "${jit:-0}ms" "${loss:-0}%"
+                 NETEM_IFACES+=("$oif"); } \
+            || printf '%b\n' "${YELLOW}  WARNING: tc netem failed on ${oif}.${NC}"
+    done
+}
+
+# =============================================================================
+# SECTION 11 — STATUS ENGINE
+# =============================================================================
+
+extract_error_from_log() {
+    local lf="$1" idx="${2:-0}"
+    [[ -f "$lf" && -s "$lf" ]] || return
+    local te
+    te=$(grep -iE '^iperf3:[[:space:]]+error|^connect failed|^unable to connect|^error -' \
+         "$lf" 2>/dev/null | head -1 | sed 's/^[[:space:]]*//')
+    if [[ -z "$te" ]]; then
+        te=$(grep -iE 'error|failed|refused|unable|timed out|no route|unreachable|cannot connect' \
+             "$lf" 2>/dev/null \
+             | grep -ivE 'bits/sec|bytes/sec|warning|Connecting to|local[[:space:]]+[0-9]|Transfer|Bandwidth|interval' \
+             | head -1 | sed 's/^[[:space:]]*//')
+    fi
+    if [[ -n "$te" ]]; then
+        case "$te" in
+            *"Connection refused"*)
+                printf '%s' "Connection refused -- is iperf3 server on ${S_TARGET[$idx]:-?}:${S_PORT[$idx]:-?}?" ;;
+            *"No route to host"*)
+                printf '%s' "No route to host -- check path to ${S_TARGET[$idx]:-?}" ;;
+            *"timed out"*|*"Connection timed out"*)
+                printf '%s' "Connection timed out -- server unreachable or firewall blocking port ${S_PORT[$idx]:-?}" ;;
+            *"Name or service"*|*"nodename nor"*)
+                printf '%s' "DNS failure -- cannot resolve '${S_TARGET[$idx]:-?}'" ;;
+            *"Network is unreachable"*)
+                printf '%s' "Network unreachable -- no route to ${S_TARGET[$idx]:-?}" ;;
+            *"Permission denied"*)
+                printf '%s' "Permission denied -- check bind address or port privileges" ;;
+            *"Address already in use"*)
+                printf '%s' "Port ${S_PORT[$idx]:-?} is already in use" ;;
+            *) printf '%s' "$te" ;;
+        esac
+    fi
+}
+
+ip_to_hex() {
+    local ip="$1" o1 o2 o3 o4
+    IFS='.' read -r o1 o2 o3 o4 <<< "$ip"
+    [[ "$o1" =~ ^[0-9]+$ && "$o2" =~ ^[0-9]+$ && \
+       "$o3" =~ ^[0-9]+$ && "$o4" =~ ^[0-9]+$ ]] || { printf '%s' ""; return 1; }
+    printf '%02X%02X%02X%02X' "$(( 10#$o4 ))" "$(( 10#$o3 ))" "$(( 10#$o2 ))" "$(( 10#$o1 ))"
+}
+
+port_to_hex() { printf '%04X' "$(( 10#$1 ))"; }
+
+check_pid_tcp_connected() {
+    local pid="$1" target_ip="$2" target_port="$3"
+    local rem_hex_ip; rem_hex_ip=$(ip_to_hex "$target_ip")
+    local rem_hex_port; rem_hex_port=$(port_to_hex "$target_port")
+    [[ -z "$rem_hex_ip" || -z "$rem_hex_port" ]] && return 1
+    local target_field="${rem_hex_ip}:${rem_hex_port}"
+
+    local tcp_file="/proc/${pid}/net/tcp"
+    if [[ -r "$tcp_file" ]]; then
+        if awk -v tgt="$target_field" '
+            NR > 1 && $4 == "01" && $3 == tgt { found=1; exit }
+            END { exit (found ? 0 : 1) }
+        ' "$tcp_file" 2>/dev/null; then
+            return 0
+        fi
+    fi
+
+    local tcp6_file="/proc/${pid}/net/tcp6"
+    if [[ -r "$tcp6_file" ]]; then
+        if awk -v port=":${rem_hex_port}" '
+            NR > 1 && $4 == "01" && $3 ~ port { found=1; exit }
+            END { exit (found ? 0 : 1) }
+        ' "$tcp6_file" 2>/dev/null; then
+            return 0
+        fi
+    fi
+
+    if ss -tnp 2>/dev/null | grep -qE "pid=${pid},[0-9]+" 2>/dev/null; then
+        local conn_line
+        conn_line=$(ss -tnp 2>/dev/null | grep -E "pid=${pid}," | grep "ESTAB")
+        if [[ -n "$conn_line" ]]; then
+            echo "$conn_line" | grep -qE "${target_ip}:${target_port}" && return 0
+            [[ "$target_ip" == "127.0.0.1" || "$target_ip" == "::1" ]] && return 0
+        fi
+    fi
+
+    if [[ -d "/proc/${pid}/fd" ]]; then
+        local socket_inodes=()
+        local fd_link
+        while IFS= read -r fd_link; do
+            if [[ "$fd_link" =~ socket:\[([0-9]+)\] ]]; then
+                socket_inodes+=("${BASH_REMATCH[1]}")
+            fi
+        done < <(ls -la "/proc/${pid}/fd" 2>/dev/null | grep -oE 'socket:\[[0-9]+\]')
+        if (( ${#socket_inodes[@]} > 0 )); then
+            local inode_pattern; inode_pattern=$(printf '%s|' "${socket_inodes[@]}"); inode_pattern="${inode_pattern%|}"
+            if [[ -r /proc/net/tcp ]]; then
+                if awk -v tgt="$target_field" -v inodes="$inode_pattern" '
+                    NR > 1 && $4 == "01" && $3 == tgt {
+                        inode = $(NF-1); n = split(inodes, arr, "|")
+                        for (k=1; k<=n; k++) if (arr[k] == inode) { found=1; exit }
+                    }
+                    END { exit (found ? 0 : 1) }
+                ' /proc/net/tcp 2>/dev/null; then
+                    return 0
                 fi
-                press_enter
-                ;;
-            0)
-                echo -e "\n  ${GREEN}Goodbye!${NC}\n"
-                exit 0
-                ;;
+            fi
+        fi
+    fi
+    return 1
+}
+
+probe_client_status() {
+    local idx="$1"
+    local pid="${STREAM_PIDS[$idx]:-0}"
+    local lf="${S_LOGFILE[$idx]:-}"
+    local target="${S_TARGET[$idx]:-}"
+    local port="${S_PORT[$idx]:-}"
+    local proto="${S_PROTO[$idx]:-TCP}"
+
+    local cur="${S_STATUS_CACHE[$idx]:-}"
+    [[ "$cur" == "DONE" || "$cur" == "FAILED" ]] && return
+
+    if [[ "$pid" == "0" ]]; then
+        S_STATUS_CACHE[$idx]="FAILED"
+        [[ -z "${S_ERROR_MSG[$idx]}" ]] && S_ERROR_MSG[$idx]="Failed to launch iperf3 process"
+        return
+    fi
+
+    local alive=0; kill -0 "$pid" 2>/dev/null && alive=1
+
+    if (( ! alive )); then
+        local err; err=$(extract_error_from_log "$lf" "$idx")
+        if [[ -n "$err" ]]; then S_STATUS_CACHE[$idx]="FAILED"; S_ERROR_MSG[$idx]="$err"; return; fi
+        if [[ -f "$lf" ]] && grep -qE 'sender|receiver' "$lf" 2>/dev/null; then
+            S_STATUS_CACHE[$idx]="DONE"; return
+        fi
+        if [[ -f "$lf" && -s "$lf" ]]; then
+            S_STATUS_CACHE[$idx]="FAILED"
+            S_ERROR_MSG[$idx]=$(tail -3 "$lf" 2>/dev/null | tr '\n' ' ' | sed 's/^[[:space:]]*//')
+            return
+        fi
+        S_STATUS_CACHE[$idx]="DONE"; return
+    fi
+
+    if [[ -f "$lf" && -s "$lf" ]]; then
+        local early_err; early_err=$(extract_error_from_log "$lf" "$idx")
+        [[ -n "$early_err" ]] && { S_STATUS_CACHE[$idx]="CONNECTING"; return; }
+    fi
+
+    local tcp_connected=0
+    if [[ "$proto" == "TCP" && -n "$target" && -n "$port" ]]; then
+        check_pid_tcp_connected "$pid" "$target" "$port" && tcp_connected=1
+    fi
+    if [[ "$proto" == "UDP" && -n "$target" && -n "$port" ]]; then
+        ss -un 2>/dev/null | grep -qE "${target}:${port}([[:space:]]|$)" && tcp_connected=1
+    fi
+
+    local log_connected=0 has_interval=0
+    if [[ -f "$lf" && -s "$lf" ]]; then
+        if grep -qE '^\[SUM\][[:space:]]+[0-9.]+-[0-9.]+[[:space:]]+sec.*bits' \
+                "$lf" 2>/dev/null || \
+           grep -qE '^\[[[:space:]]*[0-9]+\][[:space:]]+[0-9.]+-[0-9.]+[[:space:]]+sec.*bits' \
+                "$lf" 2>/dev/null; then
+            has_interval=1
+        fi
+        if (( has_interval == 0 )); then
+            grep -qE '^\[[[:space:]]*[0-9]+\].*local.*port.*connected to' \
+                "$lf" 2>/dev/null && log_connected=1
+        fi
+    fi
+
+    if (( tcp_connected || has_interval || log_connected )); then
+        S_STATUS_CACHE[$idx]="CONNECTED"; S_ERROR_MSG[$idx]=""; return
+    fi
+
+    if [[ ! -f "$lf" || ! -s "$lf" ]]; then
+        S_STATUS_CACHE[$idx]="STARTING"
+    else
+        S_STATUS_CACHE[$idx]="CONNECTING"
+    fi
+    S_ERROR_MSG[$idx]=""
+}
+
+probe_server_status() {
+    local idx="$1"
+    local pid="${SERVER_PIDS[$idx]:-0}"
+    local lf="${SRV_LOGFILE[$idx]:-}"
+    local port="${SRV_PORT[$idx]:-}"
+
+    [[ "$pid" == "0" ]] && { printf '%s' 'FAILED'; return; }
+    kill -0 "$pid" 2>/dev/null || { printf '%s' 'DONE'; return; }
+
+    if [[ -n "$port" ]]; then
+        if ss -tn 2>/dev/null | grep -qE "ESTAB.*:${port}([[:space:]]|$)"; then
+            printf '%s' 'CONNECTED'; return
+        fi
+        if ss -tn 2>/dev/null | grep -qE "ESTAB.+:${port}[[:space:]]"; then
+            printf '%s' 'CONNECTED'; return
+        fi
+        if ss -tlnp 2>/dev/null | grep -qE ":${port}([[:space:]]|$)"; then
+            if [[ -f "$lf" && -s "$lf" ]] && \
+               grep -qiE 'accepted connection|connected|bits/sec' "$lf" 2>/dev/null; then
+                printf '%s' 'RUNNING'; return
+            fi
+            printf '%s' 'LISTENING'; return
+        fi
+    fi
+
+    [[ ! -f "$lf" || ! -s "$lf" ]] && { printf '%s' 'STARTING'; return; }
+    grep -qiE 'accepted connection|connected' "$lf" 2>/dev/null && { printf '%s' 'RUNNING'; return; }
+    grep -qi 'server listening\|listening on' "$lf" 2>/dev/null && { printf '%s' 'LISTENING'; return; }
+    printf '%s' 'STARTING'
+}
+
+# =============================================================================
+# SECTION 12 — DASHBOARD
+# =============================================================================
+#
+# DASHBOARD COLUMN LAYOUT — verified arithmetic
+# =============================================
+#
+# CLIENT DASHBOARD  (COLS=80, box inner=78)
+# bleft indent=1, then prefix starts with " " (1 char) → 2 chars overhead
+# Remaining for data columns + status: 78 - 2 = 76
+#
+# Prefix printf format:
+#   %-3d  = 3   + 2sp = 5
+#   %-5s  = 5   + 2sp = 7
+#   %-13s = 13  + 2sp = 15
+#   %-5s  = 5   + 2sp = 7
+#   %-11s = 11  + 2sp = 13
+#   %-6s  = 6   + 2sp = 8
+#   %-5s  = 5   + 2sp = 7   (trailing 2 spaces ARE in the format string)
+#   Total prefix visible = 5+7+15+7+13+8+7 = 62
+# Status badge (e.g. "CONNECTED" = 9 chars) + vlen colour codes = 9 visible
+# Total: 2 + 62 + 9 = 73 → right pad = 78 - 73 = 5  ✓ within 78
+#
+# Header uses %-9s for "Status" label, same prefix widths → same alignment ✓
+#
+# SERVER DASHBOARD  (COLS=80, box inner=78)
+# Prefix format:
+#   %-3d  = 3+2 = 5
+#   %-6s  = 6+2 = 8
+#   %-16s = 16+2 = 18
+#   %-10s = 10+2 = 12
+#   %-12s = 12+2 = 14   (trailing 2 spaces in format)
+#   Total prefix = 5+8+18+12+14 = 57
+# Status badge e.g. "CONNECTED" = 9 visible
+# Total: 2 + 57 + 9 = 68 → right pad = 78 - 68 = 10  ✓
+
+calculate_frame_lines() {
+    printf '%d' $(( 10 + ${1:-0} ))
+}
+
+_render_client_frame() {
+    local now; now=$(date +%s)
+    local i
+    for (( i=0; i<STREAM_COUNT; i++ )); do probe_client_status "$i"; done
+
+    local nc=0 ni=0 ns=0 nd=0 nf=0
+    for (( i=0; i<STREAM_COUNT; i++ )); do
+        case "${S_STATUS_CACHE[$i]}" in
+            CONNECTED)  (( nc++ )) ;; CONNECTING) (( ni++ )) ;;
+            STARTING)   (( ns++ )) ;; DONE)       (( nd++ )) ;; FAILED) (( nf++ )) ;;
+        esac
+    done
+    local act=$(( nc + ni + ns ))
+    local fts="${S_START_TS[0]:-0}"; (( fts == 0 )) && fts="$now"
+    local efmt; efmt=$(format_seconds $(( now - fts )))
+
+    bline '='                                                                       # 1
+    bcenter "${BOLD}${CYAN}iperf3 Traffic Manager -- Live Dashboard${NC}"           # 2
+    bline '='                                                                       # 3
+    bleft "  $(printf 'Active:%-2d  Connected:%-2d  Done:%-2d  Failed:%-2d  Elapsed:%s' \
+        "$act" "$nc" "$nd" "$nf" "$efmt")"                                          # 4
+    print_separator                                                                 # 5
+    # Column header — pure plain text inside BOLD, vlen correctly computes width
+    bleft "${BOLD}$(printf '%-3s  %-5s  %-13s  %-5s  %-11s  %-6s  %-5s  %-9s' \
+        '#' 'Proto' 'Target' 'Port' 'Bandwidth' 'Time' 'DSCP' 'Status')${NC}"      # 6
+    print_separator                                                                 # 7
+
+    for (( i=0; i<STREAM_COUNT; i++ )); do                                         # 8..(7+N)
+        local sn=$(( i + 1 ))
+        local st="${S_STATUS_CACHE[$i]:-STARTING}"
+        local lf="${S_LOGFILE[$i]:-}"
+
+        local bw="---"
+        [[ "$st" == "CONNECTED" || "$st" == "DONE" ]] && \
+            bw=$(parse_live_bandwidth_from_log "$lf")
+
+        local td="--:--"
+        local sts="${S_START_TS[$i]:-0}"; (( sts == 0 )) && sts="$now"
+        local dur="${S_DURATION[$i]:-10}"
+        case "$st" in
+            CONNECTED|STARTING|CONNECTING)
+                if (( dur == 0 )); then
+                    td="inf $(format_seconds $(( now - sts )))"
+                else
+                    local r=$(( dur - (now - sts) )); (( r < 0 )) && r=0
+                    td=$(format_seconds "$r")
+                fi ;;
+            DONE)   td="done"   ;;
+            FAILED) td="failed" ;;
+        esac
+
+        local dscp_display="---"
+        if [[ -n "${S_DSCP_NAME[$i]}" ]]; then
+            dscp_display="${S_DSCP_NAME[$i]}"
+        elif [[ -n "${S_DSCP_VAL[$i]}" ]] && (( S_DSCP_VAL[$i] >= 0 )); then
+            dscp_display="${S_DSCP_VAL[$i]}"
+        fi
+
+        local sb sc
+        case "$st" in
+            CONNECTED)  sb="CONNECTED"  sc="$GREEN"  ;;
+            CONNECTING) sb="CONNECTING" sc="$YELLOW" ;;
+            STARTING)   sb="STARTING"   sc="$YELLOW" ;;
+            DONE)       sb="DONE"       sc="$CYAN"   ;;
+            FAILED)     sb="FAILED"     sc="$RED"    ;;
+            *)          sb="$st"        sc="$NC"     ;;
+        esac
+
+        local tgt="${S_TARGET[$i]:-?}"
+        (( ${#tgt} > 13 )) && tgt="${tgt:0:12}~"
+
+        # pfx is pure plain text — no ANSI codes, so vlen is accurate
+        local pfx
+        pfx=$(printf '%-3d  %-5s  %-13s  %-5s  %-11s  %-6s  %-5s  ' \
+            "$sn" "${S_PROTO[$i]}" "$tgt" "${S_PORT[$i]}" \
+            "$bw" "$td" "$dscp_display")
+        # The status badge ${sc}${sb}${NC} contains ANSI codes.
+        # vlen(" ${pfx}${sc}${sb}${NC}") = 1 + len(pfx) + len(sb) because
+        # vlen subtracts the known colour constants.
+        bleft " ${pfx}${sc}${sb}${NC}"
+    done
+
+    print_separator                                                                 # 8+N
+    bleft "  ${YELLOW}Ctrl+C to stop all streams${NC}"                             # 9+N
+    print_separator                                                                 # 10+N
+}
+
+_render_server_frame() {
+    local now; now=$(date +%s)
+    local running=0 i
+    for (( i=0; i<SERVER_COUNT; i++ )); do
+        local pid="${SERVER_PIDS[$i]:-0}"
+        [[ "$pid" != "0" ]] && kill -0 "$pid" 2>/dev/null && (( running++ ))
+    done
+
+    bline '='                                                                             # 1
+    bcenter "${BOLD}${CYAN}iperf3 Traffic Manager -- Server Dashboard${NC}"               # 2
+    bline '='                                                                             # 3
+    bleft "  $(printf 'Listeners active: %d / %d' "$running" "$SERVER_COUNT")"           # 4
+    print_separator                                                                       # 5
+    bleft "${BOLD}$(printf '%-3s  %-6s  %-16s  %-10s  %-12s  %-9s' \
+        '#' 'Port' 'Bind IP' 'VRF' 'Bandwidth' 'Status')${NC}"                           # 6
+    print_separator                                                                       # 7
+
+    for (( i=0; i<SERVER_COUNT; i++ )); do                                               # 8..(7+N)
+        local sn=$(( i + 1 )) lf="${SRV_LOGFILE[$i]:-}"
+        local st; st=$(probe_server_status "$i")
+        local bw; bw=$(parse_live_bandwidth_from_log "$lf")
+        local sb sc
+        case "$st" in
+            CONNECTED) sb="CONNECTED" sc="$GREEN"  ;; RUNNING)  sb="RUNNING"  sc="$CYAN"   ;;
+            LISTENING) sb="LISTENING" sc="$BLUE"   ;; STARTING) sb="STARTING" sc="$YELLOW" ;;
+            DONE)      sb="DONE"      sc="$NC"     ;; FAILED)   sb="FAILED"   sc="$RED"    ;;
+            *)         sb="$st"       sc="$NC"     ;;
+        esac
+        local pfx
+        pfx=$(printf '%-3d  %-6s  %-16s  %-10s  %-12s  ' \
+            "$sn" "${SRV_PORT[$i]}" "${SRV_BIND[$i]:-0.0.0.0}" \
+            "${SRV_VRF[$i]:-GRT}" "$bw")
+        bleft " ${pfx}${sc}${sb}${NC}"
+    done
+
+    print_separator                                                                       # 8+N
+    bleft "  ${YELLOW}Ctrl+C to stop all listeners${NC}"                                 # 9+N
+    print_separator                                                                       # 10+N
+}
+
+_render_error_panel() {
+    local has=0 i
+    for (( i=0; i<STREAM_COUNT; i++ )); do
+        [[ "${S_STATUS_CACHE[$i]}" == "FAILED" && -n "${S_ERROR_MSG[$i]}" ]] && has=1 && break
+    done
+    (( has == 0 )) && return
+    echo ""; bline '='; bcenter "${BOLD}${RED}Connection Failures${NC}"; bline '='
+    for (( i=0; i<STREAM_COUNT; i++ )); do
+        [[ "${S_STATUS_CACHE[$i]}" != "FAILED" ]] && continue
+        local sn=$(( i + 1 )) err="${S_ERROR_MSG[$i]:-Unknown error}"
+        local max_err=$(( COLS - 18 )); (( ${#err} > max_err )) && err="${err:0:$((max_err-3))}..."
+        bleft "  ${RED}Stream ${sn}:${NC} ${err}"
+    done; bline '='
+}
+
+run_dashboard() {
+    local mode="${1:-client}"
+    local count; [[ "$mode" == "server" ]] && count=$SERVER_COUNT || count=$STREAM_COUNT
+    FRAME_LINES=$(calculate_frame_lines "$count")
+
+    local k; for (( k=0; k<FRAME_LINES; k++ )); do printf '\n'; done
+    printf '\033[?25l'
+    local prev_errors=0
+
+    while true; do
+        printf '\033[%dA' "$FRAME_LINES"
+        [[ "$mode" == "server" ]] && _render_server_frame || _render_client_frame
+
+        if [[ "$mode" != "server" ]]; then
+            local ce=0 j
+            for (( j=0; j<STREAM_COUNT; j++ )); do
+                [[ "${S_STATUS_CACHE[$j]}" == "FAILED" && -n "${S_ERROR_MSG[$j]}" ]] && ce=1 && break
+            done
+            (( ce && ! prev_errors )) && { _render_error_panel; prev_errors=1; }
+        fi
+
+        local any=0
+        if [[ "$mode" == "server" ]]; then
+            local j; for (( j=0; j<SERVER_COUNT; j++ )); do
+                local pid="${SERVER_PIDS[$j]:-0}"
+                [[ "$pid" != "0" ]] && kill -0 "$pid" 2>/dev/null && any=1 && break
+            done
+        else
+            local j; for (( j=0; j<STREAM_COUNT; j++ )); do
+                local pid="${STREAM_PIDS[$j]:-0}"
+                [[ "$pid" != "0" ]] && kill -0 "$pid" 2>/dev/null && any=1 && break
+            done
+        fi
+        (( any == 0 )) && break
+        sleep 1
+    done
+
+    [[ "$mode" != "server" ]] && {
+        local j; for (( j=0; j<STREAM_COUNT; j++ )); do probe_client_status "$j"; done
+    }
+    printf '\033[?25h'; echo ""
+}
+
+# =============================================================================
+# SECTION 13 — FINAL RESULTS
+# =============================================================================
+
+parse_final_results() {
+    declare -ga RESULT_SENDER_BW=()
+    declare -ga RESULT_RECEIVER_BW=()
+    declare -ga RESULT_RTX=()
+    declare -ga RESULT_JITTER=()
+    declare -ga RESULT_LOSS_PCT=()
+    declare -ga RESULT_LOSS_COUNT=()
+
+    local i
+    for (( i=0; i<STREAM_COUNT; i++ )); do
+        if [[ "${S_STATUS_CACHE[$i]}" == "FAILED" ]]; then
+            RESULT_SENDER_BW+=("FAILED"); RESULT_RECEIVER_BW+=("FAILED")
+            RESULT_RTX+=("-"); RESULT_JITTER+=("-")
+            RESULT_LOSS_PCT+=("-"); RESULT_LOSS_COUNT+=("-")
+            continue
+        fi
+
+        local lf="${S_LOGFILE[$i]:-}"
+        local sbw="N/A" rbw="N/A" rtx="0" jit="N/A" lpct="N/A" lcnt="N/A"
+
+        if [[ -f "$lf" && -s "$lf" ]]; then
+            local proto="${S_PROTO[$i]}"
+
+            local sender_bw; sender_bw=$(parse_final_bw_from_log "$lf" "sender")
+            [[ -n "$sender_bw" ]] && sbw="$sender_bw"
+
+            local recv_bw; recv_bw=$(parse_final_bw_from_log "$lf" "receiver")
+            [[ -n "$recv_bw" ]] && rbw="$recv_bw"
+
+            [[ "$rbw" == "N/A" && "$sbw" != "N/A" ]] && rbw="$sbw"
+
+            if [[ "$sbw" == "N/A" ]]; then
+                local last_bw; last_bw=$(parse_live_bandwidth_from_log "$lf")
+                [[ "$last_bw" != "---" && -n "$last_bw" ]] && sbw="$last_bw" && rbw="$last_bw"
+            fi
+
+            if [[ "$proto" == "TCP" ]]; then
+                rtx=$(parse_retransmits_from_log "$lf")
+            else
+                local udp_line
+                udp_line=$(grep -E '[[:space:]]sender[[:space:]]*$' "$lf" 2>/dev/null | tail -1)
+                if [[ -z "$udp_line" ]]; then
+                    udp_line=$(grep -E '^\[SUM\]|^\[[[:space:]]*[0-9]+\]' "$lf" 2>/dev/null \
+                               | grep -v 'receiver' | tail -1)
+                fi
+                if [[ -n "$udp_line" ]]; then
+                    jit=$(echo "$udp_line" | grep -oE '[0-9.]+ ms' | head -1)
+                    [[ -z "$jit" ]] && jit="N/A"
+                    local loss_frac; loss_frac=$(echo "$udp_line" | grep -oE '[0-9]+/[0-9]+' | head -1)
+                    if [[ -n "$loss_frac" ]]; then
+                        lcnt=$(cut -d/ -f1 <<< "$loss_frac")
+                        local tp; tp=$(cut -d/ -f2 <<< "$loss_frac")
+                        if [[ -n "$lcnt" && -n "$tp" ]] && (( tp > 0 )); then
+                            lpct=$(awk -v l="$lcnt" -v t="$tp" 'BEGIN { printf "%.3f%%", (l/t)*100 }')
+                        else lpct="0.000%"; fi
+                    else
+                        lpct=$(echo "$udp_line" | grep -oE '\([0-9.]+%\)' | tr -d '()' | head -1)
+                        [[ -z "$lpct" ]] && lpct="0.000%"
+                    fi
+                fi
+            fi
+        fi
+
+        RESULT_SENDER_BW+=("$sbw"); RESULT_RECEIVER_BW+=("$rbw")
+        RESULT_RTX+=("$rtx"); RESULT_JITTER+=("$jit")
+        RESULT_LOSS_PCT+=("$lpct"); RESULT_LOSS_COUNT+=("$lcnt")
+    done
+}
+
+display_results_table() {
+    echo ""; print_header "Final Results"; echo ""
+    printf '  %-3s  %-5s  %-16s  %-5s  %-12s  %-12s  %-20s\n' \
+        "#" "Proto" "Target" "Port" "Sender BW" "Receiver BW" "Retx / Jitter+Loss"
+    printf '  %s\n' "$(rpt '-' 80)"
+    local i
+    for (( i=0; i<STREAM_COUNT; i++ )); do
+        local sn=$(( i + 1 )) proto="${S_PROTO[$i]}" tgt="${S_TARGET[$i]:-?}"
+        (( ${#tgt} > 16 )) && tgt="${tgt:0:15}~"
+        if [[ "${S_STATUS_CACHE[$i]}" == "FAILED" ]]; then
+            local err="${S_ERROR_MSG[$i]:-Connection failed}"
+            (( ${#err} > 36 )) && err="${err:0:33}..."
+            printf '  %-3d  %-5s  %-16s  %-5s  %b%s%b\n' \
+                "$sn" "$proto" "$tgt" "${S_PORT[$i]}" "$RED" "FAILED: $err" "$NC"
+        else
+            local extra
+            [[ "$proto" == "TCP" ]] \
+                && extra="Retx:${RESULT_RTX[$i]}" \
+                || extra="J:${RESULT_JITTER[$i]} L:${RESULT_LOSS_PCT[$i]}"
+            printf '  %-3d  %-5s  %-16s  %-5s  %b%-12s%b  %b%-12s%b  %-20s\n' \
+                "$sn" "$proto" "$tgt" "${S_PORT[$i]}" \
+                "$GREEN" "${RESULT_SENDER_BW[$i]}"   "$NC" \
+                "$CYAN"  "${RESULT_RECEIVER_BW[$i]}" "$NC" "$extra"
+        fi
+    done
+    printf '  %s\n' "$(rpt '-' 80)"; echo ""
+    local tf=0 td=0
+    for (( i=0; i<STREAM_COUNT; i++ )); do
+        [[ "${S_STATUS_CACHE[$i]}" == "FAILED" ]] && (( tf++ ))
+        [[ "${S_STATUS_CACHE[$i]}" == "DONE"   ]] && (( td++ ))
+    done
+    if (( tf > 0 )); then
+        printf '%b  %d stream(s) FAILED.  %d completed OK.%b\n' "$RED" "$tf" "$td" "$NC"
+    else
+        printf '%b  All %d stream(s) completed successfully.%b\n' "$GREEN" "$td" "$NC"
+    fi
+    echo ""
+}
+
+offer_log_view() {
+    while true; do
+        echo ""
+        read -r -p "  View raw log for stream # (or press Enter/q to quit): " sel </dev/tty
+        case "$sel" in
+            ""|q|Q) return ;;
             *)
-                print_warn "Invalid option"
-                sleep 1
-                ;;
+                if [[ "$sel" =~ ^[0-9]+$ ]] && \
+                   (( 10#$sel >= 1 && 10#$sel <= STREAM_COUNT )); then
+                    local idx=$(( 10#$sel - 1 ))
+                    local lf="${S_LOGFILE[$idx]:-}"
+                    if [[ -f "$lf" ]]; then
+                        echo ""; bline '='
+                        bcenter "Log: stream ${sel} -- ${S_PROTO[$idx]} to ${S_TARGET[$idx]}:${S_PORT[$idx]}"
+                        bline '='; cat "$lf"; echo ""; bline '='
+                    else
+                        printf '%b\n' "${RED}  Log file not found for stream ${sel}.${NC}"
+                    fi
+                else
+                    printf '%b\n' "${RED}  Enter a number 1-${STREAM_COUNT} or press Enter to quit.${NC}"
+                fi ;;
         esac
     done
 }
 
-# ============================================================================
-# ENTRY POINT
-# ============================================================================
-init_dscp_map
-build_vrf_maps
-main_menu
+# =============================================================================
+# SECTION 14 — MODE IMPLEMENTATIONS
+# =============================================================================
+
+run_server_mode() {
+    echo ""; print_header "Server Mode"; echo ""
+    select_bind_interface "server"
+    local bind_ip="$SELECTED_IP" vrf="$SELECTED_VRF"; echo ""
+    local n
+    while true; do
+        read -r -p "  How many listeners? [1]: " n </dev/tty; n="${n:-1}"
+        [[ "$n" =~ ^[0-9]+$ ]] && (( 10#$n >= 1 && 10#$n <= 64 )) && break
+        printf '%b\n' "${RED}  Enter a positive integer (1-64).${NC}"
+    done
+    configure_server_streams "$n" "$bind_ip" "$vrf"
+    show_stream_summary "server"
+    confirm_proceed "Launch ${n} listener(s)?" || return
+    echo ""; launch_servers
+    echo ""; printf '%b\n' "${GREEN}  Servers running. Opening dashboard...${NC}"; sleep 1
+    run_dashboard "server"
+    echo ""; printf '%b\n' "${CYAN}  Server mode ended.${NC}"; echo ""
+}
+
+run_client_mode() {
+    echo ""; print_header "Client Mode"; echo ""
+    select_bind_interface "client"
+    local bind_ip="$SELECTED_IP" vrf="$SELECTED_VRF"; echo ""
+    local n
+    while true; do
+        read -r -p "  How many streams? [1]: " n </dev/tty; n="${n:-1}"
+        [[ "$n" =~ ^[0-9]+$ ]] && (( 10#$n >= 1 && 10#$n <= 64 )) && break
+        printf '%b\n' "${RED}  Enter a positive integer (1-64).${NC}"
+    done
+    configure_client_streams "$n" "$bind_ip" "$vrf"
+    show_stream_summary "client"
+    confirm_proceed "Launch ${n} stream(s)?" || return
+    apply_netem; echo ""; launch_clients
+    echo ""; printf '%b\n' "${GREEN}  Streams running. Opening dashboard...${NC}"; sleep 1
+    run_dashboard "client"
+    echo ""; parse_final_results; display_results_table; offer_log_view
+}
+
+run_loopback_mode() {
+    echo ""; print_header "Loopback Test Mode"; echo ""
+    echo "  Launches server and client on 127.0.0.1 for local validation."
+    echo ""
+    local n
+    while true; do
+        read -r -p "  How many loopback streams? [1]: " n </dev/tty; n="${n:-1}"
+        [[ "$n" =~ ^[0-9]+$ ]] && (( 10#$n >= 1 && 10#$n <= 16 )) && break
+        printf '%b\n' "${RED}  Enter a positive integer (1-16).${NC}"
+    done
+
+    SERVER_COUNT="$n"
+    SRV_PORT=(); SRV_BIND=(); SRV_VRF=(); SRV_ONEOFF=(); SRV_LOGFILE=(); SRV_SCRIPT=()
+    local bp=5201 i
+    for (( i=0; i<n; i++ )); do
+        SRV_PORT+=("$(( bp + i ))"); SRV_BIND+=("127.0.0.1"); SRV_VRF+=("")
+        SRV_ONEOFF+=(1); SRV_LOGFILE+=(""); SRV_SCRIPT+=("")
+    done
+
+    STREAM_COUNT="$n"
+    S_PROTO=();    S_TARGET=();    S_PORT=();      S_BW=()
+    S_DURATION=(); S_DSCP_NAME=(); S_DSCP_VAL=();  S_PARALLEL=()
+    S_REVERSE=();  S_CCA=();       S_WINDOW=();     S_MSS=()
+    S_BIND=();     S_VRF=();       S_DELAY=();      S_JITTER=()
+    S_LOSS=();     S_NOFQ=();      S_LOGFILE=();    S_SCRIPT=()
+    S_START_TS=(); S_STATUS_CACHE=(); S_ERROR_MSG=()
+
+    printf '%b\n' "${CYAN}  Configure each stream (target: 127.0.0.1, ports from ${bp}):${NC}"
+    for (( i=0; i<n; i++ )); do
+        local sn=$(( i + 1 )) ap=$(( bp + i ))
+        echo ""; printf '%b\n' "${BOLD}  Stream ${sn}:${NC}"
+
+        local proto
+        while true; do
+            read -r -p "  Protocol [TCP/UDP] (default TCP): " proto </dev/tty
+            proto="${proto:-TCP}"; proto=$(printf '%s' "$proto" | tr '[:lower:]' '[:upper:]')
+            [[ "$proto" == "TCP" || "$proto" == "UDP" ]] && break
+            printf '%b\n' "${RED}  Enter TCP or UDP.${NC}"
+        done
+        S_PROTO+=("$proto"); S_TARGET+=("127.0.0.1"); S_PORT+=("$ap")
+
+        local bw=""
+        if [[ "$proto" == "UDP" ]]; then
+            while true; do
+                read -r -p "  Bandwidth [100M]: " bw </dev/tty; bw="${bw:-100M}"
+                validate_bandwidth "$bw" && break; printf '%b\n' "${RED}  Invalid.${NC}"
+            done
+        else
+            while true; do
+                read -r -p "  Bandwidth limit (empty=unlimited): " bw </dev/tty; bw="${bw:-}"
+                validate_bandwidth "$bw" && break; printf '%b\n' "${RED}  Invalid.${NC}"
+            done
+        fi
+        S_BW+=("$bw")
+
+        local dur
+        while true; do
+            read -r -p "  Duration [10]: " dur </dev/tty; dur="${dur:-10}"
+            validate_duration "$dur" && break; printf '%b\n' "${RED}  Enter a non-negative integer.${NC}"
+        done
+        S_DURATION+=("$(( 10#$dur ))")
+
+        prompt_dscp "$sn"; S_DSCP_NAME+=("$PROMPT_DSCP_NAME"); S_DSCP_VAL+=("$PROMPT_DSCP_VAL")
+
+        S_PARALLEL+=(1); S_REVERSE+=(0); S_CCA+=(""); S_WINDOW+=(""); S_MSS+=("")
+        S_BIND+=("127.0.0.1"); S_VRF+=("")
+        S_DELAY+=(""); S_JITTER+=(""); S_LOSS+=(""); S_NOFQ+=(0)
+        S_LOGFILE+=(""); S_SCRIPT+=(""); S_START_TS+=(0)
+        S_STATUS_CACHE+=("STARTING"); S_ERROR_MSG+=("")
+    done
+
+    show_stream_summary "client"
+    confirm_proceed "Launch loopback test?" || return
+    echo ""; launch_servers; echo ""; wait_for_servers
+    echo ""; launch_clients
+    echo ""; printf '%b\n' "${GREEN}  Running. Opening dashboard...${NC}"; sleep 1
+    run_dashboard "client"
+    echo ""; parse_final_results; display_results_table; offer_log_view
+}
+
+# =============================================================================
+# SECTION 15 — MAIN MENU
+# =============================================================================
+
+show_main_menu() {
+    clear; echo ""
+    bline '='; bempty
+    bcenter "${BOLD}${CYAN}iperf3 Multi-Stream Traffic Manager  v7.7${NC}"
+    bempty; bline '='; bempty
+    bleft "  iperf3 ${IPERF3_MAJOR}.${IPERF3_MINOR}.${IPERF3_PATCH}   at ${IPERF3_BIN}"
+    if (( IS_ROOT )); then
+        bleft "  Running as: ${GREEN}root${NC}  (full feature access)"
+    else
+        bleft "  Running as: ${YELLOW}non-root${NC}  (VRF/netem/low-ports may fail)"
+    fi
+    bempty; bline '-'; bempty
+    bleft "   ${BOLD}1${NC}   Interface Table"
+    bleft "   ${BOLD}2${NC}   Server Mode   --  start iperf3 listener(s)"
+    bleft "   ${BOLD}3${NC}   Client Mode   --  generate traffic stream(s)"
+    bleft "   ${BOLD}4${NC}   Loopback Test --  local server + client validation"
+    bleft "   ${BOLD}5${NC}   DSCP Reference Table"
+    bleft "   ${BOLD}6${NC}   Exit"
+    bempty; bline '='; echo ""
+}
+
+main_menu() {
+    while true; do
+        show_main_menu
+        local choice
+        read -r -p "  Select [1-6]: " choice </dev/tty
+        case "$choice" in
+            1)
+                echo ""; build_vrf_maps; get_interface_list
+                show_interface_table; echo ""
+                read -r -p "  Press Enter to return to menu..." </dev/tty ;;
+            2)
+                build_vrf_maps; get_interface_list; run_server_mode; echo ""
+                read -r -p "  Press Enter to return to menu..." </dev/tty
+                SERVER_COUNT=0; SERVER_PIDS=()
+                SRV_PORT=(); SRV_BIND=(); SRV_VRF=(); SRV_ONEOFF=(); SRV_LOGFILE=(); SRV_SCRIPT=() ;;
+            3)
+                build_vrf_maps; get_interface_list; run_client_mode; echo ""
+                read -r -p "  Press Enter to return to menu..." </dev/tty
+                STREAM_COUNT=0; STREAM_PIDS=(); NETEM_IFACES=() ;;
+            4)
+                build_vrf_maps; get_interface_list; run_loopback_mode; echo ""
+                read -r -p "  Press Enter to return to menu..." </dev/tty
+                STREAM_COUNT=0; SERVER_COUNT=0
+                STREAM_PIDS=(); SERVER_PIDS=(); NETEM_IFACES=() ;;
+            5)
+                echo ""; show_dscp_table
+                read -r -p "  Press Enter to return to menu..." </dev/tty ;;
+            6|q|Q)
+                echo ""; printf '%b\n' "${GREEN}  Goodbye!${NC}"; echo ""; exit 0 ;;
+            "") ;;
+            *)
+                printf '%b\n' "${RED}  Invalid choice '${choice}'. Enter 1 to 6.${NC}"
+                sleep 1 ;;
+        esac
+    done
+}
+
+# =============================================================================
+# SECTION 16 — ENTRY POINT
+# =============================================================================
+
+main() {
+    _init_ansi_lengths   # Pre-measure ANSI constant byte lengths for vlen()
+    register_traps
+    init_tmpdir
+    find_iperf3
+    get_iperf3_version
+    detect_forceflush
+    check_root
+    build_vrf_maps
+    get_interface_list
+    main_menu
+}
+
+main "$@"
