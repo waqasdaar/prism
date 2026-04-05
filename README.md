@@ -934,3 +934,52 @@ When the script exits, all _tc rules_ are removed:
 tc netem:
     [REMOVED]  netem on eth0
 ```
+
+## Use Case 9 — Reverse Mode Asymmetric Testing
+
+**Goal**: Measure throughput in the server-to-client direction without
+changing which host runs the server. This reveals upstream vs downstream
+asymmetry in the path.
+
+
+Typical scenarios:
+- ADSL / cable asymmetric link validation
+- Asymmetric MPLS path discovery
+- Upload vs download comparison
+
+**Configuration**
+```
+Reverse mode -R? [no]: y
+```
+**Generated command**:
+```
+iperf3 -c 10.0.0.1 -p 5201 -t 30 -i 1 -R
+```
+**Example — Proving Path Asymmetry**
+
+**Stream 1** — Forward (client → server):
+```
+Reverse mode -R? [no]: n
+```
+**Stream 2** — Reverse (server → client):
+```
+Reverse mode -R? [no]: y
+```
+**Final Results** — Asymmetry Visible
+```
++==============================================================================+
+|                                Final Results                                 |
++==============================================================================+
+
+  #    Proto  Target      Port   Sender BW     Receiver BW   Retx
+  ------------------------------------------------------------------
+  1    TCP    10.0.0.1    5201   950.00 Mbps   948.10 Mbps   Retx:0
+  2    TCP    10.0.0.1    5202   480.22 Mbps   478.90 Mbps   Retx:3
+  ------------------------------------------------------------------
+
+  All 2 stream(s) completed successfully.
+```
+
+**<span style="color:blue">Stream 1 (forward) shows full 950 Mbps.</span>**
+**<span style="color:red">Stream 2 (reverse) shows only 480 Mbps — confirming upstream asymmetry.</span>**
+
