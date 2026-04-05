@@ -715,3 +715,74 @@ ip vrf exec vrf10 iperf3 -c 10.10.114.1 -p 5201 -t 30 -i 1
 |  Ctrl+C to stop all listeners                                                |
 +------------------------------------------------------------------------------+
 ```
+
+## Use Case 6 — DSCP and QoS Marking
+
+**Goal**: Generate traffic with specific DSCP markings to validate end-to-end QoS classification, policing, and queuing behavior.
+Typical scenarios:
+- Verifying DiffServ policy application
+- Testing traffic classification on routers and switches
+- Validating per-class queue behavior
+- Confirming DSCP preservation across network boundaries
+
+**DSCP Reference Table**
+Access from the main menu with _option 5_:
+```
+Name          DSCP  TOS   Typical Use Case
+  ────────────  ────  ────  ─────────────────────────────────────────────
+  Default/CS0   0     0     Best Effort
+  CS1           8     32    Scavenger / Low-priority bulk
+  AF11          10    40    Low data (assured, low drop)
+  AF12          12    48    Low data (assured, med drop)
+  AF13          14    56    Low data (assured, high drop)
+  CS2           16    64    OAM / Network management
+  AF21          18    72    High-throughput data (low drop)
+  AF22          20    80    High-throughput data (med drop)
+  AF23          22    88    High-throughput data (high drop)
+  CS3           24    96    Broadcast video / Signaling
+  AF31          26    104   Multimedia streaming (low drop)
+  AF32          28    112   Multimedia streaming (med drop)
+  AF33          30    120   Multimedia streaming (high drop)
+  CS4           32    128   Real-time interactive
+  AF41          34    136   Multimedia conf (low drop)
+  AF42          36    144   Multimedia conf (med drop)
+  AF43          38    152   Multimedia conf (high drop)
+  CS5           40    160   Signaling -- call control
+  VA            44    176   Voice Admit (CAC admitted)
+  EF            46    184   Expedited Forwarding -- VoIP
+  CS6           48    192   Network Control (BGP/OSPF)
+  CS7           56    224   Reserved / Network Critical
+  ────────────  ────  ────  ─────────────────────────────────────────────
+
+  TOS = DSCP * 4  |  Enter name, 0-63, 'list', or press Enter for none.
+```
+**DSCP Configuration During Stream Setup**
+```
+Stream 1 - DSCP (name/0-63/'list'/Enter=none) [none]: EF
+```
+**Sets iperf3 flag: -S 184 (EF=46, TOS=46×4=184)**
+```
+Stream 2 - DSCP (name/0-63/'list'/Enter=none) [none]: AF41
+```
+**Sets iperf3 flag: -S 136 (AF41=34, TOS=34×4=136)**
+```
+Stream 3 - DSCP (name/0-63/'list'/Enter=none) [none]: 46
+```
+Numeric entry also accepted, equivalent to EF
+**Multi-Class QoS Validation Dashboard**
+```
++==============================================================================+
+|                   iperf3 Traffic Manager -- Live Dashboard                   |
++==============================================================================+
+|  Active:3   Connected:3   Done:0   Failed:0   Elapsed:00:10                  |
++------------------------------------------------------------------------------+
+|  #    Proto  Target         Port   Bandwidth    Time    DSCP   Status        |
++------------------------------------------------------------------------------+
+|  1    UDP    10.0.0.1       5201   100.00 Mbps  00:50   EF     CONNECTED     |
+|  2    TCP    10.0.0.1       5202   500.11 Mbps  00:50   AF41   CONNECTED     |
+|  3    TCP    10.0.0.1       5203   300.45 Mbps  00:50   CS3    CONNECTED     |
++------------------------------------------------------------------------------+
+|  Ctrl+C to stop all streams                                                  |
++------------------------------------------------------------------------------+
+```
+
