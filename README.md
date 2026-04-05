@@ -431,5 +431,71 @@ Launch 1 stream(s)? [Y/n]: Y
   All 1 stream(s) completed successfully.
 ```
 
+## Use Case 2 — UDP Performance and Loss Test
 
+**Goal**: Measure _UDP_ throughput, jitter, and packet loss for
+          real-time application path validation.
+Typical scenarios:
+- VoIP path quality assessment
+- Video streaming path validation
+- QoS policy verification
+- Pre/post impairment comparison
+**Important**: iperf3 requires an explicit bandwidth value for UDP. Without it the default is 1 Mbps, which may not reflect real traffic.
+
+**Configuration**
+| **Parameters** | **Value**  |
+|----------------|------------|
+| Protocol       | UDP        |
+| Target         | 10.10.10.5 |
+| Port           | 5201       |
+| Bandwidth      | 200M       |
+| Duration       | 30 seconds |
+| DSCP           | EF         |
+
+**Running the Test**
+```
+Protocol [TCP/UDP]: UDP
+Target server IP/hostname: 10.10.10.5
+Server port [5201]: 5201
+Bandwidth (required for UDP): 200M
+Duration seconds [10]: 30
+DSCP: EF
+Launch 1 stream(s)? [Y/n]: Y
+
+[STARTED]  stream 1  PID 379620  UDP -> 10.10.10.5:5201
+
+  Streams running. Opening dashboard...
+
+```
+
+**Live Dashboard**
+
+```
++==============================================================================+
+|                   iperf3 Traffic Manager -- Live Dashboard                   |
++==============================================================================+
+|  Active:1   Connected:1   Done:0   Failed:0   Elapsed:00:12                  |
++------------------------------------------------------------------------------+
+|  #    Proto  Target         Port   Bandwidth    Time    DSCP   Status        |
++------------------------------------------------------------------------------+
+|  1    UDP    10.10.10.5     5201   200.01 Mbps  00:18   EF     CONNECTED     |
++------------------------------------------------------------------------------+
+|  Ctrl+C to stop all streams                                                  |
++------------------------------------------------------------------------------+
+```
+
+**Final Results**
+
+```
++==============================================================================+
+|                                Final Results                                 |
++==============================================================================+
+
+  #    Proto  Target         Port   Sender BW     Receiver BW   Retx / Jitter+Loss
+  ----------------------------------------------------------------------------------
+  1    UDP    10.10.10.5     5201   200.01 Mbps   199.87 Mbps   J:0.012ms L:0.001%
+  ----------------------------------------------------------------------------------
+
+  All 1 stream(s) completed successfully.
+```
 
