@@ -12,7 +12,6 @@ CYAN=$'\033[0;36m'
 BOLD=$'\033[1m'
 NC=$'\033[0m'
 
-# Waqas Daar 2026
 # Pre-computed byte lengths of each colour constant.
 # These are used in vlen() to subtract invisible bytes from string length.
 # By measuring ${#RED}, ${#GREEN} etc. at startup we know exactly how many
