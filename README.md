@@ -1455,11 +1455,8 @@ The default is **P** (proceed) because warnings indicate degraded but
 functional connectivity. The operator may choose to proceed and observe
 the impact on stream results, or abort to investigate before the test.
 
----
+Failures Detected
 
-### Failures Detected
-
-```
 2 target(s) FAILED pre-flight checks.
 
 
@@ -1473,8 +1470,7 @@ Choice [A]:
 The default is **A** (abort) because failures indicate that one or more
 streams will almost certainly fail at runtime. Proceeding is possible
 but not recommended without resolving the underlying issue.
-
----
+```
 
 ## Use Case Examples
 
