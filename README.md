@@ -1542,7 +1542,8 @@ sudo ip vrf exec vrf10 traceroute 192.168.114.200
 sudo ip vrf exec vrf10 traceroute 192.168.114.201
 ```
 
-sudo authentication required for VRF traceroute (ip vrf exec vrf10)
+``` 
+  **sudo authentication required for VRF traceroute (ip vrf exec vrf10)**
 
   **Please enter your sudo password:**
 
@@ -1550,7 +1551,7 @@ sudo authentication required for VRF traceroute (ip vrf exec vrf10)
 
   Checking  192.168.114.200:5201  (TCP / VRF:vrf10)...
   Checking  192.168.114.201:5202  (UDP / VRF:vrf10)...
-```
+
 +==============================================================================+
 |                            Pre-Flight Results                                |
 +==============================================================================+
@@ -1575,8 +1576,9 @@ sudo authentication required for VRF traceroute (ip vrf exec vrf10)
 |   2     10.48.35.24                               1.60 ms                    |
 |   3     192.168.114.201                           1.62 ms                    |
 +==============================================================================+
-```
+
   All pre-flight checks PASSED. Proceeding to launch streams.
+```
 
 **Pre-flight output:**
 
