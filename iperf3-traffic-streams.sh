@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
 # iperf3-traffic-streams.sh — Enterprise-grade iperf3 multi-stream traffic manager
-# Version: 8.1
+# Version: 8.2.1
 # =============================================================================
 
 # =============================================================================
@@ -32,6 +32,9 @@ _bootstrap_detect
 if (( BASH_MAJOR >= 4 )); then
     declare -A IFACE_TO_VRF=()
     declare -A VRF_MASTERS=()
+    declare -A PMTU_RESULTS=()
+    declare -A PMTU_STATUS=()
+    declare -A PMTU_RECOMMEND=()
 else
     declare -a _ASSOC_KEYS_IFACE_TO_VRF=()
     declare -a _ASSOC_VALS_IFACE_TO_VRF=()
@@ -122,6 +125,7 @@ YELLOW=$'\033[1;33m'
 BLUE=$'\033[0;34m'
 CYAN=$'\033[0;36m'
 BOLD=$'\033[1m'
+DIM=$'\033[2m'
 NC=$'\033[0m'
 
 _LEN_RED=0; _LEN_GREEN=0; _LEN_YELLOW=0; _LEN_BLUE=0
@@ -1107,7 +1111,6 @@ configure_client_streams() {
         local sn=$(( i + 1 ))
         echo ""; bline '='; bcenter "${BOLD}Client Stream ${sn} of ${num}${NC}"; bline '='; echo ""
 
-        # ── Protocol ─────────────────────────────────────────────────────────
         local proto
         while true; do
             read -r -p "  Protocol [TCP/UDP] (default TCP): " proto </dev/tty
@@ -1118,7 +1121,6 @@ configure_client_streams() {
         done
         S_PROTO+=("$proto")
 
-        # ── Target ───────────────────────────────────────────────────────────
         local tprompt
         [[ -n "$lt" ]] \
             && tprompt="  Target server IP/hostname [$lt]" \
@@ -1136,7 +1138,6 @@ configure_client_streams() {
         done
         lt="$tgt"; S_TARGET+=("$tgt")
 
-        # ── Port ─────────────────────────────────────────────────────────────
         local dp=$(( lp + 1 )) port
         while true; do
             read -r -p "  Server port [$dp]: " port </dev/tty
@@ -1151,7 +1152,6 @@ configure_client_streams() {
         done
         lp="$port"; S_PORT+=("$port")
 
-        # ── Bandwidth ────────────────────────────────────────────────────────
         local bw=""
         if [[ "$proto" == "UDP" ]]; then
             while true; do
@@ -1170,7 +1170,6 @@ configure_client_streams() {
         fi
         S_BW+=("$bw")
 
-        # ── Duration ─────────────────────────────────────────────────────────
         local din dval
         while true; do
             read -r -p "  Duration seconds (0=unlimited) [10]: " din </dev/tty
@@ -1184,11 +1183,9 @@ configure_client_streams() {
         done
         S_DURATION+=("$dval")
 
-        # ── DSCP ─────────────────────────────────────────────────────────────
         prompt_dscp "$sn"
         S_DSCP_NAME+=("$PROMPT_DSCP_NAME"); S_DSCP_VAL+=("$PROMPT_DSCP_VAL")
 
-        # ── Parallel threads ──────────────────────────────────────────────────
         local pv
         while true; do
             read -r -p "  Parallel threads (-P) [1]: " pv </dev/tty
@@ -1200,12 +1197,10 @@ configure_client_streams() {
         done
         S_PARALLEL+=("$pv")
 
-        # ── Reverse mode ──────────────────────────────────────────────────────
         local ri; read -r -p "  Reverse mode -R? [no]: " ri </dev/tty
         local rev=0; [[ "$ri" =~ ^[Yy] ]] && rev=1
         S_REVERSE+=("$rev")
 
-        # ── TCP options ───────────────────────────────────────────────────────
         local cca="" win="" mss=""
         if [[ "$proto" == "TCP" ]]; then
             echo ""; printf '%b\n' "${CYAN}  -- TCP Options (press Enter to skip each) --${NC}"
@@ -1233,12 +1228,9 @@ configure_client_streams() {
         fi
         S_CCA+=("$cca"); S_WINDOW+=("$win"); S_MSS+=("$mss")
 
-        # ──────────────────────────────────────────────────────────────────────
-        # ── Bind source IP ────────────────────────────────────────────────────
-        # ──────────────────────────────────────────────────────────────────────
         local bip=""
         local auto_vrf=""
-        local bind_from_grt=0      # 1 = confirmed GRT interface was selected
+        local bind_from_grt=0
         local _bind_table_shown=0
 
         echo ""
@@ -1275,9 +1267,7 @@ configure_client_streams() {
                 local _total_ifaces=${#IFACE_NAMES[@]}
 
                 if (( _sel_num == 0 )); then
-                    bip=""
-                    auto_vrf=""
-                    bind_from_grt=0
+                    bip=""; auto_vrf=""; bind_from_grt=0
                     printf '%b\n' "${CYAN}  Auto source address selected (no bind IP, no VRF override).${NC}"
                     break
                 fi
@@ -1296,48 +1286,32 @@ configure_client_streams() {
                     fi
 
                     [[ "$_sel_state" != "up" ]] && \
-                        printf '%b\n' \
-                            "${YELLOW}  WARNING: ${_sel_iface} state='${_sel_state}'.${NC}"
+                        printf '%b\n' "${YELLOW}  WARNING: ${_sel_iface} state='${_sel_state}'.${NC}"
 
-                    printf '%b  Bound to: %s → %s%b\n' \
-                        "$GREEN" "$_sel_iface" "$_sel_ip" "$NC"
-
+                    printf '%b  Bound to: %s → %s%b\n' "$GREEN" "$_sel_iface" "$_sel_ip" "$NC"
                     bip="$_sel_ip"
 
-                    # ── Derive VRF from selected interface ────────────────
                     if [[ "$OS_TYPE" == "linux" ]]; then
                         if [[ "$_sel_vrf" == "GRT" || -z "$_sel_vrf" ]]; then
-                            # Interface is in GRT — must NOT use ip vrf exec
-                            auto_vrf=""
-                            bind_from_grt=1
+                            auto_vrf=""; bind_from_grt=1
                             printf '%b  Interface is in GRT — VRF will not be used for this stream.%b\n' \
                                 "$CYAN" "$NC"
                         else
-                            # Interface is in a named VRF
-                            auto_vrf="$_sel_vrf"
-                            bind_from_grt=0
+                            auto_vrf="$_sel_vrf"; bind_from_grt=0
                             printf '%b  Auto-detected VRF from interface: %s%b\n' \
                                 "$GREEN" "$auto_vrf" "$NC"
                         fi
                     fi
                     break
-
                 else
-                    printf '%b\n' \
-                        "${RED}  Invalid number. Enter 0 or 1-${_total_ifaces}.${NC}"
+                    printf '%b\n' "${RED}  Invalid number. Enter 0 or 1-${_total_ifaces}.${NC}"
                     continue
                 fi
             fi
 
-            # Raw IP address typed directly
             if validate_ip "$_bind_raw"; then
                 printf '%b  Bind IP set to: %s%b\n' "$GREEN" "$_bind_raw" "$NC"
-                bip="$_bind_raw"
-                # When a raw IP is entered we cannot auto-detect the VRF.
-                # The VRF prompt below will handle it.
-                auto_vrf=""
-                bind_from_grt=0
-                break
+                bip="$_bind_raw"; auto_vrf=""; bind_from_grt=0; break
             fi
 
             printf '%b\n' "${RED}  Unrecognised input '${_bind_raw}'.${NC}"
@@ -1345,49 +1319,21 @@ configure_client_streams() {
         done
         S_BIND+=("$bip")
 
-        # ── VRF (Linux only) ──────────────────────────────────────────────────
-        #
-        # Decision matrix:
-        #
-        #   bind_from_grt == 1   → interface is in GRT, never use VRF exec.
-        #                           Skip prompt entirely. Force vval="".
-        #
-        #   auto_vrf non-empty   → VRF was auto-detected from a VRF interface.
-        #                           Present as default, operator can override.
-        #
-        #   auto_vrf empty +
-        #   bind_from_grt == 0 +
-        #   bip non-empty        → Raw IP entered. Prompt for VRF.
-        #                           Validate that if a VRF is entered the
-        #                           bind IP belongs to an interface in that VRF.
-        #
-        #   bip empty (auto)     → No bind IP. Prompt for optional VRF.
-        #
         local vval=""
         if [[ "$OS_TYPE" == "linux" ]]; then
-
             if (( bind_from_grt == 1 )); then
-                # ── GRT interface selected — skip VRF prompt ──────────────
                 vval=""
-                printf '%b  Stream will use GRT (no VRF exec applied).%b\n' \
-                    "$CYAN" "$NC"
-
+                printf '%b  Stream will use GRT (no VRF exec applied).%b\n' "$CYAN" "$NC"
             elif [[ -n "$auto_vrf" ]]; then
-                # ── VRF auto-detected from interface ─────────────────────
                 printf '%b\n' \
                     "  ${GREEN}Auto-detected VRF: ${BOLD}${auto_vrf}${NC}${GREEN} (from selected interface)${NC}"
                 read -r -p "  VRF [${auto_vrf}]: " vval </dev/tty
                 vval="${vval:-$auto_vrf}"
-
-                # Safety: if operator changed VRF to empty treat as GRT
                 if [[ -z "$vval" ]]; then
-                    printf '%b  VRF cleared — stream will use GRT.%b\n' \
-                        "$YELLOW" "$NC"
+                    printf '%b  VRF cleared — stream will use GRT.%b\n' "$YELLOW" "$NC"
                 else
-                    # Validate the bind IP is reachable in the specified VRF
                     if [[ -n "$bip" ]]; then
-                        local _vrf_match=0
-                        local _ki
+                        local _vrf_match=0 _ki
                         for (( _ki=0; _ki<${#IFACE_IPS[@]}; _ki++ )); do
                             if [[ "${IFACE_IPS[$_ki]}" == "$bip" && \
                                   "${IFACE_VRFS[$_ki]}" == "$vval" ]]; then
@@ -1401,37 +1347,26 @@ configure_client_streams() {
                                 "${YELLOW}           Stream may fail with 'bad file descriptor' at runtime.${NC}"
                         fi
                     fi
-                    if (( IS_ROOT == 0 )); then
-                        printf '%b\n' \
-                            "${YELLOW}  WARNING: ip vrf exec requires root.${NC}"
-                    fi
+                    (( IS_ROOT == 0 )) && \
+                        printf '%b\n' "${YELLOW}  WARNING: ip vrf exec requires root.${NC}"
                     printf '%b  Stream will use VRF: %s%b\n' "$CYAN" "$vval" "$NC"
                 fi
-
             elif [[ -n "$dvrf" ]]; then
-                # ── Session-level VRF default ─────────────────────────────
                 read -r -p "  VRF [$dvrf]: " vval </dev/tty
                 vval="${vval:-$dvrf}"
                 if [[ -n "$vval" ]]; then
-                    if (( IS_ROOT == 0 )); then
+                    (( IS_ROOT == 0 )) && \
                         printf '%b\n' "${YELLOW}  WARNING: ip vrf exec requires root.${NC}"
-                    fi
                     printf '%b  Stream will use VRF: %s%b\n' "$CYAN" "$vval" "$NC"
                 else
                     printf '%b  Stream will use GRT (no VRF).%b\n' "$CYAN" "$NC"
                 fi
-
             else
-                # ── No auto-detection: raw IP or auto-bind ────────────────
-                # Prompt for optional VRF. Validate bind IP if provided.
                 read -r -p "  VRF (press Enter for GRT/none): " vval </dev/tty
                 vval="${vval:-}"
-
                 if [[ -n "$vval" ]]; then
-                    # Validate bind IP belongs to the manually entered VRF
                     if [[ -n "$bip" && "$bip" != "0.0.0.0" ]]; then
-                        local _vrf_match=0
-                        local _ki
+                        local _vrf_match=0 _ki
                         for (( _ki=0; _ki<${#IFACE_IPS[@]}; _ki++ )); do
                             if [[ "${IFACE_IPS[$_ki]}" == "$bip" && \
                                   "${IFACE_VRFS[$_ki]}" == "$vval" ]]; then
@@ -1447,9 +1382,8 @@ configure_client_streams() {
                                 "${YELLOW}           Proceeding — stream may fail with 'bad file descriptor'.${NC}"
                         fi
                     fi
-                    if (( IS_ROOT == 0 )); then
+                    (( IS_ROOT == 0 )) && \
                         printf '%b\n' "${YELLOW}  WARNING: ip vrf exec requires root.${NC}"
-                    fi
                     printf '%b  Stream will use VRF: %s%b\n' "$CYAN" "$vval" "$NC"
                 else
                     printf '%b  Stream will use GRT (no VRF).%b\n' "$CYAN" "$NC"
@@ -1458,7 +1392,6 @@ configure_client_streams() {
         fi
         S_VRF+=("$vval")
 
-        # ── Network impairment (Linux only) ───────────────────────────────────
         local dly="" jit="" loss=""
         if [[ "$OS_TYPE" == "linux" ]]; then
             echo ""
@@ -1496,7 +1429,6 @@ configure_client_streams() {
         fi
         S_DELAY+=("$dly"); S_JITTER+=("$jit"); S_LOSS+=("$loss")
 
-        # ── FQ socket pacing (Linux only) ─────────────────────────────────────
         local nofq=0
         if [[ "$OS_TYPE" == "linux" ]]; then
             (( NOFQ_SUPPORTED )) && {
@@ -1611,8 +1543,40 @@ build_server_command() {
 
 build_client_command() {
     local idx="$1" cmd=""
-    [[ "$OS_TYPE" == "linux" && -n "${S_VRF[$idx]}" ]] && \
-        cmd="ip vrf exec ${S_VRF[$idx]} "
+
+    local stream_vrf="${S_VRF[$idx]:-}"
+    local stream_bind="${S_BIND[$idx]:-}"
+
+    if [[ -n "$stream_vrf" && -n "$stream_bind" && \
+          "$stream_bind" != "0.0.0.0" && \
+          "$OS_TYPE" == "linux" ]]; then
+        local _vrf_consistent=0 _ki
+        for (( _ki=0; _ki<${#IFACE_IPS[@]}; _ki++ )); do
+            if [[ "${IFACE_IPS[$_ki]}"  == "$stream_bind" && \
+                  "${IFACE_VRFS[$_ki]}" == "$stream_vrf"  ]]; then
+                _vrf_consistent=1; break
+            fi
+        done
+        if (( _vrf_consistent == 0 )); then
+            local _in_grt=0
+            for (( _ki=0; _ki<${#IFACE_IPS[@]}; _ki++ )); do
+                if [[ "${IFACE_IPS[$_ki]}"  == "$stream_bind" && \
+                      "${IFACE_VRFS[$_ki]}" == "GRT" ]]; then
+                    _in_grt=1; break
+                fi
+            done
+            if (( _in_grt == 1 )); then
+                printf '%b\n' \
+                    "${YELLOW}  [WARN] Stream $((idx+1)): bind IP ${stream_bind} is in GRT but VRF '${stream_vrf}' was configured. VRF cleared to prevent bad file descriptor.${NC}" >&2
+                stream_vrf=""
+            fi
+        fi
+    fi
+
+    if [[ "$OS_TYPE" == "linux" && -n "$stream_vrf" ]]; then
+        cmd="ip vrf exec ${stream_vrf} "
+    fi
+
     cmd+="${IPERF3_BIN} -c ${S_TARGET[$idx]} -p ${S_PORT[$idx]}"
     [[ "${S_PROTO[$idx]}" == "UDP" ]] && cmd+=" -u"
     [[ -n "${S_BW[$idx]}" ]] && cmd+=" -b ${S_BW[$idx]}"
@@ -1630,7 +1594,7 @@ build_client_command() {
     [[ -n "${S_CCA[$idx]}"    ]] && cmd+=" -C ${S_CCA[$idx]}"
     [[ -n "${S_WINDOW[$idx]}" ]] && cmd+=" -w ${S_WINDOW[$idx]}"
     [[ -n "${S_MSS[$idx]}"    ]] && cmd+=" -M ${S_MSS[$idx]}"
-    [[ -n "${S_BIND[$idx]}"   ]] && cmd+=" -B ${S_BIND[$idx]}"
+    [[ -n "$stream_bind"      ]] && cmd+=" -B $stream_bind"
     if [[ "$OS_TYPE" == "linux" ]]; then
         (( S_NOFQ[$idx] )) && (( NOFQ_SUPPORTED )) && cmd+=" --no-fq-socket-pacing"
     fi
@@ -1645,24 +1609,19 @@ write_launch_script() {
 }
 
 launch_servers() {
-    SERVER_PIDS=()
-    SRV_PREV_STATE=()
-    SRV_BW_CACHE=()
+    SERVER_PIDS=(); SRV_PREV_STATE=(); SRV_BW_CACHE=()
     local i
     for (( i=0; i<SERVER_COUNT; i++ )); do
         local sn=$(( i + 1 )) sf="${TMPDIR}/server_${sn}.sh" lf="${TMPDIR}/server_${sn}.log"
         if ! write_launch_script "$sf" "$(build_server_command "$i")"; then
             printf '%b\n' "${RED}  [ERROR] Cannot write script for server ${sn}.${NC}"
             SERVER_PIDS+=(0); SRV_LOGFILE[$i]="$lf"
-            SRV_PREV_STATE+=(""); SRV_BW_CACHE+=("---")
-            continue
+            SRV_PREV_STATE+=(""); SRV_BW_CACHE+=("---"); continue
         fi
         SRV_SCRIPT[$i]="$sf"; SRV_LOGFILE[$i]="$lf"
         bash "$sf" > "$lf" 2>&1 &
         local pid=$!
-        SERVER_PIDS+=("$pid")
-        SRV_PREV_STATE+=("")
-        SRV_BW_CACHE+=("---")
+        SERVER_PIDS+=("$pid"); SRV_PREV_STATE+=(""); SRV_BW_CACHE+=("---")
         printf '%b[STARTED]%b  server %d  PID %-6d  port %s\n' \
             "$GREEN" "$NC" "$sn" "$pid" "${SRV_PORT[$i]}"
     done
@@ -1763,227 +1722,17 @@ apply_netem() {
 # =============================================================================
 # SECTION 10b — PRE-FLIGHT CONNECTIVITY CHECKS
 # =============================================================================
-#
-# Pre-flight runs three checks per configured stream target before any
-# iperf3 process is launched:
-#
-#   Check 1 — ICMP Ping
-#     Sends 3 ICMP echo requests with a 2-second timeout per packet.
-#     Reports: min/avg/max RTT, packet loss percentage.
-#     Result:  PASS  — all 3 replies received
-#              WARN  — partial replies (1-2 of 3)
-#              FAIL  — no reply
-#
-#   Check 2 — TCP Port Reachability
-#     Opens a TCP connection to target:port using /dev/tcp within a
-#     2-second timeout subshell.  This verifies the iperf3 server port
-#     is open and accepting connections before traffic is launched.
-#     Result:  PASS  — connection opened and closed cleanly
-#              SKIP  — protocol is UDP (no TCP port check applicable)
-#              FAIL  — connection refused or timed out
-#
-#   Check 3 — Traceroute Path Discovery
-#     Runs traceroute (or tracepath as fallback) to each unique target.
-#     Displays the hop-by-hop path in a sub-table below the main results.
-#     Does not produce a PASS/FAIL — informational only.
-#     Skipped for loopback targets (127.x.x.x).
-#
-# After all checks the function presents a consolidated results table and
-# asks the operator what to do when any check failed:
-#
-#   All PASS          — proceed automatically
-#   Any WARN          — display warning table, prompt: proceed / abort
-#   Any FAIL          — display failure table, prompt: proceed / abort
-#
-# =============================================================================
 
-
-# ---------------------------------------------------------------------------
-# _preflight_ping  <target>
-#
-# Sends 3 ICMP echo requests to <target>.
-# Prints a result record:  STATUS|RTT_SUMMARY|LOSS_PCT
-#   STATUS:      PASS | WARN | FAIL
-#   RTT_SUMMARY: "min/avg/max ms"  or  "N/A"
-#   LOSS_PCT:    "0%" / "33%" / "67%" / "100%"
-# ---------------------------------------------------------------------------
-_preflight_ping() {
-    local target="$1"
-    local ping_out loss_pct rtt_summary status
-
-    # Run 3 pings with a 2-second deadline per packet
-    # Works on both Linux and macOS (flag differences handled below)
-    if [[ "$OS_TYPE" == "macos" ]]; then
-        ping_out=$(ping -c 3 -W 2000 "$target" 2>&1)
-    else
-        ping_out=$(ping -c 3 -W 2 "$target" 2>&1)
-    fi
-
-    # Extract packet loss percentage
-    loss_pct=$(printf '%s' "$ping_out" \
-        | grep -oE '[0-9]+(\.[0-9]+)?% packet loss' \
-        | grep -oE '^[0-9]+(\.[0-9]+)?')
-    loss_pct="${loss_pct:-100}"
-
-    # Extract RTT summary (min/avg/max)
-    # Linux format:  rtt min/avg/max/mdev = 0.123/0.456/0.789/0.111 ms
-    # macOS format:  round-trip min/avg/max/stddev = 0.123/0.456/0.789/0.111 ms
-    local rtt_line
-    rtt_line=$(printf '%s' "$ping_out" \
-        | grep -E 'min/avg/max')
-    if [[ -n "$rtt_line" ]]; then
-        local rtt_vals
-        rtt_vals=$(printf '%s' "$rtt_line" \
-            | grep -oE '[0-9]+\.[0-9]+/[0-9]+\.[0-9]+/[0-9]+\.[0-9]+')
-        if [[ -n "$rtt_vals" ]]; then
-            local rtt_min rtt_avg rtt_max
-            rtt_min=$(printf '%s' "$rtt_vals" | cut -d/ -f1)
-            rtt_avg=$(printf '%s' "$rtt_vals" | cut -d/ -f2)
-            rtt_max=$(printf '%s' "$rtt_vals" | cut -d/ -f3)
-            rtt_summary="${rtt_min}/${rtt_avg}/${rtt_max} ms"
-        else
-            rtt_summary="N/A"
-        fi
-    else
-        rtt_summary="N/A"
-    fi
-
-    # Determine status
-    local loss_int
-    loss_int=$(printf '%.0f' "$loss_pct" 2>/dev/null || echo 100)
-    if   (( loss_int == 0   )); then status="PASS"
-    elif (( loss_int == 100 )); then status="FAIL"
-    else                              status="WARN"
-    fi
-
-    printf '%s|%s|%s%%' "$status" "$rtt_summary" "$loss_int"
-}
-
-# ---------------------------------------------------------------------------
-# _preflight_tcp_port  <target>  <port>
-#
-# Attempts to open a TCP connection to target:port within 2 seconds.
-# Prints:  PASS | FAIL | SKIP
-# ---------------------------------------------------------------------------
-_preflight_tcp_port() {
-    local target="$1"
-    local port="$2"
-
-    # Run in a subshell with timeout so it cannot hang the main script
-    local result
-    result=$(
-        (
-            # Set a 2-second alarm
-            if [[ "$OS_TYPE" == "macos" ]]; then
-                # macOS: use bash built-in timeout via background job
-                exec 5<>"/dev/tcp/${target}/${port}" 2>/dev/null
-                echo $?
-                exec 5>&-
-            else
-                # Linux: timeout command available
-                timeout 2 bash -c \
-                    "exec 5<>/dev/tcp/${target}/${port}" 2>/dev/null
-                echo $?
-            fi
-        ) 2>/dev/null
-    )
-
-    if [[ "$result" == "0" ]]; then
-        printf '%s' "PASS"
-    else
-        printf '%s' "FAIL"
-    fi
-}
-
-# ---------------------------------------------------------------------------
-# _preflight_traceroute  <target>
-#
-# Runs traceroute to the target and captures the hop list.
-# Returns a newline-separated list of:
-#   HOP_NUM  HOP_IP_OR_HOSTNAME  RTT_MS
-# or a single line "UNAVAILABLE" if the tool is not installed.
-# ---------------------------------------------------------------------------
-_preflight_traceroute() {
-    local target="$1"
-    local tr_cmd="" tr_out=""
-
-    # Prefer traceroute, fall back to tracepath (Linux), then skip
-    if command -v traceroute >/dev/null 2>&1; then
-        tr_cmd="traceroute"
-    elif command -v tracepath >/dev/null 2>&1; then
-        tr_cmd="tracepath"
-    else
-        printf '%s' "UNAVAILABLE"
-        return
-    fi
-
-    if [[ "$tr_cmd" == "traceroute" ]]; then
-        # -m 20: max 20 hops  -w 2: 2-second wait per probe  -q 1: 1 probe per hop
-        if [[ "$OS_TYPE" == "macos" ]]; then
-            tr_out=$(traceroute -m 20 -w 2 -q 1 "$target" 2>/dev/null | tail -n +2)
-        else
-            tr_out=$(traceroute -m 20 -w 2 -q 1 -n "$target" 2>/dev/null | tail -n +2)
-        fi
-    else
-        tr_out=$(tracepath -n "$target" 2>/dev/null | tail -n +2)
-    fi
-
-    if [[ -z "$tr_out" ]]; then
-        printf '%s' "UNAVAILABLE"
-        return
-    fi
-
-    # Normalise output to "HOP  HOST  RTT" lines
-    printf '%s' "$tr_out" | awk '
-    {
-        # Remove leading whitespace
-        sub(/^[[:space:]]+/, "")
-
-        # Extract hop number (first field)
-        hop = $1
-
-        # Find the first non-* hostname or IP (fields 2+)
-        host = "* * *"
-        rtt  = "---"
-        for (i = 2; i <= NF; i++) {
-            if ($i != "*" && $i !~ /^[0-9]+\.[0-9]+$/ ) {
-                host = $i
-                # Look ahead for RTT value
-                if (i+1 <= NF && $(i+1) ~ /^[0-9]+\.[0-9]+$/) {
-                    rtt = $(i+1) " ms"
-                }
-                break
-            } else if ($i ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/) {
-                host = $i
-                if (i+1 <= NF && $(i+1) ~ /^[0-9]+\.[0-9]+$/) {
-                    rtt = $(i+1) " ms"
-                }
-                break
-            }
-        }
-        printf "%s|%s|%s\n", hop, host, rtt
-    }'
-}
-
-
-# ---------------------------------------------------------------------------
-# _preflight_ping_vrf  <target>  <vrf_exec_prefix>
-#
-# Sends 3 ICMP pings to <target> inside the VRF context defined by
-# <vrf_exec_prefix> (e.g. "ip vrf exec vrf10") or in GRT when empty.
-# Prints: STATUS|RTT_SUMMARY|LOSS_PCT
-# ---------------------------------------------------------------------------
 _preflight_ping_vrf() {
     local target="$1"
-    local vrf_exec="${2:-}"
+    local vrf_name="${2:-}"
     local ping_out loss_pct rtt_summary status
 
     if [[ "$OS_TYPE" == "macos" ]]; then
-        # macOS: vrf_exec is always empty (no VRF support)
         ping_out=$(ping -c 3 -W 2000 "$target" 2>&1)
     else
-        if [[ -n "$vrf_exec" ]]; then
-            ping_out=$(${vrf_exec} ping -c 3 -W 2 "$target" 2>&1)
+        if [[ -n "$vrf_name" ]]; then
+            ping_out=$(ip vrf exec "${vrf_name}" ping -c 3 -W 2 "$target" 2>&1)
         else
             ping_out=$(ping -c 3 -W 2 "$target" 2>&1)
         fi
@@ -2023,23 +1772,13 @@ _preflight_ping_vrf() {
     printf '%s|%s|%s%%' "$status" "$rtt_summary" "$loss_int"
 }
 
-# ---------------------------------------------------------------------------
-# _preflight_tcp_port_vrf  <target>  <port>  <vrf_exec_prefix>
-#
-# Attempts to open a TCP connection to target:port inside the VRF context.
-# Uses a temporary bash script file rather than a subshell here-doc so
-# that "ip vrf exec" can correctly wrap the /dev/tcp connection attempt.
-# Prints: PASS | FAIL
-# ---------------------------------------------------------------------------
 _preflight_tcp_port_vrf() {
     local target="$1"
     local port="$2"
-    local vrf_exec="${3:-}"
-
+    local vrf_name="${3:-}"
     local result=1
 
-    if [[ -n "$vrf_exec" && "$OS_TYPE" == "linux" ]]; then
-        # Write a small probe script that ip vrf exec can run
+    if [[ -n "$vrf_name" && "$OS_TYPE" == "linux" ]]; then
         local probe_script="${TMPDIR}/_preflight_tcp_probe_$$.sh"
         cat > "$probe_script" << PROBE_EOF
 #!/usr/bin/env bash
@@ -2051,11 +1790,10 @@ _preflight_tcp_port_vrf() {
 PROBE_EOF
         chmod +x "$probe_script"
         local probe_out
-        probe_out=$(timeout 3 ${vrf_exec} bash "$probe_script" 2>/dev/null)
+        probe_out=$(timeout 3 ip vrf exec "${vrf_name}" bash "$probe_script" 2>/dev/null)
         rm -f "$probe_script"
         [[ "$probe_out" == "0" ]] && result=0
     else
-        # GRT or macOS — run directly
         local probe_out
         probe_out=$(
             (
@@ -2076,24 +1814,7 @@ PROBE_EOF
     (( result == 0 )) && printf '%s' "PASS" || printf '%s' "FAIL"
 }
 
-# ---------------------------------------------------------------------------
-# _find_traceroute_bin
-#
-# Locates the traceroute or tracepath binary by searching the current PATH
-# first then falling back to a hardcoded list of common installation paths.
-#
-# This is necessary because traceroute lives in /usr/sbin on many Linux
-# distributions and /usr/sbin may not be present in the PATH of a subshell
-# created by $(...) when the calling user is non-root.
-#
-# Prints: FULL_PATH|TYPE
-#   e.g.  /usr/sbin/traceroute|traceroute
-#         /usr/bin/tracepath|tracepath
-#         UNAVAILABLE
-# ---------------------------------------------------------------------------
-
 _find_traceroute_bin() {
-    # PATH-based search first
     local bin_in_path
     bin_in_path=$(command -v traceroute 2>/dev/null)
     if [[ -n "$bin_in_path" && -x "$bin_in_path" ]]; then
@@ -2104,7 +1825,6 @@ _find_traceroute_bin() {
         printf '%s|tracepath' "$bin_in_path"; return 0
     fi
 
-    # Hardcoded fallback search — covers /usr/sbin when not in PATH
     local -a candidates=(
         "traceroute:/usr/bin/traceroute"
         "traceroute:/usr/sbin/traceroute"
@@ -2128,143 +1848,31 @@ _find_traceroute_bin() {
     printf '%s' "UNAVAILABLE"; return 1
 }
 
-
-# ---------------------------------------------------------------------------
-# _resolve_stream_vrf_for_target  <stream_index>
-#
-# Given a stream index returns the VRF name associated with that stream.
-# If S_VRF[$idx] is set and non-empty that VRF is returned directly.
-# If S_VRF[$idx] is empty but S_BIND[$idx] resolves to an interface that
-# belongs to a VRF that VRF is returned as a fallback.
-# Prints the VRF name or empty string for GRT.
-# ---------------------------------------------------------------------------
-_resolve_stream_vrf_for_target() {
-    local idx="$1"
-    local stream_vrf="${S_VRF[$idx]:-}"
-
-    # If VRF is explicitly configured on the stream use it directly
-    if [[ -n "$stream_vrf" ]]; then
-        printf '%s' "$stream_vrf"
-        return
-    fi
-
-    # Fallback: try to derive VRF from the bind IP by matching it against
-    # the known interface list
-    local bind_ip="${S_BIND[$idx]:-}"
-    if [[ -n "$bind_ip" && "$bind_ip" != "0.0.0.0" ]]; then
-        local k
-        for (( k=0; k<${#IFACE_IPS[@]}; k++ )); do
-            if [[ "${IFACE_IPS[$k]}" == "$bind_ip" ]]; then
-                local iface_vrf="${IFACE_VRFS[$k]:-GRT}"
-                if [[ "$iface_vrf" != "GRT" && -n "$iface_vrf" ]]; then
-                    printf '%s' "$iface_vrf"
-                    return
-                fi
-                break
-            fi
-        done
-    fi
-
-    # No VRF found — stream is in GRT
-    printf '%s' ""
-}
-
-# ---------------------------------------------------------------------------
-# _preflight_sudo_warmup  <vrf_name>
-#
-# Pre-warms the sudo credential cache before traceroute runs inside $().
-#
-# Problem:
-#   When _preflight_traceroute_vrf runs inside $(...)  the subshell has
-#   stdout and stderr captured.  sudo cannot display its password prompt
-#   to the terminal and fails silently, producing empty output.
-#
-# Solution:
-#   Run "sudo -v" interactively against /dev/tty BEFORE the subshell is
-#   created.  This authenticates sudo and caches the credential.
-#   All subsequent sudo calls within the cache timeout (typically 15 min)
-#   succeed without prompting, including those inside $(...).
-#
-#   If the process is already root (IS_ROOT=1) sudo is a no-op and this
-#   function returns immediately.
-#
-#   If sudo is not available the VRF traceroute will be attempted without
-#   it — it will either work (if capabilities allow) or fail gracefully.
-# ---------------------------------------------------------------------------
-
 _preflight_sudo_warmup() {
     local vrf_name="${1:-}"
-
-    # Root never needs sudo
     (( IS_ROOT == 1 )) && return 0
-
-    # Only needed on Linux with a VRF configured
     [[ "$OS_TYPE" != "linux" || -z "$vrf_name" ]] && return 0
-
-    # Check sudo is available
     command -v sudo >/dev/null 2>&1 || return 0
-
-    # Check whether the credential is already cached (exit 0 = cached)
-    if sudo -n true 2>/dev/null; then
-        # Already authenticated — no prompt needed
-        return 0
-    fi
-
-    # Credential not cached — prompt interactively on the real terminal
+    if sudo -n true 2>/dev/null; then return 0; fi
     printf '%b\n' \
         "${YELLOW}  sudo authentication required for VRF traceroute (ip vrf exec ${vrf_name})${NC}"
-    printf '%b\n' \
-        "${CYAN}  Please enter your sudo password:${NC}"
-
-    # Run sudo -v directly on /dev/tty so the password prompt is visible
-    # even though this function may be called from within a rendering context
+    printf '%b\n' "${CYAN}  Please enter your sudo password:${NC}"
     sudo -v </dev/tty 2>/dev/tty
     local sudo_rc=$?
-
     if (( sudo_rc != 0 )); then
-        printf '%b\n' \
-            "${YELLOW}  sudo authentication failed or was cancelled.${NC}"
-        printf '%b\n' \
-            "${YELLOW}  VRF traceroute will be skipped for VRF: ${vrf_name}${NC}"
+        printf '%b\n' "${YELLOW}  sudo authentication failed or was cancelled.${NC}"
+        printf '%b\n' "${YELLOW}  VRF traceroute will be skipped for VRF: ${vrf_name}${NC}"
         return 1
     fi
-
     printf '%b\n' "${GREEN}  sudo credential cached successfully.${NC}"
     return 0
 }
-
-# ---------------------------------------------------------------------------
-# _preflight_traceroute_vrf  <target>  <vrf_name>
-#
-# Runs traceroute to <target> using the correct command pattern:
-#
-#   Linux + VRF:  sudo ip vrf exec <VRF_NAME> traceroute <target>
-#   Linux + GRT:  traceroute <target>
-#   macOS:        traceroute <target>
-#
-# Flag compatibility note:
-#   The -n flag (suppress DNS) is NOT used because it is not supported
-#   by all traceroute implementations.  Specifically inetutils-traceroute
-#   (common on Ubuntu/Debian) does not support -n and exits with error:
-#     "invalid option -- 'n'"
-#   The flags used here are supported by all known implementations:
-#     -m 20   maximum 20 hops
-#     -w 2    wait 2 seconds per probe response
-#     -q 1    send 1 probe per hop (faster, less noise)
-#   DNS resolution is left enabled — adds minor latency but is harmless
-#   and avoids the invalid option error entirely.
-#
-# The sudo credential is assumed to be already cached via
-# _preflight_sudo_warmup before this function is called inside $().
-# stderr is redirected to /dev/tty so sudo messages reach the operator.
-# ---------------------------------------------------------------------------
 
 _preflight_traceroute_vrf() {
     local target="$1"
     local vrf_name="${2:-}"
     local tr_out=""
 
-    # ── Locate binary ─────────────────────────────────────────────────────
     local bin_info
     bin_info=$(_find_traceroute_bin)
     if [[ "$bin_info" == "UNAVAILABLE" ]]; then
@@ -2275,25 +1883,17 @@ _preflight_traceroute_vrf() {
     tr_bin=$(printf '%s' "$bin_info" | cut -d'|' -f1)
     tr_type=$(printf '%s' "$bin_info" | cut -d'|' -f2)
 
-    # ── Run traceroute ────────────────────────────────────────────────────
     if [[ "$OS_TYPE" == "linux" && -n "$vrf_name" ]]; then
-
-        # ── Linux + VRF: sudo ip vrf exec VRF_NAME traceroute TARGET ─────
-        # stderr to /dev/tty so sudo messages are visible to the operator
         if [[ "$tr_type" == "traceroute" ]]; then
             tr_out=$(sudo ip vrf exec "${vrf_name}" \
                 "${tr_bin}" -m 20 -w 2 -q 1 "${target}" \
                 2>/dev/tty | tail -n +2)
         else
-            # tracepath does not support -m -w -q flags
             tr_out=$(sudo ip vrf exec "${vrf_name}" \
                 "${tr_bin}" "${target}" \
                 2>/dev/tty | tail -n +2)
         fi
-
     elif [[ "$OS_TYPE" == "linux" ]]; then
-
-        # ── Linux + GRT: plain traceroute, no sudo needed ─────────────────
         if [[ "$tr_type" == "traceroute" ]]; then
             tr_out=$("${tr_bin}" -m 20 -w 2 -q 1 "${target}" \
                 2>/dev/null | tail -n +2)
@@ -2301,11 +1901,7 @@ _preflight_traceroute_vrf() {
             tr_out=$("${tr_bin}" "${target}" \
                 2>/dev/null | tail -n +2)
         fi
-
     else
-
-        # ── macOS: plain traceroute ───────────────────────────────────────
-        # macOS traceroute does not support -w but supports -m and -q
         if [[ "$tr_type" == "traceroute" ]]; then
             tr_out=$("${tr_bin}" -m 20 -q 1 "${target}" \
                 2>/dev/null | tail -n +2)
@@ -2313,130 +1909,70 @@ _preflight_traceroute_vrf() {
             tr_out=$("${tr_bin}" "${target}" \
                 2>/dev/null | tail -n +2)
         fi
-
     fi
 
-    # ── Validate output ───────────────────────────────────────────────────
-    if [[ -z "$tr_out" ]]; then
-        printf '%s' "UNAVAILABLE"; return
-    fi
+    [[ -z "$tr_out" ]] && { printf '%s' "UNAVAILABLE"; return; }
 
-    # ── Normalise output to HOP|HOST|RTT lines ────────────────────────────
-    # Handles output from multiple traceroute implementations:
-    #
-    # GNU traceroute / inetutils format:
-    #   1  router.local (192.168.1.1)  0.451 ms  0.151 ms  0.110 ms
-    #   2  * * *
-    #
-    # tracepath format:
-    #   1?: [LOCALHOST]  pmtu 1500
-    #    1:  192.168.1.1  0.451ms
-    #
     printf '%s' "$tr_out" | awk '
     {
         sub(/^[[:space:]]+/, "")
-
-        # Skip blank lines
         if (NF == 0) next
-
-        # Skip tracepath header lines (pmtu, asymm etc.)
         if ($0 ~ /pmtu|asymm|Resume/) next
-
-        # Skip lines that do not start with a number
         if ($1 !~ /^[0-9]/) next
-
-        # Remove trailing ? from tracepath hop numbers (e.g. "1?")
         gsub(/\?$/, "", $1)
         hop = $1
-
         host = "* * *"
         rtt  = "---"
-
         for (i = 2; i <= NF; i++) {
-            # Skip asterisks
             if ($i == "*") continue
-
-            # Match IPv4 address
             if ($i ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/) {
                 host = $i
-                # Search forward for RTT value (number followed by ms)
                 for (j = i+1; j <= NF; j++) {
-                    # Handle "0.451ms" (no space before ms)
                     if ($(j) ~ /^[0-9]+\.[0-9]+ms$/) {
-                        gsub(/ms$/, "", $(j))
-                        rtt = $(j) " ms"
-                        break
+                        v = $(j); gsub(/ms$/, "", v)
+                        rtt = v " ms"; break
                     }
-                    # Handle "0.451" followed by "ms"
-                    if ($(j) ~ /^[0-9]+\.[0-9]+$/ && \
-                        j+1 <= NF && $(j+1) == "ms") {
-                        rtt = $(j) " ms"
-                        break
-                    }
-                    # Handle standalone float (traceroute standard)
                     if ($(j) ~ /^[0-9]+\.[0-9]+$/) {
-                        rtt = $(j) " ms"
-                        break
+                        rtt = $(j) " ms"; break
                     }
                 }
                 break
             }
-
-            # Match hostname in parentheses e.g. "router.local (192.168.1.1)"
             if ($i ~ /^\(.*\)$/) {
-                # Extract IP from parentheses
-                gsub(/[()]/, "", $i)
-                if ($i ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/) {
-                    host = $i
+                v = $i; gsub(/[()]/, "", v)
+                if (v ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/) {
+                    host = v
                     for (j = i+1; j <= NF; j++) {
                         if ($(j) ~ /^[0-9]+\.[0-9]+ms$/) {
-                            gsub(/ms$/, "", $(j))
-                            rtt = $(j) " ms"
-                            break
+                            w = $(j); gsub(/ms$/, "", w)
+                            rtt = w " ms"; break
                         }
                         if ($(j) ~ /^[0-9]+\.[0-9]+$/) {
-                            rtt = $(j) " ms"
-                            break
+                            rtt = $(j) " ms"; break
                         }
                     }
                     break
                 }
             }
-
-            # Match bare hostname (not a number, not ms, not *)
             if ($i !~ /^[0-9]+(\.[0-9]+)?$/ && \
                 $i !~ /^ms$/ && \
                 $i !~ /^\[/ ) {
                 host = $i
                 for (j = i+1; j <= NF; j++) {
                     if ($(j) ~ /^[0-9]+\.[0-9]+ms$/) {
-                        gsub(/ms$/, "", $(j))
-                        rtt = $(j) " ms"
-                        break
+                        w = $(j); gsub(/ms$/, "", w)
+                        rtt = w " ms"; break
                     }
                     if ($(j) ~ /^[0-9]+\.[0-9]+$/) {
-                        rtt = $(j) " ms"
-                        break
+                        rtt = $(j) " ms"; break
                     }
                 }
                 break
             }
         }
-
         printf "%s|%s|%s\n", hop, host, rtt
     }'
 }
-
-# ---------------------------------------------------------------------------
-# run_preflight_checks
-#
-# Runs all pre-flight checks for every configured client stream.
-# Deduplicates targets so a target+port combination is only checked once.
-# Displays a consolidated results table.
-# Returns:
-#   0 — all checks passed or operator chose to proceed despite warnings/failures
-#   1 — operator chose to abort
-# ---------------------------------------------------------------------------
 
 run_preflight_checks() {
     local inner=$(( COLS - 2 ))
@@ -2449,11 +1985,6 @@ run_preflight_checks() {
     printf '+%s+\n' "$(rpt '-' "$inner")"
     printf '\n'
 
-    # ── Collect unique target+port+proto+vrf combinations ─────────────────
-    # VRF is included in the deduplication key so that the same target
-    # reached via different VRFs is checked independently in each VRF
-    # context.  This ensures pre-flight ping and port checks use the
-    # correct routing table for each stream.
     local -a pf_targets=()
     local -a pf_ports=()
     local -a pf_protos=()
@@ -2474,23 +2005,19 @@ run_preflight_checks() {
                   "${pf_protos[$j]}"  == "$pro"  && \
                   "${pf_vrfs[$j]}"    == "$vrf"  ]]; then
                 pf_stream_ids[$j]="${pf_stream_ids[$j]},$((i+1))"
-                found=1
-                break
+                found=1; break
             fi
         done
 
         if (( found == 0 )); then
-            pf_targets+=("$tgt")
-            pf_ports+=("$prt")
-            pf_protos+=("$pro")
-            pf_vrfs+=("$vrf")
+            pf_targets+=("$tgt"); pf_ports+=("$prt")
+            pf_protos+=("$pro");  pf_vrfs+=("$vrf")
             pf_stream_ids+=("$((i+1))")
         fi
     done
 
     local total_checks=${#pf_targets[@]}
-    local any_fail=0
-    local any_warn=0
+    local any_fail=0 any_warn=0
 
     local -a res_ping_status=()
     local -a res_ping_rtt=()
@@ -2498,35 +2025,19 @@ run_preflight_checks() {
     local -a res_tcp_status=()
     local -a res_overall=()
 
-    # ── Run checks ────────────────────────────────────────────────────────
     local k
     for (( k=0; k<total_checks; k++ )); do
         local tgt="${pf_targets[$k]}"
         local prt="${pf_ports[$k]}"
         local pro="${pf_protos[$k]}"
         local vrf="${pf_vrfs[$k]}"
-
         local vrf_label
         [[ -n "$vrf" ]] && vrf_label="VRF:${vrf}" || vrf_label="GRT"
 
-        printf '  Checking  %s:%s  (%s / %s)...\n' \
-            "$tgt" "$prt" "$pro" "$vrf_label"
+        printf '  Checking  %s:%s  (%s / %s)...\n' "$tgt" "$prt" "$pro" "$vrf_label"
 
-        # ── Build VRF exec prefix ─────────────────────────────────────────
-        # All pre-flight commands (ping, TCP probe, traceroute) are wrapped
-        # in "ip vrf exec <vrf>" when a VRF is configured for the stream.
-        # This ensures the connectivity check runs inside the same routing
-        # table that iperf3 will use at runtime.
-        local vrf_exec=""
-        if [[ -n "$vrf" && "$OS_TYPE" == "linux" ]]; then
-            if command -v ip >/dev/null 2>&1; then
-                vrf_exec="ip vrf exec ${vrf}"
-            fi
-        fi
-
-        # ── Check 1: ICMP Ping ────────────────────────────────────────────
         local ping_result
-        ping_result=$(_preflight_ping_vrf "$tgt" "$vrf_exec")
+        ping_result=$(_preflight_ping_vrf "$tgt" "$vrf")
         local p_status p_rtt p_loss
         p_status=$(printf '%s' "$ping_result" | cut -d'|' -f1)
         p_rtt=$(printf '%s'    "$ping_result" | cut -d'|' -f2)
@@ -2536,16 +2047,14 @@ run_preflight_checks() {
         res_ping_rtt+=("$p_rtt")
         res_ping_loss+=("$p_loss")
 
-        # ── Check 2: TCP Port ─────────────────────────────────────────────
         local t_status
         if [[ "${pro^^}" == "UDP" ]]; then
             t_status="SKIP"
         else
-            t_status=$(_preflight_tcp_port_vrf "$tgt" "$prt" "$vrf_exec")
+            t_status=$(_preflight_tcp_port_vrf "$tgt" "$prt" "$vrf")
         fi
         res_tcp_status+=("$t_status")
 
-        # ── Derive overall status ─────────────────────────────────────────
         local overall="PASS"
         if   [[ "$p_status" == "FAIL" || "$t_status" == "FAIL" ]]; then
             overall="FAIL"; any_fail=1
@@ -2555,7 +2064,6 @@ run_preflight_checks() {
         res_overall+=("$overall")
     done
 
-    # ── Print results table ───────────────────────────────────────────────
     printf '\n'
     printf '+%s+\n' "$(rpt '=' "$inner")"
     bcenter "${BOLD}Pre-Flight Results${NC}"
@@ -2576,10 +2084,8 @@ run_preflight_checks() {
 
         local tgt_disp="$tgt"
         (( ${#tgt_disp} > 16 )) && tgt_disp="${tgt_disp:0:15}~"
-
         local rtt_disp="$p_rtt"
         (( ${#rtt_disp} > 20 )) && rtt_disp="${rtt_disp:0:19}~"
-
         local vrf_disp="${vrf:-GRT}"
         (( ${#vrf_disp} > 8 )) && vrf_disp="${vrf_disp:0:7}~"
 
@@ -2607,26 +2113,12 @@ run_preflight_checks() {
     printf '+%s+\n' "$(rpt '=' "$inner")"
 
     # ── Traceroute section ────────────────────────────────────────────────
-    # Traceroute is run per unique target+vrf combination.
-    #
-    # Command pattern used:
-    #   Linux + VRF:  sudo ip vrf exec <VRF_NAME> traceroute <target>
-    #   Linux + GRT:  traceroute <target>
-    #   macOS:        traceroute <target>
-    #
-    # The VRF name is taken directly from the stream's S_VRF configuration
-    # which was either set manually or auto-detected from the bind interface.
-    # Loopback targets (127.x.x.x and ::1) are skipped.
-    # ─────────────────────────────────────────────────────────────────────
-
-    # First pass: determine whether any traceroute will be attempted
     local -a tr_done_keys=()
     local do_traceroute=0
     for (( k=0; k<total_checks; k++ )); do
         local tgt="${pf_targets[$k]}"
         [[ "$tgt" =~ ^127\. || "$tgt" == "::1" ]] && continue
-        do_traceroute=1
-        break
+        do_traceroute=1; break
     done
 
     if (( do_traceroute )); then
@@ -2635,26 +2127,18 @@ run_preflight_checks() {
         bcenter "${BOLD}Path Discovery — Traceroute${NC}"
         printf '+%s+\n' "$(rpt '=' "$inner")"
 
-        # ── Pre-warm sudo credential once per unique VRF ──────────────────
-        # This MUST happen before any traceroute subshell $(...)  is opened.
-        # Once the credential is cached all subsequent sudo calls in this
-        # shell session succeed without a TTY prompt.
         local -a sudo_warmed_vrfs=()
         for (( k=0; k<total_checks; k++ )); do
             local tgt="${pf_targets[$k]}"
             [[ "$tgt" =~ ^127\. || "$tgt" == "::1" ]] && continue
             local vrf="${pf_vrfs[$k]}"
-            [[ -z "$vrf" ]] && continue   # GRT needs no sudo warmup
-
-            # Only warm up each VRF once
+            [[ -z "$vrf" ]] && continue
             local _already_warmed=0
             local _wv
             for _wv in "${sudo_warmed_vrfs[@]}"; do
                 [[ "$_wv" == "$vrf" ]] && _already_warmed=1 && break
             done
             (( _already_warmed )) && continue
-
-            # Warm up sudo for this VRF
             if _preflight_sudo_warmup "$vrf"; then
                 sudo_warmed_vrfs+=("$vrf")
             fi
@@ -2717,24 +2201,17 @@ run_preflight_checks() {
                     h_num=$(printf '%s'  "$hop_line" | cut -d'|' -f1)
                     h_host=$(printf '%s' "$hop_line" | cut -d'|' -f2)
                     h_rtt=$(printf '%s'  "$hop_line" | cut -d'|' -f3)
-
                     local h_host_disp="$h_host"
-                    (( ${#h_host_disp} > 40 )) && \
-                        h_host_disp="${h_host_disp:0:39}~"
-
+                    (( ${#h_host_disp} > 40 )) && h_host_disp="${h_host_disp:0:39}~"
                     local h_col="$NC"
                     [[ "$h_host" == "$tgt" ]] && h_col="$GREEN"
-                    [[ "$h_host" == "* * *" || \
-                       "$h_host" == "*" ]] && h_col="$YELLOW"
-
+                    [[ "$h_host" == "* * *" || "$h_host" == "*" ]] && h_col="$YELLOW"
                     bleft "  $(printf '%-4s  ' "$h_num")${h_col}$(printf '%-40s  %-12s' \
                         "$h_host_disp" "$h_rtt")${NC}"
                     (( hop_count++ ))
                     (( hop_count >= 20 )) && break
                 done <<< "$tr_output"
-
-                (( hop_count == 0 )) && \
-                    bleft "  ${YELLOW}No hop information returned${NC}"
+                (( hop_count == 0 )) && bleft "  ${YELLOW}No hop information returned${NC}"
             fi
 
             printf '+%s+\n' "$(rpt '=' "$inner")"
@@ -2754,7 +2231,6 @@ run_preflight_checks() {
 
         for (( k=0; k<total_checks; k++ )); do
             [[ "${res_overall[$k]}" == "PASS" ]] && continue
-
             local tgt="${pf_targets[$k]}"
             local prt="${pf_ports[$k]}"
             local pro="${pf_protos[$k]}"
@@ -2777,7 +2253,7 @@ run_preflight_checks() {
                     fi
                     ;;
                 WARN)
-                    bleft "  ${YELLOW}  ⚠ ICMP Ping PARTIAL — packet loss detected in ${vrf_label}${NC}"
+                    bleft "  ${YELLOW}  ⚠ ICMP Ping PARTIAL — packet loss in ${vrf_label}${NC}"
                     bleft "    ${DIM}Check: intermittent connectivity or ICMP rate-limiting${NC}"
                     ;;
             esac
@@ -2799,8 +2275,7 @@ run_preflight_checks() {
     # ── Decision prompt ───────────────────────────────────────────────────
     if (( any_fail )); then
         printf '\n'
-        printf '%b  %d target(s) FAILED pre-flight checks.\n%b' \
-            "$RED" "$any_fail" "$NC"
+        printf '%b  %d target(s) FAILED pre-flight checks.\n%b' "$RED" "$any_fail" "$NC"
         printf '\n'
         printf '  Options:\n'
         printf '    %s%sP%s%s  Proceed anyway  (streams may fail at runtime)\n' \
@@ -2823,14 +2298,12 @@ run_preflight_checks() {
 
     elif (( any_warn )); then
         printf '\n'
-        printf '%b  %d target(s) have pre-flight warnings.\n%b' \
-            "$YELLOW" "$any_warn" "$NC"
+        printf '%b  %d target(s) have pre-flight warnings.\n%b' "$YELLOW" "$any_warn" "$NC"
         printf '\n'
         printf '  Options:\n'
         printf '    %s%sP%s%s  Proceed  (streams may experience packet loss)\n' \
             "$BOLD" "$YELLOW" "$NC" "$NC"
-        printf '    %s%sA%s%s  Abort\n' \
-            "$BOLD" "$GREEN" "$NC" "$NC"
+        printf '    %s%sA%s%s  Abort\n' "$BOLD" "$GREEN" "$NC" "$NC"
         printf '\n'
         local decision
         while true; do
@@ -2846,11 +2319,390 @@ run_preflight_checks() {
 
     else
         printf '\n'
-        printf '%b  All pre-flight checks PASSED. Proceeding to launch streams.%b\n' \
+        printf '%b  All pre-flight checks PASSED. Proceeding to path MTU discovery.%b\n' \
             "$GREEN" "$NC"
         printf '\n'
         return 0
     fi
+}
+
+# =============================================================================
+# SECTION 10c — PATH MTU DISCOVERY
+# =============================================================================
+
+_pmtu_ping_probe() {
+    local target="$1"
+    local payload="$2"
+    local vrf_name="${3:-}"
+    local rc=0
+
+    if [[ "$OS_TYPE" == "linux" ]]; then
+        if [[ -n "$vrf_name" ]]; then
+            ip vrf exec "${vrf_name}" \
+                ping -M do -s "${payload}" -c 1 -W 2 "${target}" \
+                >/dev/null 2>&1
+            rc=$?
+        else
+            ping -M do -s "${payload}" -c 1 -W 2 "${target}" \
+                >/dev/null 2>&1
+            rc=$?
+        fi
+    else
+        ping -D -s "${payload}" -c 1 -W 2000 "${target}" \
+            >/dev/null 2>&1
+        rc=$?
+    fi
+
+    return $rc
+}
+
+_pmtu_get_iface_mtu() {
+    local target="$1"
+    local vrf_name="${2:-}"
+    local mtu=1500
+
+    if [[ "$OS_TYPE" == "linux" ]]; then
+        local oif=""
+        if [[ -n "$vrf_name" ]]; then
+            oif=$(ip vrf exec "${vrf_name}" ip route get "${target}" \
+                2>/dev/null | grep -oE '\bdev [^ ]+' | awk '{print $2}' | head -1)
+        else
+            oif=$(ip route get "${target}" \
+                2>/dev/null | grep -oE '\bdev [^ ]+' | awk '{print $2}' | head -1)
+        fi
+        if [[ -n "$oif" ]]; then
+            local iface_mtu
+            iface_mtu=$(ip link show dev "${oif}" 2>/dev/null \
+                | grep -oE 'mtu [0-9]+' | awk '{print $2}' | head -1)
+            if [[ "$iface_mtu" =~ ^[0-9]+$ ]] && (( iface_mtu > 0 )); then
+                mtu=$iface_mtu
+            fi
+        fi
+    elif [[ "$OS_TYPE" == "macos" ]]; then
+        local oif=""
+        oif=$(route -n get "${target}" 2>/dev/null \
+            | grep -E 'interface:' | awk '{print $2}' | head -1)
+        if [[ -n "$oif" ]]; then
+            local iface_mtu
+            iface_mtu=$(ifconfig "${oif}" 2>/dev/null \
+                | grep -oE 'mtu [0-9]+' | awk '{print $2}' | head -1)
+            if [[ "$iface_mtu" =~ ^[0-9]+$ ]] && (( iface_mtu > 0 )); then
+                mtu=$iface_mtu
+            fi
+        fi
+    fi
+
+    printf '%d' "$mtu"
+}
+
+_pmtu_discover() {
+    local target="$1"
+    local vrf_name="${2:-}"
+
+    local iface_mtu
+    iface_mtu=$(_pmtu_get_iface_mtu "$target" "$vrf_name")
+
+    local lower=548
+    local upper=$(( iface_mtu - 28 ))
+    (( upper < lower )) && upper=$lower
+
+    if ! _pmtu_ping_probe "$target" "$lower" "$vrf_name"; then
+        printf '%d' 0; return
+    fi
+
+    if _pmtu_ping_probe "$target" "$upper" "$vrf_name"; then
+        printf '%d' $(( upper + 28 )); return
+    fi
+
+    local mid
+    local iterations=0
+    local max_iterations=12
+
+    while (( upper - lower > 1 && iterations < max_iterations )); do
+        mid=$(( (lower + upper) / 2 ))
+        if _pmtu_ping_probe "$target" "$mid" "$vrf_name"; then
+            lower=$mid
+        else
+            upper=$mid
+        fi
+        (( iterations++ ))
+    done
+
+    printf '%d' $(( lower + 28 ))
+}
+
+_pmtu_classify() {
+    local discovered="$1"
+    local iface_mtu="$2"
+
+    (( discovered == 0 )) && { printf '%s' "UNKNOWN"; return; }
+
+    local diff=$(( iface_mtu - discovered ))
+
+    if   (( discovered < 576  )); then printf '%s' "CRITICAL"
+    elif (( discovered < 1280 )); then printf '%s' "CRITICAL"
+    elif (( diff > 200        )); then printf '%s' "FRAGMENTATION"
+    elif (( diff > 50         )); then printf '%s' "REDUCED"
+    else                               printf '%s' "OK"
+    fi
+}
+
+run_pmtu_discovery() {
+    local inner=$(( COLS - 2 ))
+
+    printf '\n'
+    printf '+%s+\n' "$(rpt '=' "$inner")"
+    bcenter "${BOLD}${CYAN}Path MTU Discovery${NC}"
+    printf '+%s+\n' "$(rpt '=' "$inner")"
+    bleft "  Probing path MTU for all configured stream targets..."
+    bleft "  ${DIM}Method: ICMP DF-bit binary search (payload 576 – interface MTU)${NC}"
+    printf '+%s+\n' "$(rpt '-' "$inner")"
+    printf '\n'
+
+    local -a pmtu_targets=()
+    local -a pmtu_vrfs=()
+    local -a pmtu_stream_ids=()
+
+    local i j found
+    for (( i=0; i<STREAM_COUNT; i++ )); do
+        local tgt="${S_TARGET[$i]}"
+        local vrf="${S_VRF[$i]:-}"
+        found=0
+
+        for (( j=0; j<${#pmtu_targets[@]}; j++ )); do
+            if [[ "${pmtu_targets[$j]}" == "$tgt" && \
+                  "${pmtu_vrfs[$j]}"    == "$vrf"  ]]; then
+                pmtu_stream_ids[$j]="${pmtu_stream_ids[$j]},$((i+1))"
+                found=1; break
+            fi
+        done
+
+        if (( found == 0 )); then
+            pmtu_targets+=("$tgt")
+            pmtu_vrfs+=("$vrf")
+            pmtu_stream_ids+=("$((i+1))")
+        fi
+    done
+
+    local total=${#pmtu_targets[@]}
+    local any_warn=0 any_critical=0
+
+    local -a disc_mtus=()
+    local -a iface_mtus=()
+    local -a statuses=()
+    local -a recommends=()
+
+    local k
+    for (( k=0; k<total; k++ )); do
+        local tgt="${pmtu_targets[$k]}"
+        local vrf="${pmtu_vrfs[$k]}"
+        local vrf_label
+        [[ -n "$vrf" ]] && vrf_label="VRF:${vrf}" || vrf_label="GRT"
+
+        printf '  Probing  %s  (%s)...' "$tgt" "$vrf_label"
+
+        local iface_mtu
+        iface_mtu=$(_pmtu_get_iface_mtu "$tgt" "$vrf")
+
+        local disc_mtu
+        disc_mtu=$(_pmtu_discover "$tgt" "$vrf")
+
+        local status
+        status=$(_pmtu_classify "$disc_mtu" "$iface_mtu")
+
+        local recommend="N/A"
+        if (( disc_mtu > 40 )); then
+            recommend=$(( disc_mtu - 40 ))
+        fi
+
+        disc_mtus+=("$disc_mtu")
+        iface_mtus+=("$iface_mtu")
+        statuses+=("$status")
+        recommends+=("$recommend")
+
+        if (( BASH_MAJOR >= 4 )); then
+            local key="${tgt}|${vrf}"
+            PMTU_RESULTS["$key"]="$disc_mtu"
+            PMTU_STATUS["$key"]="$status"
+            PMTU_RECOMMEND["$key"]="$recommend"
+        fi
+
+        case "$status" in
+            CRITICAL)      (( any_critical++ )); printf ' CRITICAL\n' ;;
+            FRAGMENTATION) (( any_warn++     )); printf ' WARNING\n'  ;;
+            REDUCED)       (( any_warn++     )); printf ' REDUCED\n'  ;;
+            OK)                                  printf ' OK\n'       ;;
+            UNKNOWN)                             printf ' UNKNOWN\n'  ;;
+        esac
+    done
+
+    printf '\n'
+    printf '+%s+\n' "$(rpt '=' "$inner")"
+    bcenter "${BOLD}Path MTU Discovery Results${NC}"
+    printf '+%s+\n' "$(rpt '=' "$inner")"
+    bleft "${BOLD}$(printf '%-16s  %-8s  %-10s  %-10s  %-9s  %-13s  %-7s' \
+        'Target' 'VRF' 'Iface MTU' 'Path MTU' 'Rec MSS' 'Status' 'Streams')${NC}"
+    printf '+%s+\n' "$(rpt '-' "$inner")"
+
+    for (( k=0; k<total; k++ )); do
+        local tgt="${pmtu_targets[$k]}"
+        local vrf="${pmtu_vrfs[$k]}"
+        local disc="${disc_mtus[$k]}"
+        local imtu="${iface_mtus[$k]}"
+        local stat="${statuses[$k]}"
+        local rec="${recommends[$k]}"
+        local sids="${pmtu_stream_ids[$k]}"
+
+        local tgt_disp="$tgt"
+        (( ${#tgt_disp} > 16 )) && tgt_disp="${tgt_disp:0:15}~"
+        local vrf_disp="${vrf:-GRT}"
+        (( ${#vrf_disp} > 8 )) && vrf_disp="${vrf_disp:0:7}~"
+
+        local disc_disp
+        (( disc == 0 )) && disc_disp="UNKNOWN" || disc_disp="${disc} B"
+
+        local rec_disp="$rec"
+        [[ "$rec" != "N/A" ]] && rec_disp="${rec} B"
+
+        local stat_col
+        case "$stat" in
+            OK)            stat_col="${GREEN}${BOLD}OK           ${NC}" ;;
+            REDUCED)       stat_col="${YELLOW}${BOLD}REDUCED      ${NC}" ;;
+            FRAGMENTATION) stat_col="${YELLOW}${BOLD}FRAG WARN    ${NC}" ;;
+            CRITICAL)      stat_col="${RED}${BOLD}CRITICAL     ${NC}"   ;;
+            UNKNOWN)       stat_col="${DIM}UNKNOWN      ${NC}"           ;;
+        esac
+
+        local pfx
+        pfx=$(printf '%-16s  %-8s  %-10s  %-10s  %-9s  ' \
+            "$tgt_disp" "$vrf_disp" "${imtu} B" "$disc_disp" "$rec_disp")
+        bleft " ${pfx}${stat_col}${DIM}s:${sids}${NC}"
+    done
+
+    printf '+%s+\n' "$(rpt '=' "$inner")"
+
+    # ── Warning and advisory panel ─────────────────────────────────────────
+    if (( any_critical > 0 || any_warn > 0 )); then
+        printf '\n'
+        printf '+%s+\n' "$(rpt '=' "$inner")"
+        if (( any_critical > 0 )); then
+            bcenter "${BOLD}${RED}Path MTU Warnings — Action Required${NC}"
+        else
+            bcenter "${BOLD}${YELLOW}Path MTU Warnings — Review Recommended${NC}"
+        fi
+        printf '+%s+\n' "$(rpt '=' "$inner")"
+
+        for (( k=0; k<total; k++ )); do
+            local stat="${statuses[$k]}"
+            [[ "$stat" == "OK" || "$stat" == "UNKNOWN" ]] && continue
+
+            local tgt="${pmtu_targets[$k]}"
+            local vrf="${pmtu_vrfs[$k]}"
+            local disc="${disc_mtus[$k]}"
+            local imtu="${iface_mtus[$k]}"
+            local rec="${recommends[$k]}"
+            local sids="${pmtu_stream_ids[$k]}"
+            local vrf_label
+            [[ -n "$vrf" ]] && vrf_label="VRF: ${vrf}" || vrf_label="GRT"
+
+            bleft "  ${BOLD}Target: ${CYAN}${tgt}${NC}  ${DIM}(${vrf_label})  stream(s): ${sids}${NC}"
+
+            case "$stat" in
+                CRITICAL)
+                    bleft "  ${RED}  ✗ CRITICAL: Path MTU is ${disc} bytes${NC}"
+                    bleft "    ${DIM}Interface MTU: ${imtu} B — Path MTU reduction: $(( imtu - disc )) B${NC}"
+                    bleft "    ${RED}  This path has severe MTU constraints.${NC}"
+                    bleft "    ${DIM}  Impact: TCP throughput severely degraded, excessive fragmentation${NC}"
+                    bleft "    ${DIM}  Action: Investigate tunnels, MPLS labels, or VPN overhead on path${NC}"
+                    if [[ "$rec" != "N/A" ]]; then
+                        bleft "    ${BOLD}  Recommended MSS: ${rec} bytes${NC}"
+                        bleft "    ${DIM}  Apply with: iperf3 -M ${rec} or configure TCP MSS clamping${NC}"
+                    fi
+                    ;;
+                FRAGMENTATION)
+                    bleft "  ${YELLOW}  ⚠ FRAGMENTATION RISK: Path MTU is ${disc} bytes${NC}"
+                    bleft "    ${DIM}Interface MTU: ${imtu} B — Path MTU reduction: $(( imtu - disc )) B${NC}"
+                    bleft "    ${YELLOW}  A network segment on this path has a smaller MTU.${NC}"
+                    bleft "    ${DIM}  Common causes: MPLS encapsulation (+4-20 B), GRE tunnel (+24 B),${NC}"
+                    bleft "    ${DIM}                 IPsec ESP overhead, VXLAN (+50 B), WAN link MTU${NC}"
+                    if [[ "$rec" != "N/A" ]]; then
+                        bleft "    ${BOLD}  Recommended MSS: ${rec} bytes  (configure on iperf3 with -M ${rec})${NC}"
+                    fi
+                    ;;
+                REDUCED)
+                    bleft "  ${YELLOW}  ⚠ REDUCED MTU: Path MTU is ${disc} bytes${NC}"
+                    bleft "    ${DIM}Interface MTU: ${imtu} B — Minor reduction of $(( imtu - disc )) B${NC}"
+                    bleft "    ${DIM}  Small reduction likely due to minor encapsulation overhead.${NC}"
+                    bleft "    ${DIM}  Impact: Minor efficiency loss, unlikely to affect throughput.${NC}"
+                    if [[ "$rec" != "N/A" ]]; then
+                        bleft "    ${DIM}  Recommended MSS: ${rec} bytes${NC}"
+                    fi
+                    ;;
+            esac
+
+            printf '+%s+\n' "$(rpt '-' "$inner")"
+        done
+
+        printf '+%s+\n' "$(rpt '=' "$inner")"
+    fi
+
+    # ── UNKNOWN advisory ───────────────────────────────────────────────────
+    local has_unknown=0
+    for (( k=0; k<total; k++ )); do
+        [[ "${statuses[$k]}" == "UNKNOWN" ]] && has_unknown=1 && break
+    done
+
+    if (( has_unknown )); then
+        printf '\n'
+        printf '+%s+\n' "$(rpt '=' "$inner")"
+        bcenter "${BOLD}${DIM}Path MTU Discovery Notes${NC}"
+        printf '+%s+\n' "$(rpt '=' "$inner")"
+        bleft "  ${DIM}One or more targets returned UNKNOWN MTU.${NC}"
+        bleft "  ${DIM}This occurs when:${NC}"
+        bleft "  ${DIM}  - The target does not respond to ICMP echo requests${NC}"
+        bleft "  ${DIM}  - A firewall blocks ICMP or ICMP-unreachable messages${NC}"
+        bleft "  ${DIM}  - The target is unreachable at any probe size${NC}"
+        bleft "  ${DIM}iperf3 streams will use the default interface MTU.${NC}"
+        printf '+%s+\n' "$(rpt '=' "$inner")"
+    fi
+
+    printf '\n'
+}
+
+_pmtu_annotate_stream_summary() {
+    local idx="$1"
+    (( BASH_MAJOR < 4 )) && return
+
+    local tgt="${S_TARGET[$idx]:-}"
+    local vrf="${S_VRF[$idx]:-}"
+    local key="${tgt}|${vrf}"
+
+    [[ -z "${PMTU_RESULTS[$key]+x}" ]] && return
+
+    local disc="${PMTU_RESULTS[$key]}"
+    local stat="${PMTU_STATUS[$key]}"
+    local rec="${PMTU_RECOMMEND[$key]}"
+
+    local annotation=""
+    case "$stat" in
+        OK)
+            annotation="${DIM}Path MTU: ${disc} B  MSS: ${rec} B  ✓ OK${NC}"
+            ;;
+        REDUCED)
+            annotation="${YELLOW}Path MTU: ${disc} B  MSS: ${rec} B  ⚠ Reduced${NC}"
+            ;;
+        FRAGMENTATION)
+            annotation="${YELLOW}Path MTU: ${disc} B  MSS: ${rec} B  ⚠ Fragmentation risk${NC}"
+            ;;
+        CRITICAL)
+            annotation="${RED}Path MTU: ${disc} B  MSS: ${rec} B  ✗ CRITICAL${NC}"
+            ;;
+        UNKNOWN)
+            annotation="${DIM}Path MTU: UNKNOWN (ICMP probe failed)${NC}"
+            ;;
+    esac
+
+    [[ -n "$annotation" ]] && bleft "    ${annotation}"
 }
 
 # =============================================================================
@@ -2885,6 +2737,8 @@ extract_error_from_log() {
                 printf '%s' "Permission denied -- check bind address or port privileges" ;;
             *"Address already in use"*)
                 printf '%s' "Port ${S_PORT[$idx]:-?} is already in use" ;;
+            *"Bad file descriptor"*)
+                printf '%s' "Bad file descriptor -- VRF/bind IP mismatch or iperf3 server not reachable" ;;
             *) printf '%s' "$te" ;;
         esac
     fi
@@ -3494,8 +3348,12 @@ display_results_table() {
                 "$GREEN" "${RESULT_SENDER_BW[$i]}"   "$NC" \
                 "$CYAN"  "${RESULT_RECEIVER_BW[$i]}" "$NC" "$extra"
         fi
+
+        # Append MTU annotation for this stream
+        _pmtu_annotate_stream_summary "$i"
     done
     printf '  %s\n' "$(rpt '-' 80)"; echo ""
+
     local tf=0 td=0
     for (( i=0; i<STREAM_COUNT; i++ )); do
         [[ "${S_STATUS_CACHE[$i]}" == "FAILED" ]] && (( tf++ ))
@@ -3506,6 +3364,24 @@ display_results_table() {
     else
         printf '%b  All %d stream(s) completed successfully.%b\n' "$GREEN" "$td" "$NC"
     fi
+
+    # MTU summary footer
+    if (( BASH_MAJOR >= 4 && ${#PMTU_RESULTS[@]} > 0 )); then
+        local _has_mtu_warn=0 _k
+        for _k in "${!PMTU_STATUS[@]}"; do
+            local _s="${PMTU_STATUS[$_k]}"
+            [[ "$_s" == "FRAGMENTATION" || "$_s" == "CRITICAL" || \
+               "$_s" == "REDUCED" ]] && _has_mtu_warn=1 && break
+        done
+        if (( _has_mtu_warn )); then
+            echo ""
+            printf '%b  Path MTU advisory: one or more paths have reduced MTU.%b\n' \
+                "$YELLOW" "$NC"
+            printf '%b  See MTU details above. Consider configuring MSS with iperf3 -M <value>.%b\n' \
+                "$YELLOW" "$NC"
+        fi
+    fi
+
     echo ""
 }
 
@@ -3570,21 +3446,14 @@ run_client_mode() {
     show_stream_summary "client"
     confirm_proceed "Launch ${n} stream(s)?" || return
 
-    # ── Apply network impairment ──────────────────────────────────────────
+    # Apply network impairment
     apply_netem
 
-    # ── Pre-flight connectivity checks ───────────────────────────────────
-    # Run ICMP ping, TCP port check, and traceroute for every configured
-    # target before any iperf3 process is started.
-    # If the operator aborts at the pre-flight prompt the function returns 1
-    # and we return to the main menu without launching any streams.
+    # Pre-flight connectivity checks
     echo ""
     if ! run_preflight_checks; then
-        # Operator chose to abort at pre-flight
-        # Clean up any netem rules that were applied
         if (( ${#NETEM_IFACES[@]} > 0 )); then
-            printf '%b  Removing netem rules applied before abort...%b\n' \
-                "$YELLOW" "$NC"
+            printf '%b  Removing netem rules applied before abort...%b\n' "$YELLOW" "$NC"
             local iface
             for iface in "${NETEM_IFACES[@]}"; do
                 tc qdisc del dev "$iface" root 2>/dev/null && \
@@ -3595,7 +3464,32 @@ run_client_mode() {
         return
     fi
 
-    # ── Launch streams ────────────────────────────────────────────────────
+    # Path MTU Discovery
+    run_pmtu_discovery
+
+    # Prompt to review MTU warnings before launch if CRITICAL detected
+    local _pmtu_critical=0
+    if (( BASH_MAJOR >= 4 )); then
+        local _pmtu_key
+        for _pmtu_key in "${!PMTU_STATUS[@]}"; do
+            [[ "${PMTU_STATUS[$_pmtu_key]}" == "CRITICAL" ]] && \
+                _pmtu_critical=1 && break
+        done
+    fi
+
+    if (( _pmtu_critical )); then
+        printf '%b\n' \
+            "${RED}  CRITICAL path MTU detected on one or more stream paths.${NC}"
+        printf '%b\n' \
+            "${YELLOW}  Consider adjusting MSS values (TCP options) before proceeding.${NC}"
+        printf '\n'
+        if ! confirm_proceed "Proceed with stream launch despite MTU warnings?"; then
+            printf '%b  Aborted. Adjust stream MSS settings and retry.%b\n' "$RED" "$NC"
+            return
+        fi
+    fi
+
+    # Launch streams
     echo ""; launch_clients
     echo ""
     printf '%b\n' "${GREEN}  Streams running. Opening dashboard...${NC}"
@@ -3695,7 +3589,7 @@ run_loopback_mode() {
 show_main_menu() {
     clear; echo ""
     bline '='; bempty
-    bcenter "${BOLD}${CYAN}iperf3 Traffic Streams  v8.1${NC}"
+    bcenter "${BOLD}${CYAN}iperf3 Traffic Streams  v8.2.1${NC}"
     bempty; bline '='
 
     if [[ "$OS_TYPE" == "macos" ]]; then
@@ -3744,7 +3638,10 @@ main_menu() {
             3)
                 build_vrf_maps; get_interface_list; run_client_mode; echo ""
                 read -r -p "  Press Enter to return to menu..." </dev/tty
-                STREAM_COUNT=0; STREAM_PIDS=(); NETEM_IFACES=() ;;
+                STREAM_COUNT=0; STREAM_PIDS=(); NETEM_IFACES=()
+                if (( BASH_MAJOR >= 4 )); then
+                    PMTU_RESULTS=(); PMTU_STATUS=(); PMTU_RECOMMEND=()
+                fi ;;
             4)
                 build_vrf_maps; get_interface_list; run_loopback_mode; echo ""
                 read -r -p "  Press Enter to return to menu..." </dev/tty
