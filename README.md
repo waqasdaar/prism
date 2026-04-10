@@ -1677,6 +1677,36 @@ intermittent packet loss and stream 4 is completely unreachable.
 Stream 3 may show elevated packet loss in the results. Stream 4 will show
 FAILED in the dashboard with "ICMP Ping FAILED" as the error.
 
+### Use Case 4 — Firewall Blocking the iperf3 Port
+
+**Scenario**: The target host 192.168.50.10 is reachable (ping passes)
+but a firewall is blocking TCP port 5201.
+
+**Pre-flight output**:
+
+```
++==============================================================================+
+|                            Pre-Flight Results                                |
++==============================================================================+
+|  1    192.168.50.10      5201   TCP    GRT       FAIL    0.45/0.48/0.52 ms   0%      FAIL      |
++==============================================================================+
+
++==============================================================================+
+|                         Pre-Flight Failures Detected                         |
++==============================================================================+
+|   Target 192.168.50.10:5201 (TCP / GRT)  — stream(s): 1                     |
+|     ✗ TCP Port 5201 UNREACHABLE in GRT                                       |
+|       Check: iperf3 server is running, firewall allows port 5201             |
++------------------------------------------------------------------------------+
++==============================================================================+
+```
+
+**Key observation**: ICMP ping passed with 0% loss (host is alive) but
+TCP port 5201 is unreachable. This is the classic signature of a firewall
+blocking the specific port while allowing ICMP. The operator knows
+immediately that this is a firewall issue rather than a routing or
+availability issue.
+
 ## Troubleshooting
 
 ### 1. **Stream Stuck at STARTING**
