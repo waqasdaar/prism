@@ -2970,8 +2970,124 @@ probe_server_status() {
 # SECTION 12 — DASHBOARD
 # =============================================================================
 
+# ---------------------------------------------------------------------------
+# calculate_frame_lines  <stream_count>
+#
+# Returns the exact number of lines printed inside the fixed dashboard
+# frame by _render_client_frame and _render_server_frame.
+#
+# Client frame anatomy with progress bars:
+#   line 1    bline '='           top border
+#   line 2    bcenter             title
+#   line 3    bline '='           title border
+#   line 4    bleft counters      active/connected/done/failed/elapsed
+#   line 5    print_separator     ---
+#   line 6    bleft col header    # Proto Target ...
+#   line 7    bleft sub-header    Progress (only when has_fixed_dur)
+#   line 8    print_separator     ---
+#   lines 9..(8+2N) data rows:   one main row + one bar row per stream
+#                                 (bar row only when stream has fixed dur)
+#   line 9+2N  print_separator   ---
+#   line 10+2N bleft hint        Ctrl+C hint
+#   line 11+2N print_separator   ---
+#
+# Worst case (all N streams have fixed duration):
+#   fixed overhead = 11
+#   per stream = 2 (main row + bar row)
+#   total = 11 + (2 * N)
+#
+# Best case (all N streams are unlimited duration / no bar):
+#   fixed overhead = 10  (no sub-header line)
+#   per stream = 1
+#   total = 10 + N
+#
+# Since calculate_frame_lines is called before streams start (so we do not
+# know yet which streams will show bars) we use the worst case to ensure
+# the pre-reserved blank block is always large enough:
+#   total = 11 + (2 * N)
+#
+# This over-reserves by at most N+1 lines for unlimited streams but that
+# is safe — the extra blank lines just sit below the rendered frame.
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# calculate_frame_lines  <mode>  <stream_count>
+#
+# Returns the FIXED frame line count for cursor pre-reservation.
+# This is used ONLY for the initial pre-reserve blank lines.
+# The actual cursor-up distance each tick uses _LAST_FRAME_LINES
+# which is updated after every render.
+#
+# Server frame (never has progress bars):
+#   1  top border
+#   2  title
+#   3  title border
+#   4  listeners active line
+#   5  separator
+#   6  column header
+#   7  separator
+#   8..(7+N)  data rows
+#   8+N  separator
+#   9+N  hint
+#   10+N separator
+#   Total: 10 + N
+#
+# Client frame base (without progress bars counted here):
+#   Same structure: 10 + N
+#   Progress bar rows and the sub-header are accounted for dynamically.
+#
+# Pre-reservation uses the client worst-case: 11 + (2*N)
+# so the viewport always has enough space on the first tick.
+# ---------------------------------------------------------------------------
 calculate_frame_lines() {
-    printf '%d' $(( 10 + ${1:-0} ))
+    local mode="${1:-client}"
+    local count="${2:-0}"
+    printf '%d' $(( 10 + count ))
+}
+# ---------------------------------------------------------------------------
+# _count_client_frame_lines
+#
+# Returns the ACTUAL number of lines that _render_client_frame will print
+# on the current tick based on live stream state.
+#
+# This is called after each render to record exactly how many lines were
+# printed so run_dashboard knows how far up to move the cursor next tick.
+#
+# Anatomy:
+#   3  fixed header lines (top border + title + title border)
+#   1  counters row
+#   1  separator
+#   1  column header
+#   1  sub-header (only when at least one stream has fixed duration)
+#   1  separator
+#   N × (1 main row + 0 or 1 bar row)
+#   1  separator
+#   1  hint
+#   1  separator
+# ---------------------------------------------------------------------------
+_count_client_frame_lines() {
+    local base=9   # top border + title + title border + counters +
+                   # separator + col header + separator + hint + separator
+
+    # Sub-header line — present when any stream has fixed duration
+    local has_fixed=0
+    local i
+    for (( i=0; i<STREAM_COUNT; i++ )); do
+        (( S_DURATION[$i] > 0 )) && has_fixed=1 && break
+    done
+    (( has_fixed )) && (( base++ ))
+
+    # Per-stream rows: 1 main row + 1 bar row if stream has fixed duration
+    for (( i=0; i<STREAM_COUNT; i++ )); do
+        (( base++ ))   # main data row always present
+        # Bar row present when stream has fixed duration AND is not FAILED
+        local st="${S_STATUS_CACHE[$i]:-STARTING}"
+        if (( S_DURATION[$i] > 0 )) && [[ "$st" != "FAILED" ]]; then
+            (( base++ ))
+        fi
+    done
+
+    printf '%d' "$base"
 }
 
 _count_completed_panel_lines() {
@@ -3051,6 +3167,122 @@ _render_failed_panel() {
     printf '+%s+\033[K\n' "$(rpt '=' $(( COLS - 2 )))"
 }
 
+
+# ---------------------------------------------------------------------------
+# _count_client_frame_lines_for_state
+#
+# Calculates how many lines _render_client_frame will print given the
+# CURRENT stream states and durations.
+#
+# Called BEFORE rendering (to size the pre-reserve) and AFTER rendering
+# (to record the exact cursor-up distance for the next tick).
+#
+# Anatomy:
+#   1  top border          bline '='
+#   2  title               bcenter
+#   3  title border        bline '='
+#   4  counters row        bleft
+#   5  separator           print_separator
+#   6  column header       bleft
+#   +1 sub-header          bleft  (only when any stream has fixed duration)
+#   7  separator           print_separator
+#   per stream:
+#     +1  main data row    bleft
+#     +1  bar row          bleft  (only when stream has fixed dur AND not FAILED)
+#   8+N  separator         print_separator
+#   9+N  hint row          bleft
+#   10+N separator         print_separator
+# ---------------------------------------------------------------------------
+_count_client_frame_lines_for_state() {
+    # Base fixed lines (no streams, no sub-header):
+    #   bline'=' + bcenter + bline'=' + bleft-counters +
+    #   print_sep + bleft-col-hdr + print_sep +
+    #   print_sep + bleft-hint + print_sep = 10
+    local total=10
+
+    # Sub-header: present when any stream has fixed duration
+    local has_fixed=0
+    local i
+    for (( i=0; i<STREAM_COUNT; i++ )); do
+        (( S_DURATION[$i] > 0 )) && has_fixed=1 && break
+    done
+    (( has_fixed )) && (( total++ ))
+
+    # Per-stream rows
+    for (( i=0; i<STREAM_COUNT; i++ )); do
+        (( total++ ))   # main data row always present
+        local st="${S_STATUS_CACHE[$i]:-STARTING}"
+        if (( S_DURATION[$i] > 0 )) && [[ "$st" != "FAILED" ]]; then
+            (( total++ ))   # bar row
+        fi
+    done
+
+    printf '%d' "$total"
+}
+
+_count_client_frame_lines() {
+    _count_client_frame_lines_for_state
+}
+
+# ---------------------------------------------------------------------------
+# _render_progress_bar  <elapsed_seconds>  <total_seconds>
+#
+# Renders a Unicode block-character progress bar of a fixed width.
+# Only called when total_seconds > 0 (fixed-duration streams).
+#
+# Bar anatomy:
+#   [████████████░░░░░░░░]  62%
+#    ↑ filled blocks      ↑ empty blocks
+#
+# Unicode characters used:
+#   U+2588  █  FULL BLOCK          — completed portion
+#   U+2591  ░  LIGHT SHADE         — remaining portion
+#
+# Parameters:
+#   elapsed  — seconds elapsed since stream start
+#   total    — configured duration in seconds
+#
+# Prints the bar string WITHOUT a trailing newline so the caller can
+# append it inline inside a dashboard row.
+# ---------------------------------------------------------------------------
+
+_render_progress_bar() {
+    local elapsed="$1"
+    local total="$2"
+    local bar_width=16   # number of characters inside the brackets
+
+    # Clamp elapsed to total
+    (( elapsed > total )) && elapsed=$total
+    (( elapsed < 0     )) && elapsed=0
+
+    # Calculate percentage (integer, 0-100)
+    local pct=0
+    (( total > 0 )) && pct=$(( (elapsed * 100) / total ))
+    (( pct > 100 )) && pct=100
+
+    # Calculate how many block chars to fill
+    local filled=$(( (pct * bar_width) / 100 ))
+    (( filled > bar_width )) && filled=$bar_width
+    local empty=$(( bar_width - filled ))
+
+    # Choose bar colour based on progress
+    local bar_col
+    if   (( pct >= 90 )); then bar_col="$CYAN"
+    elif (( pct >= 60 )); then bar_col="$GREEN"
+    elif (( pct >= 30 )); then bar_col="$YELLOW"
+    else                       bar_col="$GREEN"
+    fi
+
+    # Build filled and empty segments
+    local filled_str="" empty_str=""
+    local k
+    for (( k=0; k<filled; k++ )); do filled_str+=$'\xe2\x96\x88'; done   # █
+    for (( k=0; k<empty;  k++ )); do empty_str+=$'\xe2\x96\x91';  done   # ░
+
+    printf '[%b%s%b%s] %3d%%' \
+        "$bar_col" "$filled_str" "$NC" "$empty_str" "$pct"
+}
+
 _render_client_frame() {
     local now; now=$(date +%s)
     local i
@@ -3067,6 +3299,13 @@ _render_client_frame() {
     local fts="${S_START_TS[0]:-0}"; (( fts == 0 )) && fts="$now"
     local efmt; efmt=$(format_seconds $(( now - fts )))
 
+    # Detect whether any stream has a fixed duration (used for sub-header)
+    local has_fixed_dur=0
+    for (( i=0; i<STREAM_COUNT; i++ )); do
+        (( S_DURATION[$i] > 0 )) && has_fixed_dur=1 && break
+    done
+
+    # ── Fixed frame ───────────────────────────────────────────────────────
     bline '='
     bcenter "${BOLD}${CYAN}iperf3 Traffic Streams -- Live Dashboard${NC}"
     bline '='
@@ -3075,8 +3314,13 @@ _render_client_frame() {
     print_separator
     bleft "${BOLD}$(printf '%-3s  %-5s  %-13s  %-5s  %-11s  %-6s  %-5s  %-9s' \
         '#' 'Proto' 'Target' 'Port' 'Bandwidth' 'Time' 'DSCP' 'Status')${NC}"
+    if (( has_fixed_dur )); then
+        bleft "${DIM}$(printf '%-3s  %-5s  %-13s  %-5s  %-11s  %-29s' \
+            '' '' '' '' '' 'Progress')${NC}"
+    fi
     print_separator
 
+    # ── Per-stream rows ───────────────────────────────────────────────────
     for (( i=0; i<STREAM_COUNT; i++ )); do
         local sn=$(( i + 1 ))
         local st="${S_STATUS_CACHE[$i]:-STARTING}"
@@ -3089,16 +3333,32 @@ _render_client_frame() {
         local td="--:--"
         local sts="${S_START_TS[$i]:-0}"; (( sts == 0 )) && sts="$now"
         local dur="${S_DURATION[$i]:-10}"
+        local stream_elapsed=$(( now - sts ))
+        local show_bar=0
+
         case "$st" in
             CONNECTED|STARTING|CONNECTING)
                 if (( dur == 0 )); then
-                    td="inf $(format_seconds $(( now - sts )))"
+                    td="inf $(format_seconds "$stream_elapsed")"
+                    show_bar=0
                 else
-                    local r=$(( dur - (now - sts) )); (( r < 0 )) && r=0
-                    td=$(format_seconds "$r")
-                fi ;;
-            DONE)   td="done"   ;;
-            FAILED) td="failed" ;;
+                    local stream_remaining=$(( dur - stream_elapsed ))
+                    (( stream_remaining < 0 )) && stream_remaining=0
+                    td=$(format_seconds "$stream_remaining")
+                    show_bar=1
+                fi
+                ;;
+            DONE)
+                td="done"
+                if (( dur > 0 )); then
+                    show_bar=1
+                    stream_elapsed=$dur
+                fi
+                ;;
+            FAILED)
+                td="failed"
+                show_bar=0
+                ;;
         esac
 
         local dscp_display="---"
@@ -3121,11 +3381,22 @@ _render_client_frame() {
         local tgt="${S_TARGET[$i]:-?}"
         (( ${#tgt} > 13 )) && tgt="${tgt:0:12}~"
 
+        # Main data row
         local pfx
         pfx=$(printf '%-3d  %-5s  %-13s  %-5s  %-11s  %-6s  %-5s  ' \
             "$sn" "${S_PROTO[$i]}" "$tgt" "${S_PORT[$i]}" \
             "$bw" "$td" "$dscp_display")
         bleft " ${pfx}${sc}${sb}${NC}"
+
+        # Progress bar row — only for fixed-duration non-failed streams
+        if (( show_bar && has_fixed_dur )); then
+            local bar_str
+            bar_str=$(_render_progress_bar "$stream_elapsed" "$dur")
+            local bar_prefix
+            bar_prefix=$(printf ' %-3s  %-5s  %-13s  %-5s  %-11s  ' \
+                '' '' '' '' '')
+            bleft " ${bar_prefix}${bar_str}"
+        fi
     done
 
     print_separator
@@ -3191,38 +3462,84 @@ run_dashboard() {
     local mode="${1:-client}"
     local count
     [[ "$mode" == "server" ]] && count=$SERVER_COUNT || count=$STREAM_COUNT
-    FRAME_LINES=$(calculate_frame_lines "$count")
+
+    # ── Probe status BEFORE calculating pre-reserve ───────────────────────
+    # Must run first so S_STATUS_CACHE is populated and
+    # _count_client_frame_lines_for_state returns the correct count
+    # for the first render.
+    if [[ "$mode" != "server" ]]; then
+        local j
+        for (( j=0; j<STREAM_COUNT; j++ )); do
+            probe_client_status "$j"
+        done
+    fi
+
+    # ── Pre-reserve exactly the lines the first render will print ─────────
+    # Do NOT add panel worst-case here.  The panels grow below the fixed
+    # frame and are cleared by \033[J on each tick — they do not need
+    # pre-reserved space.
+    #
+    # Pre-reserving more than the first render will cause the terminal to
+    # scroll if the excess exceeds the remaining viewport height, which
+    # makes \033[NA clamp at the top of the scroll region and breaks
+    # cursor positioning.
+    local pre_lines
+    if [[ "$mode" == "server" ]]; then
+        pre_lines=$(( 10 + count ))
+    else
+        pre_lines=$(_count_client_frame_lines_for_state)
+    fi
+
+    FRAME_LINES=$pre_lines
     _PREV_DYNAMIC_LINES=0
 
+    # _last_total: total lines rendered last tick (frame + panels)
+    # Initialised to pre_lines so tick 2 cursor-up is correct even if
+    # tick 1 renders a different count (should not happen but safe).
+    local _last_total=$pre_lines
+
+    # Print blank lines and move cursor back to top
     local k
-    for (( k=0; k<FRAME_LINES; k++ )); do printf '\n'; done
-    printf '\033[%dA' "$FRAME_LINES"
+    for (( k=0; k<pre_lines; k++ )); do printf '\n'; done
+    printf '\033[%dA' "$pre_lines"
     printf '\033[?25l'
 
     local first_tick=1
 
     while true; do
-        if [[ "$mode" != "server" ]]; then
+        # ── Probe status (skip on tick 1 — already done above) ────────────
+        if (( first_tick == 0 )) && [[ "$mode" != "server" ]]; then
             local j
             for (( j=0; j<STREAM_COUNT; j++ )); do
                 probe_client_status "$j"
             done
         fi
 
+        # ── Move cursor to top of last rendered block ──────────────────────
+        # Tick 1: cursor already at top from pre-reserve — skip.
+        # Tick 2+: move up by exact total lines rendered last tick.
         if (( first_tick == 0 )); then
-            local move_up=$(( FRAME_LINES + _PREV_DYNAMIC_LINES ))
-            printf '\033[%dA' "$move_up"
+            printf '\033[%dA' "$_last_total"
         fi
         first_tick=0
 
+        # ── Render fixed frame ────────────────────────────────────────────
+        local fixed_lines
         if [[ "$mode" == "server" ]]; then
             _render_server_frame
+            fixed_lines=$(( 10 + SERVER_COUNT ))
         else
             _render_client_frame
+            # Count after render so bar/sub-hdr state is accurate
+            fixed_lines=$(_count_client_frame_lines_for_state)
         fi
 
+        # ── Erase from cursor to end of screen ───────────────────────────
+        # Clears stale dynamic panel rows and any leftover pre-reserved
+        # blank lines below the current frame.
         printf '\033[J'
 
+        # ── Render dynamic panels (client only) ───────────────────────────
         local completed_lines=0 failed_lines=0
         if [[ "$mode" != "server" ]]; then
             completed_lines=$(_count_completed_panel_lines)
@@ -3231,8 +3548,12 @@ run_dashboard() {
             (( failed_lines    > 0 )) && _render_failed_panel
         fi
 
-        _PREV_DYNAMIC_LINES=$(( completed_lines + failed_lines ))
+        # ── Record total for next tick's cursor-up ────────────────────────
+        local dynamic_lines=$(( completed_lines + failed_lines ))
+        _last_total=$(( fixed_lines + dynamic_lines ))
+        _PREV_DYNAMIC_LINES=$dynamic_lines
 
+        # ── Check whether all processes have finished ─────────────────────
         local any=0
         if [[ "$mode" == "server" ]]; then
             local j
@@ -3446,10 +3767,8 @@ run_client_mode() {
     show_stream_summary "client"
     confirm_proceed "Launch ${n} stream(s)?" || return
 
-    # Apply network impairment
     apply_netem
 
-    # Pre-flight connectivity checks
     echo ""
     if ! run_preflight_checks; then
         if (( ${#NETEM_IFACES[@]} > 0 )); then
@@ -3464,10 +3783,8 @@ run_client_mode() {
         return
     fi
 
-    # Path MTU Discovery
     run_pmtu_discovery
 
-    # Prompt to review MTU warnings before launch if CRITICAL detected
     local _pmtu_critical=0
     if (( BASH_MAJOR >= 4 )); then
         local _pmtu_key
@@ -3489,7 +3806,6 @@ run_client_mode() {
         fi
     fi
 
-    # Launch streams
     echo ""; launch_clients
     echo ""
     printf '%b\n' "${GREEN}  Streams running. Opening dashboard...${NC}"
