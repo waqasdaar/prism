@@ -1471,8 +1471,6 @@ but not recommended without resolving the underlying issue.
 
 ## Use Case Examples
 
----
-
 ### Use Case 1 — Simple Two-Host Test (All Pass)
 
 **Scenario:** Client to server over a direct GRT path. iperf3 server is
