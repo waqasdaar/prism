@@ -210,6 +210,229 @@ SELECTED_IP=""
 SELECTED_VRF=""
 _PREV_DYNAMIC_LINES=0
 
+
+# =============================================================================
+# SECTION 9 — SPARKLINE ENGINE  ★ NEW IN v8.2.2 ★
+# =============================================================================
+#
+# Each stream (client) and each server listener maintains an independent
+# bandwidth history ring buffer stored as a colon-separated string in an
+# ordinary shell variable — fully Bash 3.2 compatible, no arrays required.
+#
+# Variable naming:
+#   _SPARK_c_<idx>   client stream (0-based index)
+#   _SPARK_s_<idx>   server listener (0-based index)
+#
+# Ring buffer depth  : _SPARK_DEPTH = 10  (10 seconds at 1 tick/sec)
+# Rendered bar width : _SPARK_WIDTH = 10  (always exactly 10 printable chars)
+#
+# Block characters (U+2581–U+2588), stored as awk octal escapes so they
+# render correctly on any platform regardless of locale:
+#   ▁ \342\226\201   ▂ \342\226\202   ▃ \342\226\203   ▄ \342\226\204
+#   ▅ \342\226\205   ▆ \342\226\206   ▇ \342\226\207   █ \342\226\210
+#
+# When fewer than _SPARK_WIDTH samples exist, the bar is left-padded with
+# '·' dots so the rendered field is always exactly _SPARK_WIDTH chars wide.
+#
+# API:
+#   _spark_push   <role> <idx> <bw_string>   append one live BW sample
+#   _spark_clear  <role> <idx>               reset buffer to empty
+#   _spark_render <role> <idx>               print the sparkline bar string
+# =============================================================================
+
+readonly _SPARK_DEPTH=10    # seconds of history retained per buffer
+readonly _SPARK_WIDTH=10    # printable characters rendered per bar
+
+# ---------------------------------------------------------------------------
+# _spark_bw_to_bps  <bw_string>
+#
+# Converts a human-readable bandwidth string (e.g. "94.40 Mbps") to an
+# integer bps value for numeric storage in the ring buffer.
+# Returns "0" on any parse failure.
+# ---------------------------------------------------------------------------
+_spark_bw_to_bps() {
+    local raw="$1"
+    [[ -z "$raw" || "$raw" == "---" || "$raw" == "N/A" ]] && { printf '0'; return; }
+    printf '%s' "$raw" | awk '
+    {
+        val  = $1 + 0
+        unit = $2
+        if      (unit ~ /[Gg]bps/) bps = val * 1e9
+        else if (unit ~ /[Mm]bps/) bps = val * 1e6
+        else if (unit ~ /[Kk]bps/) bps = val * 1e3
+        else                       bps = val
+        printf "%d", bps
+    }'
+}
+
+# ---------------------------------------------------------------------------
+# _spark_push  <role> <idx> <bw_string>
+#
+# Appends one bandwidth sample to the ring buffer for role ("c"=client,
+# "s"=server) and 0-based index.  Enforces _SPARK_DEPTH by trimming oldest.
+# ---------------------------------------------------------------------------
+_spark_push() {
+    local role="$1" idx="$2" bw_str="$3"
+    local varname="_SPARK_${role}_${idx}"
+
+    local bps; bps=$(_spark_bw_to_bps "$bw_str")
+
+    local existing=""
+    eval "existing=\"\${${varname}:-}\""
+
+    local updated
+    if [[ -z "$existing" ]]; then
+        updated="$bps"
+    else
+        updated="${existing}:${bps}"
+    fi
+
+    # Trim to _SPARK_DEPTH entries
+    local trimmed
+    trimmed=$(printf '%s' "$updated" | awk -v depth="$_SPARK_DEPTH" '
+        BEGIN { FS = ":"; OFS = ":" }
+        {
+            n = split($0, a, ":")
+            start = (n > depth) ? n - depth + 1 : 1
+            out = ""
+            for (i = start; i <= n; i++) {
+                out = (out == "") ? a[i] : out ":" a[i]
+            }
+            print out
+        }')
+
+    eval "${varname}=\"\${trimmed}\""
+}
+
+# ---------------------------------------------------------------------------
+# _spark_clear  <role>  <idx>
+#
+# Resets the ring buffer to empty.
+# Called when a server listener transitions to RUNNING (new client connect).
+# ---------------------------------------------------------------------------
+_spark_clear() {
+    local role="$1" idx="$2"
+    local varname="_SPARK_${role}_${idx}"
+    eval "${varname}=\"\""
+}
+
+# ---------------------------------------------------------------------------
+# _spark_render  <role>  <idx>
+#
+# Renders exactly _SPARK_WIDTH printable characters as a FILLED AREA
+# (mountain) sparkline graph.
+#
+# Algorithm:
+#   1. Find min and max of all samples in the current window.
+#   2. Normalise each sample to [0.0, 1.0] relative to the window range.
+#      This is the key difference from a simple bar graph — even small
+#      fluctuations within a narrow absolute range are fully amplified to
+#      use the entire 8-level display height, making trends always visible.
+#   3. Map normalised value to one of 8 filled block levels (U+2581–U+2588).
+#   4. Left-pad with '·' when fewer than _SPARK_WIDTH samples exist.
+#
+# Dynamic range normalisation rules:
+#   range == 0, max > 0   → flat mid-height (▄, level 4) — stable traffic
+#   range == 0, max == 0  → flat floor (▁, level 1)      — no traffic
+#   range > 0             → normalise to [1, 8] linearly
+#
+# The filled area gives:
+#   - Immediate spike/drop visibility (tall vs short filled column)
+#   - Trend shape readable at a glance (rising/falling/stable regions)
+#   - Zero traffic clearly distinguishable from low traffic
+#   - High traffic clearly distinguishable from medium traffic
+#   - Works correctly for both Kbps and Gbps ranges without configuration
+# ---------------------------------------------------------------------------
+
+_spark_render() {
+    local role="$1" idx="$2"
+    local varname="_SPARK_${role}_${idx}"
+    local buf=""
+    eval "buf=\"\${${varname}:-}\""
+
+    # Empty buffer — return dot padding without invoking awk
+    if [[ -z "$buf" ]]; then
+        local d="" k
+        for (( k=0; k<_SPARK_WIDTH; k++ )); do d+='·'; done
+        printf '%s' "$d"
+        return
+    fi
+
+    printf '%s' "$buf" | awk \
+        -v width="$_SPARK_WIDTH" \
+        'BEGIN {
+            FS = ":"
+
+            # Filled block characters U+2581–U+2588 as octal escapes.
+            # Each character fills the cell from the bottom to the given
+            # fraction of the full cell height, creating a solid area.
+            #
+            #   blocks[1] = ▁  U+2581  one eighth    (floor / near-zero)
+            #   blocks[2] = ▂  U+2582  one quarter
+            #   blocks[3] = ▃  U+2583  three eighths
+            #   blocks[4] = ▄  U+2584  half
+            #   blocks[5] = ▅  U+2585  five eighths
+            #   blocks[6] = ▆  U+2586  three quarters
+            #   blocks[7] = ▇  U+2587  seven eighths
+            #   blocks[8] = █  U+2588  full block    (maximum)
+            #
+            blocks[1] = "\342\226\201"
+            blocks[2] = "\342\226\202"
+            blocks[3] = "\342\226\203"
+            blocks[4] = "\342\226\204"
+            blocks[5] = "\342\226\205"
+            blocks[6] = "\342\226\206"
+            blocks[7] = "\342\226\207"
+            blocks[8] = "\342\226\210"
+        }
+        {
+            n = split($0, vals, ":")
+
+            # ── Step 1: find min and max of the current window ────────────
+            min_v = vals[1] + 0
+            max_v = vals[1] + 0
+            for (i = 2; i <= n; i++) {
+                v = vals[i] + 0
+                if (v < min_v) min_v = v
+                if (v > max_v) max_v = v
+            }
+            range = max_v - min_v
+
+            # ── Step 2: build filled area string ──────────────────────────
+            area = ""
+            for (i = 1; i <= n; i++) {
+                v = vals[i] + 0
+
+                if (range == 0) {
+                    # Flat signal within this window:
+                    #   non-zero → mid height (▄) shows stable active traffic
+                    #   zero     → floor (▁) shows connection idle / no data
+                    lvl = (max_v > 0) ? 4 : 1
+                } else {
+                    # Dynamic range normalisation:
+                    # Map [min_v, max_v] linearly onto levels [1, 8].
+                    # This ensures the full height of the sparkline field is
+                    # always used, making even small fluctuations visible.
+                    #
+                    # Formula: lvl = round( (v - min_v) / range * 7 ) + 1
+                    # Result:  min_v → 1 (▁),  max_v → 8 (█)
+                    lvl = int((v - min_v) / range * 7 + 0.5) + 1
+                    if (lvl < 1) lvl = 1
+                    if (lvl > 8) lvl = 8
+                }
+
+                area = area blocks[lvl]
+            }
+
+            # ── Step 3: left-pad with dots to reach target width ──────────
+            dots_needed = width - n
+            dots = ""
+            for (i = 1; i <= dots_needed; i++) dots = dots "·"
+
+            printf "%s%s", dots, area
+        }'
+}
+
 # =============================================================================
 # SECTION 1 — PRIMITIVES
 # =============================================================================
@@ -3906,30 +4129,21 @@ probe_server_status() {
 
     local prev_state="${SRV_PREV_STATE[$idx]:-}"
 
-    # ── Bandwidth cache reset policy ──────────────────────────────────────
-    #
-    # Reset the BW cache ONLY when the server transitions from CONNECTED
-    # to LISTENING or STARTING. This means a client fully disconnected
-    # and the server has returned to waiting with no active connection.
-    #
-    # Do NOT reset when transitioning CONNECTED → RUNNING:
-    #   RUNNING means the server accepted the connection and is either
-    #   still processing or just finished — the cached BW from that
-    #   connection is still meaningful and should be shown.
-    #
-    # Do NOT reset when staying in RUNNING:
-    #   The server may cycle CONNECTED → RUNNING between client connections.
-    #   Retaining the cached BW provides continuity in the dashboard.
-    #
+    # ── BW cache reset: client disconnected, server back to waiting ───────
     if [[ "$prev_state" == "CONNECTED" ]]; then
         case "$current_state" in
             LISTENING|STARTING)
-                # Client fully gone, server back to waiting — clear BW
                 SRV_BW_CACHE[$idx]="---"
                 ;;
-            # RUNNING, CONNECTED: retain cache — connection still active or
-            # just completed, BW is still relevant
         esac
+    fi
+
+    # ── ★ NEW IN v8.2.2 ★ Sparkline reset on RUNNING transition ──────────
+    # A transition to RUNNING means a new client connection has just been
+    # accepted. Clear the server ring buffer so the graph always shows only
+    # the current connection's history, never a mix with previous sessions.
+    if [[ "$prev_state" != "RUNNING" && "$current_state" == "RUNNING" ]]; then
+        _spark_clear "s" "$idx"
     fi
 
     SRV_PREV_STATE[$idx]="$current_state"
@@ -4290,25 +4504,19 @@ _render_client_frame() {
     local efmt; efmt=$(format_seconds $(( now - fts )))
 
     # ── Dynamic target column width ───────────────────────────────────────
-    # Calculate the minimum width needed to display all targets without
-    # truncation, capped so the total row fits within COLS (80).
-    #
-    # Row layout (characters):
-    #   " " + sn(3) + "  " + proto(5) + "  " + target(W) + "  " +
-    #   port(5) + "  " + bw(11) + "  " + time(6) + "  " + dscp(5) +
-    #   "  " + status(9) = 1+3+2+5+2+W+2+5+2+11+2+6+2+5+2+9 = 59+W
-    # Box overhead (| on each side + 1 indent) = 3
-    # Total = 62 + W  must be <= COLS (80)  →  W <= 18
-    # Minimum useful width = 13 (fits "192.168.1.1" + some)
-    local _tgt_col_w=13
+    # Row layout with sparkline (80 cols total):
+    #   " " sn(3) "  " proto(5) "  " target(W) "  " port(5) "  "
+    #   bw(11) " " spark(10) "  " time(6) "  " dscp(5) "  " status(9)
+    #   = 1+3+2+5+2+W+2+5+2+11+1+10+2+6+2+5+2+9 = 68+W
+    # Box overhead = 3  →  total = 71+W ≤ COLS(80)  →  W ≤ 9; minimum 9
+    local _tgt_col_w=9
     for (( i=0; i<STREAM_COUNT; i++ )); do
         local _tlen=${#S_TARGET[$i]}
         (( _tlen > _tgt_col_w )) && _tgt_col_w=$_tlen
     done
-    # Cap to fit in 80-column box
-    local _tgt_max=$(( COLS - 62 ))
+    local _tgt_max=$(( COLS - 71 ))
+    (( _tgt_max < 9 )) && _tgt_max=9
     (( _tgt_col_w > _tgt_max )) && _tgt_col_w=$_tgt_max
-    (( _tgt_col_w < 13 )) && _tgt_col_w=13
 
     local has_fixed_dur=0
     for (( i=0; i<STREAM_COUNT; i++ )); do
@@ -4323,12 +4531,12 @@ _render_client_frame() {
         "$act" "$nc" "$nd" "$nf" "$efmt")"
     print_separator
 
-    # Column header uses dynamic target width
-    bleft "${BOLD}$(printf '%-3s  %-5s  %-*s  %-5s  %-11s  %-6s  %-5s  %-9s' \
-        '#' 'Proto' "$_tgt_col_w" 'Target' 'Port' 'Bandwidth' 'Time' 'DSCP' \
-        'Status')${NC}"
+    # Column header — sparkline labelled "Last 10s"  ★ NEW IN v8.2.2 ★
+    bleft "${BOLD}$(printf '%-3s  %-5s  %-*s  %-5s  %-11s %-10s  %-6s  %-5s  %-9s' \
+        '#' 'Proto' "$_tgt_col_w" 'Target' 'Port' \
+        'Bandwidth' 'Last 10s' 'Time' 'DSCP' 'Status')${NC}"
     if (( has_fixed_dur )); then
-        bleft "${DIM}$(printf '%-3s  %-5s  %-*s  %-5s  %-11s  %-29s' \
+        bleft "${DIM}$(printf '%-3s  %-5s  %-*s  %-5s  %-22s  %-29s' \
             '' '' "$_tgt_col_w" '' '' '' 'Progress')${NC}"
     fi
     print_separator
@@ -4342,6 +4550,14 @@ _render_client_frame() {
         local bw="---"
         [[ "$st" == "CONNECTED" ]] && bw=$(parse_live_bandwidth_from_log "$lf")
         [[ "$st" == "DONE"      ]] && bw="${S_FINAL_SENDER_BW[$i]:-N/A}"
+
+        # ── ★ NEW IN v8.2.2 ★ Push sample + render sparkline ─────────────
+        # Push only when CONNECTED with real data — not for DONE/FAILED/
+        # STARTING states, which must not pollute the history ring buffer.
+        if [[ "$st" == "CONNECTED" && "$bw" != "---" ]]; then
+            _spark_push "c" "$i" "$bw"
+        fi
+        local spark_str; spark_str=$(_spark_render "c" "$i")
 
         local td="--:--"
         local sts="${S_START_TS[$i]:-0}"; (( sts == 0 )) && sts="$now"
@@ -4391,27 +4607,27 @@ _render_client_frame() {
             *)          sb="$st"        sc="$NC"     ;;
         esac
 
-        # Truncate target only when it exceeds the dynamic column width
         local tgt="${S_TARGET[$i]:-?}"
         if (( ${#tgt} > _tgt_col_w )); then
             tgt="${tgt:0:$(( _tgt_col_w - 1 ))}~"
         fi
 
-        # Main data row uses dynamic target width
+        # ── Main data row with inline sparkline  ★ NEW IN v8.2.2 ★ ───────
+        # Format: bw(11) space spark(10)  then time/dscp/status as before
         local pfx
-        pfx=$(printf '%-3d  %-5s  %-*s  %-5s  %-11s  %-6s  %-5s  ' \
-            "$sn" "${S_PROTO[$i]}" "$_tgt_col_w" "$tgt" "${S_PORT[$i]}" \
-            "$bw" "$td" "$dscp_display")
-        bleft " ${pfx}${sc}${sb}${NC}"
+        pfx=$(printf '%-3d  %-5s  %-*s  %-5s  %-11s ' \
+            "$sn" "${S_PROTO[$i]}" "$_tgt_col_w" "$tgt" "${S_PORT[$i]}" "$bw")
+        bleft " ${pfx}${CYAN}${spark_str}${NC}  $(printf '%-6s  %-5s  ' \
+            "$td" "$dscp_display")${sc}${sb}${NC}"
 
-        # Progress bar row — indent matches target column width
+        # Progress bar row (unchanged from v8.2.1.1)
         if (( show_bar && has_fixed_dur )); then
             local bar_str
             bar_str=$(_render_progress_bar "$stream_elapsed" "$dur")
             local bar_prefix
-            bar_prefix=$(printf ' %-3s  %-5s  %-*s  %-5s  %-11s  ' \
+            bar_prefix=$(printf ' %-3s  %-5s  %-*s  %-5s  %-11s ' \
                 '' '' "$_tgt_col_w" '' '' '')
-            bleft " ${bar_prefix}${bar_str}"
+            bleft " ${bar_prefix}$(rpt ' ' 11)${bar_str}"
         fi
     done
 
@@ -4432,58 +4648,46 @@ _render_server_frame() {
     bline '='
     bleft "  $(printf 'Listeners active: %d / %d' "$running" "$SERVER_COUNT")"
     print_separator
-    bleft "${BOLD}$(printf '%-3s  %-6s  %-16s  %-10s  %-12s  %-9s' \
-        '#' 'Port' 'Bind IP' 'VRF' 'Bandwidth' 'Status')${NC}"
+
+    # Column header — sparkline labelled "Last 10s"  ★ NEW IN v8.2.2 ★
+    bleft "${BOLD}$(printf '%-3s  %-6s  %-16s  %-10s  %-11s %-10s  %-9s' \
+        '#' 'Port' 'Bind IP' 'VRF' 'Bandwidth' 'Last 10s' 'Status')${NC}"
     print_separator
 
     for (( i=0; i<SERVER_COUNT; i++ )); do
         local sn=$(( i + 1 )) lf="${SRV_LOGFILE[$i]:-}"
         local st; st=$(probe_server_status "$i")
 
-        # ── Bandwidth display logic ───────────────────────────────────────
-        #
-        # CONNECTED or RUNNING:
-        #   Try to parse a live bandwidth sample from the log.
-        #   If a new sample is available, update the cache and display it.
-        #   If no new sample, display the cached value (last known BW).
-        #   This retains the previous connection's bandwidth while the
-        #   server is in RUNNING state waiting for the next client.
-        #
-        # LISTENING or STARTING:
-        #   No client has connected yet (or server just started).
-        #   Clear the cache and show "---" — there is no meaningful
-        #   bandwidth figure to display.
-        #
-        # DONE or FAILED:
-        #   Show "---" — listener is no longer active.
-
+        # ── Bandwidth display logic (unchanged from v8.2.1.1) ─────────────
         local bw
         case "$st" in
             CONNECTED|RUNNING)
                 local live_bw
                 live_bw=$(parse_live_bandwidth_from_log "$lf")
                 if [[ "$live_bw" != "---" && -n "$live_bw" ]]; then
-                    # Fresh live sample available — update cache
                     bw="$live_bw"
                     SRV_BW_CACHE[$i]="$live_bw"
                 else
-                    # No live sample — retain cached value from last
-                    # active connection (may be from previous client)
                     bw="${SRV_BW_CACHE[$i]:----}"
                 fi
                 ;;
             LISTENING|STARTING)
-                # No client has ever connected to this listener in the
-                # current session, or server is initialising.
-                # Clear cache and show placeholder.
                 bw="---"
                 SRV_BW_CACHE[$i]="---"
                 ;;
             *)
-                # DONE, FAILED, or unknown
                 bw="---"
                 ;;
         esac
+
+        # ── ★ NEW IN v8.2.2 ★ Push sample + render sparkline ─────────────
+        # Push only when a real BW sample is available (CONNECTED or RUNNING
+        # with actual data).  LISTENING/STARTING/DONE/FAILED must not push.
+        if [[ ( "$st" == "CONNECTED" || "$st" == "RUNNING" ) && \
+              "$bw" != "---" && -n "$bw" ]]; then
+            _spark_push "s" "$i" "$bw"
+        fi
+        local spark_str; spark_str=$(_spark_render "s" "$i")
 
         local sb sc
         case "$st" in
@@ -4499,11 +4703,12 @@ _render_server_frame() {
         local vrf_disp="${SRV_VRF[$i]:-GRT}"
         [[ "$OS_TYPE" == "macos" ]] && vrf_disp="N/A"
 
+        # ── Main data row with inline sparkline  ★ NEW IN v8.2.2 ★ ───────
         local pfx
-        pfx=$(printf '%-3d  %-6s  %-16s  %-10s  %-12s  ' \
+        pfx=$(printf '%-3d  %-6s  %-16s  %-10s  %-11s ' \
             "$sn" "${SRV_PORT[$i]}" "${SRV_BIND[$i]:-0.0.0.0}" \
             "$vrf_disp" "$bw")
-        bleft " ${pfx}${sc}${sb}${NC}"
+        bleft " ${pfx}${CYAN}${spark_str}${NC}  ${sc}${sb}${NC}"
     done
 
     print_separator
