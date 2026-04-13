@@ -512,6 +512,30 @@ validate_ip() {
     return 1
 }
 
+
+# ---------------------------------------------------------------------------
+# _all_streams_loopback
+#
+# Returns 0 (true) when every configured client stream targets a loopback
+# address (127.x.x.x or ::1).  Used to suppress features that are not
+# applicable during loopback validation tests, such as DSCP verification
+# and the RTT hint row.
+# Returns 1 (false) when at least one stream targets a non-loopback address.
+# ---------------------------------------------------------------------------
+_all_streams_loopback() {
+    (( STREAM_COUNT == 0 )) && return 0
+    local i
+    for (( i=0; i<STREAM_COUNT; i++ )); do
+        local t="${S_TARGET[$i]:-}"
+        # If any stream is NOT loopback, return false immediately
+        if [[ ! "$t" =~ ^127\. && "$t" != "::1" ]]; then
+            return 1
+        fi
+    done
+    return 0
+}
+
+
 # =============================================================================
 # SECTION 2 — BOX DRAWING
 # =============================================================================
@@ -2408,28 +2432,46 @@ build_client_command() {
     local stream_vrf="${S_VRF[$idx]:-}"
     local stream_bind="${S_BIND[$idx]:-}"
 
-    if [[ -n "$stream_vrf" && -n "$stream_bind" && \
-          "$stream_bind" != "0.0.0.0" && \
-          "$OS_TYPE" == "linux" ]]; then
-        local _vrf_consistent=0 _ki
+    if [[ "$OS_TYPE" == "linux" && -n "$stream_bind" && \
+          "$stream_bind" != "0.0.0.0" ]]; then
+
+        # Determine which VRF (or GRT) actually owns the bind IP
+        local _actual_vrf="GRT"
+        local _ki
         for (( _ki=0; _ki<${#IFACE_IPS[@]}; _ki++ )); do
-            if [[ "${IFACE_IPS[$_ki]}"  == "$stream_bind" && \
-                  "${IFACE_VRFS[$_ki]}" == "$stream_vrf"  ]]; then
-                _vrf_consistent=1; break
+            if [[ "${IFACE_IPS[$_ki]}" == "$stream_bind" ]]; then
+                _actual_vrf="${IFACE_VRFS[$_ki]:-GRT}"
+                break
             fi
         done
-        if (( _vrf_consistent == 0 )); then
-            local _in_grt=0
-            for (( _ki=0; _ki<${#IFACE_IPS[@]}; _ki++ )); do
-                if [[ "${IFACE_IPS[$_ki]}"  == "$stream_bind" && \
-                      "${IFACE_VRFS[$_ki]}" == "GRT" ]]; then
-                    _in_grt=1; break
-                fi
-            done
-            if (( _in_grt == 1 )); then
+
+        if [[ -n "$stream_vrf" ]]; then
+            # A VRF was configured — verify the bind IP actually lives in it
+            if [[ "$_actual_vrf" == "GRT" ]]; then
+                # Bind IP is in GRT but VRF was set — clear VRF to prevent
+                # "bad file descriptor" error at iperf3 socket bind time
                 printf '%b\n' \
-                    "${YELLOW}  [WARN] Stream $((idx+1)): bind IP ${stream_bind} is in GRT but VRF '${stream_vrf}' was configured. VRF cleared to prevent bad file descriptor.${NC}" >&2
+                    "${YELLOW}  [WARN] Stream $((idx+1)): bind IP ${stream_bind} belongs to GRT" \
+                    "but VRF '${stream_vrf}' was configured." \
+                    "Clearing VRF to prevent bad file descriptor.${NC}" >&2
                 stream_vrf=""
+            elif [[ "$_actual_vrf" != "$stream_vrf" ]]; then
+                # Bind IP is in a different VRF than configured — correct it
+                printf '%b\n' \
+                    "${YELLOW}  [WARN] Stream $((idx+1)): bind IP ${stream_bind} belongs to" \
+                    "VRF '${_actual_vrf}', not '${stream_vrf}'." \
+                    "Correcting VRF to '${_actual_vrf}'.${NC}" >&2
+                stream_vrf="$_actual_vrf"
+                [[ "$stream_vrf" == "GRT" ]] && stream_vrf=""
+            fi
+        else
+            # No VRF was configured — auto-apply the correct one if the
+            # bind IP lives in a VRF (prevents silent GRT-vs-VRF mismatch)
+            if [[ "$_actual_vrf" != "GRT" && -n "$_actual_vrf" ]]; then
+                printf '%b\n' \
+                    "${CYAN}  [AUTO] Stream $((idx+1)): bind IP ${stream_bind} belongs to" \
+                    "VRF '${_actual_vrf}'. Auto-applying VRF for correct routing.${NC}" >&2
+                stream_vrf="$_actual_vrf"
             fi
         fi
     fi
@@ -2471,6 +2513,52 @@ write_launch_script() {
 
 launch_servers() {
     SERVER_PIDS=(); SRV_PREV_STATE=(); SRV_BW_CACHE=()
+
+    # ── Pre-launch VRF/bind consistency validation (server) ───────────────
+    if [[ "$OS_TYPE" == "linux" ]]; then
+        get_interface_list
+        local _vi
+        for (( _vi=0; _vi<SERVER_COUNT; _vi++ )); do
+            local _vbind="${SRV_BIND[$_vi]:-}"
+            local _vvrf="${SRV_VRF[$_vi]:-}"
+
+            [[ -z "$_vbind" || "$_vbind" == "0.0.0.0" ]] && continue
+
+            local _vactual="GRT"
+            local _vki
+            for (( _vki=0; _vki<${#IFACE_IPS[@]}; _vki++ )); do
+                if [[ "${IFACE_IPS[$_vki]}" == "$_vbind" ]]; then
+                    _vactual="${IFACE_VRFS[$_vki]:-GRT}"
+                    break
+                fi
+            done
+
+            if [[ -n "$_vvrf" && "$_vactual" == "GRT" ]]; then
+                printf '%b\n' \
+                    "${YELLOW}  [PRE-LAUNCH FIX] Listener $((_vi+1)):" \
+                    "bind IP ${_vbind} is in GRT." \
+                    "Clearing VRF '${_vvrf}' to prevent bad file descriptor.${NC}"
+                SRV_VRF[$_vi]=""
+
+            elif [[ -n "$_vvrf" && "$_vactual" != "GRT" && \
+                    "$_vactual" != "$_vvrf" ]]; then
+                printf '%b\n' \
+                    "${YELLOW}  [PRE-LAUNCH FIX] Listener $((_vi+1)):" \
+                    "bind IP ${_vbind} belongs to VRF '${_vactual}'," \
+                    "not '${_vvrf}'. Correcting VRF.${NC}"
+                SRV_VRF[$_vi]="$_vactual"
+
+            elif [[ -z "$_vvrf" && "$_vactual" != "GRT" && \
+                    -n "$_vactual" ]]; then
+                printf '%b\n' \
+                    "${CYAN}  [PRE-LAUNCH AUTO] Listener $((_vi+1)):" \
+                    "bind IP ${_vbind} belongs to VRF '${_vactual}'." \
+                    "Auto-applying VRF.${NC}"
+                SRV_VRF[$_vi]="$_vactual"
+            fi
+        done
+    fi
+
     local i
     for (( i=0; i<SERVER_COUNT; i++ )); do
         local sn=$(( i + 1 )) sf="${TMPDIR}/server_${sn}.sh" lf="${TMPDIR}/server_${sn}.log"
@@ -2490,10 +2578,65 @@ launch_servers() {
 
 launch_clients() {
     STREAM_PIDS=()
-    # ★ NEW IN v8.2.3 ★ — initialise ping tracking arrays
     PING_PIDS=()
     PING_LOGFILES=()
+
+    # ── Pre-launch VRF/bind consistency validation ────────────────────────
+    # Refresh the interface list so VRF membership data is current, then
+    # verify each stream's bind IP / VRF combination before launching.
+    # This catches mismatches that slipped through the configuration wizard
+    # and prevents streams from failing immediately with "bad file descriptor".
+
+    if [[ "$OS_TYPE" == "linux" ]]; then
+        get_interface_list
+        local _vi
+        for (( _vi=0; _vi<STREAM_COUNT; _vi++ )); do
+            local _vbind="${S_BIND[$_vi]:-}"
+            local _vvrf="${S_VRF[$_vi]:-}"
+
+            [[ -z "$_vbind" || "$_vbind" == "0.0.0.0" ]] && continue
+
+            # Find the actual VRF that owns this bind IP
+            local _vactual="GRT"
+            local _vki
+            for (( _vki=0; _vki<${#IFACE_IPS[@]}; _vki++ )); do
+                if [[ "${IFACE_IPS[$_vki]}" == "$_vbind" ]]; then
+                    _vactual="${IFACE_VRFS[$_vki]:-GRT}"
+                    break
+                fi
+            done
+
+            # Case 1: VRF set but bind IP is in GRT → clear VRF
+            if [[ -n "$_vvrf" && "$_vactual" == "GRT" ]]; then
+                printf '%b\n' \
+                    "${YELLOW}  [PRE-LAUNCH FIX] Stream $((_vi+1)):" \
+                    "bind IP ${_vbind} is in GRT." \
+                    "Clearing VRF '${_vvrf}' to prevent bad file descriptor.${NC}"
+                S_VRF[$_vi]=""
+
+            # Case 2: VRF set to wrong VRF → correct it
+            elif [[ -n "$_vvrf" && "$_vactual" != "GRT" && \
+                    "$_vactual" != "$_vvrf" ]]; then
+                printf '%b\n' \
+                    "${YELLOW}  [PRE-LAUNCH FIX] Stream $((_vi+1)):" \
+                    "bind IP ${_vbind} belongs to VRF '${_vactual}'," \
+                    "not '${_vvrf}'. Correcting VRF.${NC}"
+                S_VRF[$_vi]="$_vactual"
+
+            # Case 3: No VRF set but bind IP is in a VRF → auto-apply
+            elif [[ -z "$_vvrf" && "$_vactual" != "GRT" && \
+                    -n "$_vactual" ]]; then
+                printf '%b\n' \
+                    "${CYAN}  [PRE-LAUNCH AUTO] Stream $((_vi+1)):" \
+                    "bind IP ${_vbind} belongs to VRF '${_vactual}'." \
+                    "Auto-applying VRF.${NC}"
+                S_VRF[$_vi]="$_vactual"
+            fi
+        done
+    fi
+
     local i
+
     for (( i=0; i<STREAM_COUNT; i++ )); do
         local sn=$(( i + 1 )) sf="${TMPDIR}/stream_${sn}.sh" lf="${TMPDIR}/stream_${sn}.log"
         if ! write_launch_script "$sf" "$(build_client_command "$i")"; then
@@ -4073,25 +4216,18 @@ _dscp_verify_interactive() {
     printf '\033[?25h'
     printf '\n'
 
-    # Guard: check whether any non-loopback stream exists
-    local _has_verifiable=0
-    local _vi
-    for (( _vi=0; _vi<STREAM_COUNT; _vi++ )); do
-        if [[ ! "${S_TARGET[$_vi]:-}" =~ ^127\. ]] && \
-           [[ "${S_TARGET[$_vi]:-}" != "::1" ]]; then
-            _has_verifiable=1
-            break
-        fi
-    done
-
-    if (( _has_verifiable == 0 )); then
+    # Guard: suppress DSCP verification entirely during loopback test mode.
+    # tcpdump cannot capture meaningful DSCP markings on the loopback
+    # interface because the TOS field is not preserved in the same way
+    # as on physical or virtual Ethernet interfaces.
+    if _all_streams_loopback; then
         printf '\n'
         printf '+%s+\n' "$(rpt '=' "$inner")"
         bcenter "${BOLD}${CYAN}DSCP Marking Verification${NC}"
         printf '+%s+\n' "$(rpt '=' "$inner")"
-        bleft "  ${YELLOW}⚠ All streams are targeting loopback (127.x.x.x).${NC}"
-        bleft "  ${DIM}DSCP verification via tcpdump is not applicable for loopback traffic.${NC}"
-        bleft "  ${DIM}Configure streams to non-loopback targets to use this feature.${NC}"
+        bleft "  ${YELLOW}⚠ Loopback test mode — DSCP verification is not applicable.${NC}"
+        bleft "  ${DIM}All streams target 127.0.0.1. tcpdump DSCP capture requires${NC}"
+        bleft "  ${DIM}a physical or virtual interface, not the loopback interface.${NC}"
         printf '+%s+\n' "$(rpt '=' "$inner")"
         printf '\n'
         read -r -p "  Press Enter to return to dashboard..." </dev/tty
@@ -4775,15 +4911,7 @@ _count_server_frame_lines() {
 # ---------------------------------------------------------------------------
 _count_client_frame_lines_for_state() {
     local total=10    # fixed structural lines (same anatomy as server)
-
-    # Sub-header line — only when at least one stream has fixed duration
-    local has_fixed=0
     local i
-    for (( i=0; i<STREAM_COUNT; i++ )); do
-        (( S_DURATION[$i] > 0 )) && has_fixed=1 && break
-    done
-    (( has_fixed )) && (( total++ ))
-
     # Per-stream rows
     for (( i=0; i<STREAM_COUNT; i++ )); do
         (( total++ ))   # main data row always present
@@ -4877,7 +5005,7 @@ _render_client_frame() {
     local i
     for (( i=0; i<STREAM_COUNT; i++ )); do probe_client_status "$i"; done
 
-    # ── Stream counters and elapsed time ─────────────────────────────────
+    # ── Stream counters ───────────────────────────────────────────────────
     local nc=0 ni=0 ns=0 nd=0 nf=0
     for (( i=0; i<STREAM_COUNT; i++ )); do
         case "${S_STATUS_CACHE[$i]}" in
@@ -4889,25 +5017,43 @@ _render_client_frame() {
     local fts="${S_START_TS[0]:-0}"; (( fts == 0 )) && fts="$now"
     local efmt; efmt=$(format_seconds $(( now - fts )))
 
-    # ── Fixed column widths ───────────────────────────────────────────────
+    # ── Column widths ─────────────────────────────────────────────────────
     #
-    # Total inner width = COLS - 2 = 78 (for COLS=80)
+    #  Inner usable width (after bleft's 1-space indent) = COLS - 3 = 77
     #
-    # Column layout (each width includes its trailing spaces):
-    #   C_SN     =  3   stream number       e.g.  " 1 "
-    #   C_PROTO  =  5   protocol            e.g.  " TCP "
-    #   C_TARGET = 15   target IP           e.g.  " 192.168.1.100 "
-    #   C_PORT   =  6   port                e.g.  "  5201"
-    #   C_BW     = 12   bandwidth           e.g.  " 941.23 Mbps"
-    #   C_SPARK  = 12   sparkline+label     e.g.  " ·▃▄▅▆▆▇▇█▇ "
-    #   C_TIME   =  7   countdown/elapsed   e.g.  " 00:22 "
-    #   C_DSCP   =  6   DSCP name           e.g.  "   EF "
-    #   C_STATUS =  9   connection status   e.g.  "CONNECTED"
+    #  Field widths (visible chars):
+    #    C_SN      3    stream number
+    #    C_PROTO   5    protocol
+    #    C_TARGET 15    target IP
+    #    C_PORT    5    port number
+    #    C_BW     13    bandwidth
+    #    C_SPARK  11    sparkline  (1 space + 10 spark chars)
+    #    C_TIME    6    time remaining
+    #    C_DSCP    5    DSCP name
+    #    C_STAT    9    status
     #
-    # Sum = 3+5+15+6+12+12+7+6+9 = 75  +  separating spaces (3) = 78 ✓
+    #  Separating spaces: 8 gaps × 2 spaces = 16
+    #  Total = 3+5+15+5+13+11+6+5+9 + 16 = 88 → exceeds 77 at 80 cols.
     #
-    local C_SN=3 C_PROTO=5 C_TARGET=15 C_PORT=6
-    local C_BW=12 C_SPARK=12 C_TIME=7 C_DSCP=6 C_STATUS=9
+    #  Reduce C_TARGET to fit:
+    #    77 - (3+5+5+13+11+6+5+9+16) = 77 - 73 = 4  → too small.
+    #
+    #  Solution: reduce gaps to 1 space between fields:
+    #    8 gaps × 1 space = 8
+    #    77 - 8 - (3+5+5+13+11+6+5+9) = 77 - 8 - 57 = 12 → C_TARGET = 12
+    #
+    #  Final widths:
+    #    C_SN=3  C_PROTO=5  C_TARGET=12  C_PORT=5
+    #    C_BW=13  C_SPARK=11  C_TIME=6  C_DSCP=5  C_STAT=9
+    #    gaps=8 (1 space between each pair)
+    #    total = 3+5+12+5+13+11+6+5+9+8 = 77  ✓
+    #
+    local C_SN=3 C_PROTO=5 C_TARGET=12 C_PORT=5
+    local C_BW=13 C_SPARK=11 C_TIME=6 C_DSCP=5 C_STAT=9
+
+    # Single reusable format string — 1 space between every field
+    local ROW_FMT
+    ROW_FMT="%-${C_SN}s %-${C_PROTO}s %-${C_TARGET}s %${C_PORT}s %-${C_BW}s %-${C_SPARK}s %${C_TIME}s %${C_DSCP}s %-${C_STAT}s"
 
     local has_fixed_dur=0
     for (( i=0; i<STREAM_COUNT; i++ )); do
@@ -4919,31 +5065,17 @@ _render_client_frame() {
     bcenter "${BOLD}${CYAN}iperf3 Traffic Streams -- Live Dashboard${NC}"
     bline '='
 
-    # ── Status summary bar ────────────────────────────────────────────────
+    # ── Summary bar ───────────────────────────────────────────────────────
     bleft "$(printf \
         '  Active:%-3d  Connected:%-3d  Done:%-3d  Failed:%-3d  Elapsed:%s' \
         "$act" "$nc" "$nd" "$nf" "$efmt")"
     bline '='
 
-    # ── Column header — precisely aligned to column definitions ──────────
-    bleft "${BOLD}$(printf \
-        ' %-*s  %-*s  %-*s  %*s  %-*s  %-*s  %*s  %*s  %-*s' \
-        "$C_SN"     '#' \
-        "$C_PROTO"  'Proto' \
-        "$C_TARGET" 'Target' \
-        "$C_PORT"   'Port' \
-        "$C_BW"     'Bandwidth' \
-        "$C_SPARK"  'Last 10s' \
-        "$C_TIME"   'Time' \
-        "$C_DSCP"   'DSCP' \
-        "$C_STATUS" 'Status')${NC}"
-
-    # Progress sub-header only when at least one stream has fixed duration
-    if (( has_fixed_dur )); then
-        local prog_indent=$(( C_SN + 2 + C_PROTO + 2 + C_TARGET + 2 + \
-                              C_PORT + 2 + C_BW + 2 + 1 ))
-        bleft "${DIM}$(printf '%*s%-s' "$prog_indent" '' 'Progress ─────────────────')${NC}"
-    fi
+    # ── Column header ─────────────────────────────────────────────────────
+    # shellcheck disable=SC2059
+    bleft "${BOLD}$(printf "$ROW_FMT" \
+        '#' 'Proto' 'Target' 'Port' 'Bandwidth' 'Last 10s' \
+        'Time' 'DSCP' 'Status')${NC}"
     bline '-'
 
     # ── Per-stream rows ───────────────────────────────────────────────────
@@ -4952,7 +5084,7 @@ _render_client_frame() {
         local st="${S_STATUS_CACHE[$i]:-STARTING}"
         local lf="${S_LOGFILE[$i]:-}"
 
-        # RTT parse (once per tick per stream)
+        # RTT parse
         _rtt_parse "$i"
 
         # ── Bandwidth ─────────────────────────────────────────────────────
@@ -4976,7 +5108,7 @@ _render_client_frame() {
         case "$st" in
             CONNECTED|STARTING|CONNECTING)
                 if (( dur == 0 )); then
-                    td="∞$(format_seconds "$stream_elapsed")"
+                    td="inf"
                     show_bar=0
                 else
                     local rem=$(( dur - stream_elapsed ))
@@ -4995,7 +5127,7 @@ _render_client_frame() {
                 ;;
         esac
 
-        # ── DSCP display ──────────────────────────────────────────────────
+        # ── DSCP ──────────────────────────────────────────────────────────
         local dscp_disp="---"
         [[ -n "${S_DSCP_NAME[$i]}" ]] && dscp_disp="${S_DSCP_NAME[$i]}"
         [[ "$dscp_disp" == "---" && -n "${S_DSCP_VAL[$i]}" ]] && \
@@ -5012,28 +5144,26 @@ _render_client_frame() {
             *)          sb="$st"        sc="$NC"     ;;
         esac
 
-        # ── Target truncation to fixed column width ───────────────────────
+        # ── Field value preparation ───────────────────────────────────────
         local tgt="${S_TARGET[$i]:-?}"
-        (( ${#tgt} > C_TARGET )) && tgt="${tgt:0:$(( C_TARGET - 1 ))}~"
-
-        # ── BW truncation ─────────────────────────────────────────────────
         local bw_disp="$bw"
-        (( ${#bw_disp} > C_BW )) && bw_disp="${bw_disp:0:$(( C_BW - 1 ))}~"
 
-        # ── Main data row — each field padded to its column width ─────────
-        printf '| '
-        printf '%-*s  '  "$C_SN"     "$sn"
-        printf '%-*s  '  "$C_PROTO"  "${S_PROTO[$i]}"
-        printf '%-*s  '  "$C_TARGET" "$tgt"
-        printf '%*s  '   "$C_PORT"   "${S_PORT[$i]}"
-        printf '%-*s  '  "$C_BW"     "$bw_disp"
-        printf '%b%-*s%b  ' "$CYAN" "$C_SPARK" "$spark_str" "$NC"
-        printf '%*s  '   "$C_TIME"   "$td"
-        printf '%*s  '   "$C_DSCP"   "$dscp_disp"
-        printf '%b%-*s%b' "$sc" "$C_STATUS" "$sb" "$NC"
-        printf ' |\033[K\n'
+        (( ${#tgt}     > C_TARGET )) && tgt="${tgt:0:$(( C_TARGET - 1 ))}~"
+        (( ${#bw_disp} > C_BW     )) && bw_disp="${bw_disp:0:$(( C_BW - 1 ))}~"
+        (( ${#dscp_disp} > C_DSCP )) && dscp_disp="${dscp_disp:0:$(( C_DSCP - 1 ))}~"
 
-        # ── RTT row — indented under BW column, full box width ───────────
+        # ── Data row ──────────────────────────────────────────────────────
+        # Build the plain portion (no colour codes) then append the
+        # coloured status so ANSI bytes do not distort printf column widths.
+        local plain_part
+        # shellcheck disable=SC2059
+        plain_part=$(printf \
+            "%-${C_SN}s %-${C_PROTO}s %-${C_TARGET}s %${C_PORT}s %-${C_BW}s %-${C_SPARK}s %${C_TIME}s %${C_DSCP}s " \
+            "$sn" "${S_PROTO[$i]}" "$tgt" "${S_PORT[$i]}" \
+            "$bw_disp" "$spark_str" "$td" "$dscp_disp")
+        bleft "${plain_part}${sc}$(printf '%-*s' "$C_STAT" "$sb")${NC}"
+
+        # ── RTT row ───────────────────────────────────────────────────────
         local stream_tgt="${S_TARGET[$i]:-}"
         if [[ ! "$stream_tgt" =~ ^127\. && "$stream_tgt" != "::1" ]]; then
             local rtt_str; rtt_str=$(_rtt_display "$i")
@@ -5043,21 +5173,23 @@ _render_client_frame() {
         # ── Progress bar row ──────────────────────────────────────────────
         if (( show_bar && has_fixed_dur )); then
             local bar_str; bar_str=$(_render_progress_bar "$stream_elapsed" "$dur")
-            # Indent the bar to start under the BW column
-            local bar_indent=$(( 1 + C_SN + 2 + C_PROTO + 2 + \
-                                 C_TARGET + 2 + C_PORT + 2 ))
-            printf '| %*s%b%s%b |\033[K\n' \
-                "$bar_indent" '' "$DIM" "$bar_str" "$NC"
+            local bar_indent=$(( C_SN + 1 + C_PROTO + 1 + C_TARGET + 1 + C_PORT + 1 ))
+            bleft "$(printf '%*s' "$bar_indent" '')${bar_str}"
         fi
 
-        # ── Per-stream separator (thinner line between streams) ───────────
+        # Per-stream separator (between streams, not after the last)
         if (( i < STREAM_COUNT - 1 )); then
             bline '-'
         fi
     done
 
+    # ── Footer ────────────────────────────────────────────────────────────
     bline '='
-    bleft "  ${YELLOW}Ctrl+C${NC} to stop all streams  ${DIM}|${NC}  ${CYAN}[v/p]${NC} DSCP verify"
+    if _all_streams_loopback; then
+        bleft "  ${YELLOW}Ctrl+C${NC} to stop all streams"
+    else
+        bleft "  ${YELLOW}Ctrl+C${NC} to stop all streams  ${DIM}|${NC}  ${CYAN}[v/p]${NC} DSCP verify"
+    fi
     bline '='
 }
 
@@ -5068,35 +5200,44 @@ _render_server_frame() {
         [[ "$pid" != "0" ]] && kill -0 "$pid" 2>/dev/null && (( running++ ))
     done
 
-    # ── Fixed column widths ───────────────────────────────────────────────
-    #   C_SN     =  3   listener number
-    #   C_PORT   =  6   port
-    #   C_BIND   = 16   bind IP
-    #   C_VRF    = 10   VRF name
-    #   C_BW     = 13   bandwidth
-    #   C_SPARK  = 12   sparkline
-    #   C_STATUS =  9   status
-    # Sum = 3+6+16+10+13+12+9 = 69 + separators (6×2=12) = 81 → trim C_BIND=15
-    local C_SN=3 C_PORT=6 C_BIND=15 C_VRF=10
-    local C_BW=13 C_SPARK=12 C_STATUS=9
+    # ── Column widths (must sum to COLS-4 = 76 for | sp … sp | borders) ──
+    #
+    #  Inner width = COLS - 2 = 78
+    #  bleft adds 1 leading space → usable = 77
+    #
+    #  Field widths (visible chars, no separating spaces counted here):
+    #    C_SN     3    e.g. " 1"
+    #    C_PORT   5    e.g. " 5201"
+    #    C_BIND  16    e.g. " 192.168.114.200"
+    #    C_VRF    8    e.g. " vrf10   "
+    #    C_BW    13    e.g. " 941.23 Mbps "
+    #    C_SPARK 11    e.g. " ▄▄▅▃▄▅▄▆▅▄"   (1 space + 10 spark chars)
+    #    C_STAT   9    e.g. " LISTENING"
+    #
+    #  Separating spaces between fields: 6 gaps × 2 spaces = 12
+    #  Total = 3+5+16+8+13+11+9 + 12 = 77  ✓ (fits inside bleft's 1-space indent)
+    #
+    local C_SN=3 C_PORT=5 C_BIND=16 C_VRF=8
+    local C_BW=13 C_SPARK=11 C_STAT=9
+
+    # Build one reusable format string so header and every data row use
+    # exactly the same field widths — this is what guarantees alignment.
+    local ROW_FMT
+    ROW_FMT="%-${C_SN}s  %${C_PORT}s  %-${C_BIND}s  %-${C_VRF}s  %-${C_BW}s  %-${C_SPARK}s  %-${C_STAT}s"
 
     # ── Top border + title ────────────────────────────────────────────────
     bline '='
     bcenter "${BOLD}${CYAN}iperf3 Traffic Streams -- Server Dashboard${NC}"
     bline '='
+
+    # ── Summary bar ───────────────────────────────────────────────────────
     bleft "$(printf '  Listeners active: %d / %d' "$running" "$SERVER_COUNT")"
     bline '='
 
-    # ── Column header ─────────────────────────────────────────────────────
-    bleft "${BOLD}$(printf \
-        ' %-*s  %*s  %-*s  %-*s  %-*s  %-*s  %-*s' \
-        "$C_SN"     '#' \
-        "$C_PORT"   'Port' \
-        "$C_BIND"   'Bind IP' \
-        "$C_VRF"    'VRF' \
-        "$C_BW"     'Bandwidth' \
-        "$C_SPARK"  'Last 10s' \
-        "$C_STATUS" 'Status')${NC}"
+    # ── Column header (uses same ROW_FMT for perfect alignment) ──────────
+    # shellcheck disable=SC2059
+    bleft "${BOLD}$(printf "$ROW_FMT" \
+        '#' 'Port' 'Bind IP' 'VRF' 'Bandwidth' 'Last 10s' 'Status')${NC}"
     bline '-'
 
     # ── Per-listener rows ─────────────────────────────────────────────────
@@ -5104,7 +5245,7 @@ _render_server_frame() {
         local sn=$(( i + 1 )) lf="${SRV_LOGFILE[$i]:-}"
         local st; st=$(probe_server_status "$i")
 
-        # ── Bandwidth + cache logic (unchanged) ───────────────────────────
+        # ── Bandwidth ─────────────────────────────────────────────────────
         local bw
         case "$st" in
             CONNECTED|RUNNING)
@@ -5119,7 +5260,7 @@ _render_server_frame() {
             *)                  bw="---" ;;
         esac
 
-        # ── Sparkline push + render ───────────────────────────────────────
+        # ── Sparkline ─────────────────────────────────────────────────────
         if [[ ( "$st" == "CONNECTED" || "$st" == "RUNNING" ) && \
               "$bw" != "---" && -n "$bw" ]]; then
             _spark_push "s" "$i" "$bw"
@@ -5138,35 +5279,38 @@ _render_server_frame() {
             *)         sb="$st"       sc="$NC"     ;;
         esac
 
+        # ── Field value preparation ───────────────────────────────────────
         local vrf_disp="${SRV_VRF[$i]:-GRT}"
         [[ "$OS_TYPE" == "macos" ]] && vrf_disp="N/A"
+
         local bind_disp="${SRV_BIND[$i]:-0.0.0.0}"
-
-        # Truncate long bind IPs
-        (( ${#bind_disp} > C_BIND )) && \
-            bind_disp="${bind_disp:0:$(( C_BIND - 1 ))}~"
-
-        # Truncate long BW strings
         local bw_disp="$bw"
-        (( ${#bw_disp} > C_BW )) && bw_disp="${bw_disp:0:$(( C_BW - 1 ))}~"
 
-        # ── Data row ──────────────────────────────────────────────────────
-        printf '| '
-        printf '%-*s  '  "$C_SN"     "$sn"
-        printf '%*s  '   "$C_PORT"   "${SRV_PORT[$i]}"
-        printf '%-*s  '  "$C_BIND"   "$bind_disp"
-        printf '%-*s  '  "$C_VRF"    "$vrf_disp"
-        printf '%-*s  '  "$C_BW"     "$bw_disp"
-        printf '%b%-*s%b  ' "$CYAN" "$C_SPARK" "$spark_str" "$NC"
-        printf '%b%-*s%b'   "$sc"   "$C_STATUS" "$sb" "$NC"
-        printf ' |\033[K\n'
+        # Truncate fields that exceed their column width
+        (( ${#bind_disp} > C_BIND - 1 )) && \
+            bind_disp="${bind_disp:0:$(( C_BIND - 2 ))}~"
+        (( ${#vrf_disp}  > C_VRF  - 1 )) && \
+            vrf_disp="${vrf_disp:0:$(( C_VRF  - 2 ))}~"
+        (( ${#bw_disp}   > C_BW   - 1 )) && \
+            bw_disp="${bw_disp:0:$(( C_BW   - 2 ))}~"
 
-        # Per-listener separator
+        # ── Data row — status cell gets colour wrapping ───────────────────
+        # Build the plain portion first (all fields except status), then
+        # append the coloured status so ANSI bytes do not upset printf width.
+        local plain_part
+        # shellcheck disable=SC2059
+        plain_part=$(printf "%-${C_SN}s  %${C_PORT}s  %-${C_BIND}s  %-${C_VRF}s  %-${C_BW}s  %-${C_SPARK}s  " \
+            "$sn" "${SRV_PORT[$i]}" "$bind_disp" "$vrf_disp" \
+            "$bw_disp" "$spark_str")
+        bleft "${plain_part}${sc}$(printf '%-*s' "$C_STAT" "$sb")${NC}"
+
+        # Per-listener separator (between rows, not after the last)
         if (( i < SERVER_COUNT - 1 )); then
             bline '-'
         fi
     done
 
+    # ── Footer ────────────────────────────────────────────────────────────
     bline '='
     bleft "  ${YELLOW}Ctrl+C${NC} to stop all listeners"
     bline '='
@@ -5184,9 +5328,7 @@ run_dashboard() {
     local count
     [[ "$mode" == "server" ]] && count=$SERVER_COUNT || count=$STREAM_COUNT
 
-    # Probe status BEFORE calculating the pre-reserve size so the line
-    # count reflects actual current state (e.g. FAILED streams have no
-    # progress bar or RTT row).
+    # Probe status BEFORE calculating pre-reserve size
     if [[ "$mode" != "server" ]]; then
         local j
         for (( j=0; j<STREAM_COUNT; j++ )); do
@@ -5194,7 +5336,7 @@ run_dashboard() {
         done
     fi
 
-    # Calculate exact pre-reserve line count using the state-aware counters
+    # Calculate exact pre-reserve line count
     local pre_lines
     if [[ "$mode" == "server" ]]; then
         pre_lines=$(_count_server_frame_lines)
@@ -5206,19 +5348,19 @@ run_dashboard() {
     _PREV_DYNAMIC_LINES=0
     local _last_total=$pre_lines
 
-    # Print exactly pre_lines blank lines to claim vertical space, then
-    # move the cursor back to the top of the reserved block.
+    # Reserve vertical space and position cursor at top of reserved block
     local k
     for (( k=0; k<pre_lines; k++ )); do printf '\n'; done
     printf '\033[%dA' "$pre_lines"
     printf '\033[?25l'   # hide cursor
 
     local first_tick=1
+    local _dashboard_running=1
 
-    while true; do
+    # ── Main render loop ──────────────────────────────────────────────────
+    while (( _dashboard_running == 1 )); do
 
-        # Probe client status on every tick except the first (already done
-        # before the pre-reserve above).
+        # Probe client status on every tick after the first
         if (( first_tick == 0 )) && [[ "$mode" != "server" ]]; then
             local j
             for (( j=0; j<STREAM_COUNT; j++ )); do
@@ -5226,13 +5368,13 @@ run_dashboard() {
             done
         fi
 
-        # Move cursor to top of the last rendered block
+        # Move cursor to top of last rendered block (skip on first tick)
         if (( first_tick == 0 )); then
             printf '\033[%dA' "$_last_total"
         fi
         first_tick=0
 
-        # Render the appropriate frame and measure how many lines it used
+        # Render the frame and measure actual line count
         local fixed_lines
         if [[ "$mode" == "server" ]]; then
             _render_server_frame
@@ -5242,11 +5384,10 @@ run_dashboard() {
             fixed_lines=$(_count_client_frame_lines_for_state)
         fi
 
-        # Erase from cursor to end of screen (removes stale content from
-        # frames that were taller on a previous tick)
+        # Erase stale content below current frame
         printf '\033[J'
 
-        # Render dynamic panels (client mode only)
+        # Dynamic panels (client only)
         local completed_lines=0 failed_lines=0
         if [[ "$mode" != "server" ]]; then
             completed_lines=$(_count_completed_panel_lines)
@@ -5255,9 +5396,9 @@ run_dashboard() {
             (( failed_lines    > 0 )) && _render_failed_panel
         fi
 
-        # DSCP verification hint (client mode — non-loopback CONNECTED streams)
+        # DSCP hint (client, non-loopback, CONNECTED streams only)
         local _hint_lines=0
-        if [[ "$mode" != "server" ]]; then
+        if [[ "$mode" != "server" ]] && ! _all_streams_loopback; then
             local _any_verifiable=0
             local _ji
             for (( _ji=0; _ji<STREAM_COUNT; _ji++ )); do
@@ -5268,7 +5409,7 @@ run_dashboard() {
                     break
                 fi
             done
-            if (( _any_verifiable )); then
+            if (( _any_verifiable == 1 )); then
                 printf '\033[K\n'
                 printf '  %b[v/p]%b  Verify DSCP marking for a stream\033[K\n' \
                     "$DIM" "$NC"
@@ -5277,43 +5418,68 @@ run_dashboard() {
             fi
         fi
 
-        # Record total lines rendered this tick so we know how far up to
-        # move the cursor on the next tick.
+        # Record total rendered lines for next tick cursor positioning
         local dynamic_lines=$(( completed_lines + failed_lines ))
         _last_total=$(( fixed_lines + dynamic_lines + _hint_lines ))
         _PREV_DYNAMIC_LINES=$dynamic_lines
 
-        # Check whether all processes have finished
-        local any=0
+        # ── Check whether all processes have finished ─────────────────────
+        local _any_alive=0
         if [[ "$mode" == "server" ]]; then
             local j
             for (( j=0; j<SERVER_COUNT; j++ )); do
                 local pid="${SERVER_PIDS[$j]:-0}"
-                [[ "$pid" != "0" ]] && kill -0 "$pid" 2>/dev/null && any=1 && break
+                if [[ "$pid" != "0" ]] && kill -0 "$pid" 2>/dev/null; then
+                    _any_alive=1
+                    break
+                fi
             done
         else
             local j
             for (( j=0; j<STREAM_COUNT; j++ )); do
                 local pid="${STREAM_PIDS[$j]:-0}"
-                [[ "$pid" != "0" ]] && kill -0 "$pid" 2>/dev/null && any=1 && break
+                if [[ "$pid" != "0" ]] && kill -0 "$pid" 2>/dev/null; then
+                    _any_alive=1
+                    break
+                fi
             done
         fi
 
-        (( any == 0 )) && break
+        # Exit the loop when all processes have finished
+        if (( _any_alive == 0 )); then
+            _dashboard_running=0
+            continue
+        fi
 
-        # Non-blocking keyboard check (10 × 0.1 s slices = 1 second total)
+        # ── Non-blocking keyboard poll (10 × 0.1 s = 1 s per tick) ───────
         local key_pressed="" key_lower=""
         local tick_slice
         for (( tick_slice=0; tick_slice<10; tick_slice++ )); do
+            # Use a subshell-safe read that does not block the signal queue
             if IFS= read -r -s -n 1 -t 0.1 key_pressed </dev/tty 2>/dev/null; then
                 key_lower=$(printf '%s' "$key_pressed" | tr '[:upper:]' '[:lower:]')
                 break
             fi
-            key_pressed=""; key_lower=""
+            key_pressed=""
+            key_lower=""
+
+            # Check after each 0.1 s slice whether a signal was received
+            # (the trap will have set CLEANUP_DONE=1 before returning here)
+            if (( CLEANUP_DONE == 1 )); then
+                _dashboard_running=0
+                break
+            fi
         done
 
-        # Handle DSCP verification keypress (client mode only)
+        # Stop the loop immediately if cleanup was triggered by a signal
+        if (( CLEANUP_DONE == 1 )); then
+            _dashboard_running=0
+            continue
+        fi
+
+        # ── Handle DSCP verify keypress ───────────────────────────────────
         if [[ "$mode" != "server" ]] && \
+           ! _all_streams_loopback && \
            [[ "$key_lower" == "v" || "$key_lower" == "p" ]]; then
 
             printf '\033[?25h'
@@ -5321,7 +5487,7 @@ run_dashboard() {
 
             _dscp_verify_interactive
 
-            # Re-probe and recalculate after returning from interactive mode
+            # Re-probe and recalculate frame after returning
             local j
             for (( j=0; j<STREAM_COUNT; j++ )); do
                 probe_client_status "$j"
@@ -5338,9 +5504,12 @@ run_dashboard() {
             _last_total=$new_pre
             first_tick=1
         fi
-    done
 
-    printf '\033[?25h'   # restore cursor
+    done
+    # ── End of render loop ────────────────────────────────────────────────
+
+    # Restore cursor visibility
+    printf '\033[?25h'
     printf '\n'
 }
 
@@ -5604,15 +5773,13 @@ offer_log_view() {
 
 run_server_mode() {
     echo ""; print_header "Server Mode"; echo ""
-    select_bind_interface "server"
-    local bind_ip="$SELECTED_IP" vrf="$SELECTED_VRF"; echo ""
     local n
     while true; do
         read -r -p "  How many listeners? [1]: " n </dev/tty; n="${n:-1}"
         [[ "$n" =~ ^[0-9]+$ ]] && (( 10#$n >= 1 && 10#$n <= 64 )) && break
         printf '%b\n' "${RED}  Enter a positive integer (1-64).${NC}"
     done
-    configure_server_streams "$n" "$bind_ip" "$vrf"
+    configure_server_streams "$n"
     show_stream_summary "server"
     confirm_proceed "Launch ${n} listener(s)?" || return
     echo ""; launch_servers
