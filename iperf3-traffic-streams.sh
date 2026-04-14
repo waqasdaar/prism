@@ -5351,7 +5351,7 @@ _render_server_frame() {
 
     # ── Footer ────────────────────────────────────────────────────────────
     bline '='
-    bleft "  ${YELLOW}Ctrl+C${NC} to stop all listeners"
+    bleft "  ${YELLOW}Ctrl+C${NC} to stop all listeners  ${DIM}|${NC}  ${CYAN}[c]${NC} Packet capture"
     bline '='
 }
 
@@ -5463,17 +5463,19 @@ run_dashboard() {
         _PREV_DYNAMIC_LINES=$dynamic_lines
 
         # ── Check whether all processes have finished ─────────────────────
-        local _any_alive=0
-        if [[ "$mode" == "server" ]]; then
-            local j
-            for (( j=0; j<SERVER_COUNT; j++ )); do
-                local pid="${SERVER_PIDS[$j]:-0}"
-                if [[ "$pid" != "0" ]] && kill -0 "$pid" 2>/dev/null; then
-                    _any_alive=1
-                    break
-                fi
-            done
-        else
+        #
+        # Client mode: exit automatically when all iperf3 client processes
+        # have finished — the test is complete.
+        #
+        # Server mode: NEVER exit automatically based on process liveness.
+        # iperf3 server processes may exit after serving one client
+        # (--one-off / -1 mode) and that is expected and normal.
+        # The server dashboard runs until the operator presses Ctrl+C.
+        # The cleanup trap handles all process termination.
+        #
+
+        if [[ "$mode" != "server" ]]; then
+            local _any_alive=0
             local j
             for (( j=0; j<STREAM_COUNT; j++ )); do
                 local pid="${STREAM_PIDS[$j]:-0}"
@@ -5482,14 +5484,15 @@ run_dashboard() {
                     break
                 fi
             done
+
+            if (( _any_alive == 0 )); then
+                _dashboard_running=0
+                continue
+            fi
         fi
 
-        # Exit the loop when all processes have finished
-        if (( _any_alive == 0 )); then
-            _dashboard_running=0
-            continue
-        fi
-
+        # Server mode falls through — dashboard keeps running indefinitely
+        # until CLEANUP_DONE=1 is set by a signal trap (Ctrl+C etc.)
         # ── Non-blocking keyboard poll (10 × 0.1 s = 1 s per tick) ───────
         local key_pressed="" key_lower=""
         local tick_slice
@@ -5516,7 +5519,7 @@ run_dashboard() {
             continue
         fi
 
-        # ── Handle DSCP verify keypress ───────────────────────────────────
+        # ── Handle DSCP verify keypress — client mode (v or p) ───────────
         if [[ "$mode" != "server" ]] && \
            ! _all_streams_loopback && \
            [[ "$key_lower" == "v" || "$key_lower" == "p" ]]; then
@@ -5526,7 +5529,6 @@ run_dashboard() {
 
             _dscp_verify_interactive
 
-            # Re-probe and recalculate frame after returning
             local j
             for (( j=0; j<STREAM_COUNT; j++ )); do
                 probe_client_status "$j"
@@ -5534,6 +5536,26 @@ run_dashboard() {
 
             local new_pre
             new_pre=$(_count_client_frame_lines_for_state)
+            FRAME_LINES=$new_pre
+
+            for (( k=0; k<new_pre; k++ )); do printf '\n'; done
+            printf '\033[%dA' "$new_pre"
+            printf '\033[?25l'
+
+            _last_total=$new_pre
+            first_tick=1
+        fi
+
+        # ── Handle DSCP verify keypress — server mode (c) ────────────────
+        if [[ "$mode" == "server" ]] && [[ "$key_lower" == "c" ]]; then
+
+            printf '\033[?25h'
+            printf '\033[%dB' "$_last_total"
+
+            _dscp_verify_server_interactive
+
+            local new_pre
+            new_pre=$(_count_server_frame_lines)
             FRAME_LINES=$new_pre
 
             for (( k=0; k<new_pre; k++ )); do printf '\n'; done
@@ -5971,6 +5993,623 @@ run_loopback_mode() {
     echo ""; parse_final_results; display_results_table; offer_log_view
 }
 
+# ---------------------------------------------------------------------------
+# _dscp_verify_server_get_iface  <listener_index>
+#
+# Resolves the correct capture interface for a server listener.
+#
+# A server listener binds to a specific local IP address (bind IP).
+# The correct capture interface is the interface that OWNS that IP address —
+# i.e. the interface on which incoming packets arrive.
+#
+# Resolution strategy (in priority order):
+#
+#   1. PRIMARY — ip addr show lookup (Linux):
+#      Find which interface has the bind IP assigned.
+#      This is always correct for server-side capture:
+#        - For VRF listeners: returns the member interface (e.g. ens224)
+#          NOT the VRF master device (e.g. vrf10)
+#        - For GRT listeners: returns the physical/virtual interface (e.g. ens192)
+#      Command: ip -4 addr show
+#      Avoids ip route get entirely for local addresses because route lookup
+#      of a local address returns the VRF master or loopback, not the
+#      actual member interface where packets are received.
+#
+#   2. FALLBACK — ifconfig lookup (macOS):
+#      Same approach using ifconfig output.
+#
+#   3. MANUAL — returns empty string when bind is 0.0.0.0 (all interfaces)
+#      The caller (_dscp_verify_server_interactive) handles this case by
+#      presenting the operator with a manual interface selection menu.
+# ---------------------------------------------------------------------------
+
+_dscp_verify_server_get_iface() {
+    local idx="$1"
+    local bind_ip="${SRV_BIND[$idx]:-}"
+
+    # bind is 0.0.0.0 or unset — cannot resolve a single interface
+    [[ -z "$bind_ip" || "$bind_ip" == "0.0.0.0" ]] && {
+        printf '%s' ""
+        return 1
+    }
+
+    # ── Linux: find which interface owns the bind IP ──────────────────────
+    # This is the authoritative method for server-side capture because:
+    #   - Incoming packets arrive on the interface that HAS the IP
+    #   - ip route get of a local address returns the VRF master device,
+    #     not the member interface — so route lookup is wrong here
+    #   - ip addr show always returns the actual member interface
+    if [[ "$OS_TYPE" == "linux" ]]; then
+        local oif=""
+        oif=$(ip -4 addr show 2>/dev/null \
+            | awk -v ip="$bind_ip" '
+                /^[0-9]+:/ {
+                    # Extract interface name, strip trailing colon
+                    iface = $2
+                    gsub(/:$/, "", iface)
+                    # Skip VRF master devices (type vrf) — they are not
+                    # real capture interfaces. We want the member interface.
+                    # VRF masters appear in "ip addr show" but have no
+                    # real traffic — skip names that match VRF master list.
+                    current_iface = iface
+                }
+                /inet / {
+                    # Extract IP without prefix length (e.g. "192.168.1.1/24" → "192.168.1.1")
+                    split($2, a, "/")
+                    if (a[1] == ip) {
+                        print current_iface
+                        exit
+                    }
+                }
+            ')
+
+        if [[ -n "$oif" ]]; then
+            # Verify the resolved interface is not a VRF master device.
+            # A VRF master can appear in "ip addr show" with an IP only
+            # when the VRF itself has an IP (unusual but possible).
+            # Check: if the interface is of type "vrf" in ip-link, reject it.
+            local is_vrf_master=0
+            if ip -d link show dev "$oif" 2>/dev/null | grep -q ' vrf '; then
+                is_vrf_master=1
+            fi
+
+            if (( is_vrf_master == 0 )); then
+                printf '%s' "$oif"
+                return 0
+            fi
+
+            # Interface is a VRF master — find the member interface that
+            # owns this IP inside the VRF
+            local vrf="${SRV_VRF[$idx]:-}"
+            if [[ -n "$vrf" ]]; then
+                local member_iface=""
+                member_iface=$(ip link show master "${vrf}" 2>/dev/null \
+                    | awk '/^[0-9]+:/ {
+                        iface = $2; gsub(/:$/, "", iface); print iface
+                    }' \
+                    | while read -r candidate; do
+                        # Check if this member interface has the bind IP
+                        if ip -4 addr show dev "$candidate" 2>/dev/null \
+                           | grep -q "${bind_ip}/"; then
+                            printf '%s' "$candidate"
+                            break
+                        fi
+                    done)
+                if [[ -n "$member_iface" ]]; then
+                    printf '%s' "$member_iface"
+                    return 0
+                fi
+            fi
+        fi
+
+        # addr show found nothing — this bind IP is not locally assigned
+        printf '%s' ""
+        return 1
+    fi
+
+    # ── macOS: find which interface owns the bind IP ──────────────────────
+    if [[ "$OS_TYPE" == "macos" ]]; then
+        local oif=""
+        oif=$(ifconfig 2>/dev/null \
+            | awk -v ip="$bind_ip" '
+                /^[a-z]/ {
+                    iface = $1
+                    gsub(/:$/, "", iface)
+                }
+                /inet / {
+                    if ($2 == ip) { print iface; exit }
+                }
+            ')
+        if [[ -n "$oif" ]]; then
+            printf '%s' "$oif"
+            return 0
+        fi
+        printf '%s' ""
+        return 1
+    fi
+
+    printf '%s' ""
+    return 1
+}
+
+# ---------------------------------------------------------------------------
+# _dscp_verify_server_run  <listener_index>  <capture_interface>
+#
+# Runs tcpdump on the resolved interface for the given server listener.
+# Captures incoming iperf3 traffic and reports:
+#   - Source IP:Port  (iperf3 client)
+#   - Destination IP:Port  (this server listener)
+#   - TOS hex byte
+#   - DSCP decimal value
+#   - PASS/FAIL verdict against the expected DSCP (if configured)
+#
+# Unlike the client-side verification which filters on dst host+port,
+# the server-side filter captures INCOMING traffic TO the listener port,
+# so the filter is:  tcp/udp dst port <port>
+# When a specific bind IP is set the filter is additionally narrowed to:
+#   dst host <bind_ip> and dst port <port>
+# ---------------------------------------------------------------------------
+_dscp_verify_server_run() {
+    local idx="$1"
+    local iface="$2"
+    local inner=$(( COLS - 2 ))
+
+    local port="${SRV_PORT[$idx]:-}"
+    local bind_ip="${SRV_BIND[$idx]:-}"
+    local vrf="${SRV_VRF[$idx]:-}"
+    local listener_num=$(( idx + 1 ))
+
+    # ── Display header ────────────────────────────────────────────────────
+    printf '\n'
+    printf '+%s+\n' "$(rpt '=' "$inner")"
+    bcenter "${BOLD}${CYAN}DSCP Verification — Server Listener ${listener_num}${NC}"
+    printf '+%s+\n' "$(rpt '=' "$inner")"
+
+    local vrf_label
+    [[ -n "$vrf" ]] && vrf_label="VRF: ${vrf}" || vrf_label="GRT"
+
+    bleft "  Listener : ${BOLD}port ${port}${NC}  (${vrf_label})"
+    if [[ -n "$bind_ip" && "$bind_ip" != "0.0.0.0" ]]; then
+        bleft "  Bind IP  : ${BOLD}${bind_ip}${NC}"
+        bleft "  ${DIM}Interface resolved via: ip -4 addr show (interface owning ${bind_ip})${NC}"
+    else
+        bleft "  Bind IP  : ${BOLD}0.0.0.0 (all interfaces)${NC}"
+        bleft "  ${DIM}Interface selected manually (bind is 0.0.0.0)${NC}"
+    fi
+    bleft "  Interface: ${BOLD}${iface}${NC}"
+    printf '+%s+\n' "$(rpt '-' "$inner")"
+
+    # ── Check tcpdump ─────────────────────────────────────────────────────
+    local tcpdump_result
+    tcpdump_result=$(_dscp_verify_check_tcpdump)
+    local tcpdump_rc=$?
+
+    if (( tcpdump_rc != 0 )); then
+        case "$tcpdump_result" in
+            NOTFOUND)
+                bleft "  ${RED}✗ tcpdump not found.${NC}"
+                bleft "  ${DIM}Install: apt install tcpdump  |  yum install tcpdump${NC}"
+                ;;
+            NOPERM)
+                bleft "  ${RED}✗ Insufficient privileges for tcpdump.${NC}"
+                bleft "  ${DIM}Run as root or grant sudo access for tcpdump.${NC}"
+                ;;
+        esac
+        printf '+%s+\n' "$(rpt '=' "$inner")"
+        return 1
+    fi
+
+    local tcpdump_bin="$tcpdump_result"
+
+    # ── Check listener status ─────────────────────────────────────────────
+    local srv_state="${SRV_PREV_STATE[$idx]:-STARTING}"
+    if [[ "$srv_state" != "CONNECTED" && "$srv_state" != "RUNNING" ]]; then
+        bleft "  ${YELLOW}⚠ Listener ${listener_num} has no active client (state: ${srv_state}).${NC}"
+        bleft "  ${DIM}Traffic may not be flowing — capture may return no results.${NC}"
+        printf '+%s+\n' "$(rpt '-' "$inner")"
+    fi
+
+    bleft "  ${DIM}Capturing up to 50 packets (3 second window)...${NC}"
+    printf '+%s+\n' "$(rpt '-' "$inner")"
+
+    # ── Build tcpdump filter ───────────────────────────────────────────────
+    # Server side: capture INCOMING traffic arriving at the listener port.
+    # Filter by destination port (always).  Also filter by destination host
+    # when a specific bind IP is set to avoid capturing unrelated traffic
+    # on shared interfaces.
+    local proto_filter="tcp or udp"
+    local tcpdump_filter
+
+    if [[ -n "$bind_ip" && "$bind_ip" != "0.0.0.0" ]]; then
+        tcpdump_filter="dst host ${bind_ip} and dst port ${port}"
+    else
+        tcpdump_filter="dst port ${port}"
+    fi
+
+    # ── Run tcpdump ───────────────────────────────────────────────────────
+    local capture_file="${TMPDIR}/dscp_srv_cap_${idx}_$$.txt"
+    local capture_cmd
+
+    if (( IS_ROOT == 1 )); then
+        capture_cmd="${tcpdump_bin} -i ${iface} -v -n -l -c 50 ${tcpdump_filter}"
+    else
+        capture_cmd="sudo ${tcpdump_bin} -i ${iface} -v -n -l -c 50 ${tcpdump_filter}"
+    fi
+
+    timeout 3 bash -c "${capture_cmd}" > "$capture_file" 2>&1
+
+    if [[ ! -f "$capture_file" || ! -s "$capture_file" ]]; then
+        bleft "  ${YELLOW}⚠ No output from tcpdump.${NC}"
+        bleft "  ${DIM}Ensure a client is actively sending to this listener and retry.${NC}"
+        printf '+%s+\n' "$(rpt '=' "$inner")"
+        rm -f "$capture_file"
+        return 1
+    fi
+
+    if grep -qiE 'permission denied|Operation not permitted|No such device' \
+            "$capture_file" 2>/dev/null; then
+        bleft "  ${RED}✗ tcpdump error:${NC}"
+        local err_line
+        err_line=$(grep -iE 'permission denied|Operation not permitted|No such device' \
+            "$capture_file" 2>/dev/null | head -1)
+        bleft "  ${DIM}${err_line}${NC}"
+        printf '+%s+\n' "$(rpt '=' "$inner")"
+        rm -f "$capture_file"
+        return 1
+    fi
+
+    # ── Merge continuation lines ──────────────────────────────────────────
+    local merged_file="${TMPDIR}/dscp_srv_merged_${idx}_$$.txt"
+    awk '
+        /^[[:space:]]/ && NR > 1 { printf " %s", $0; next }
+        NR > 1 { print "" }
+        { printf "%s", $0 }
+        END { print "" }
+    ' "$capture_file" > "$merged_file"
+
+    # ── Parse and display packets ─────────────────────────────────────────
+    bleft "  ${BOLD}$(printf '%-4s  %-21s  %-21s  %-6s  %-4s  %-6s' \
+        'Pkt' 'Source IP:Port' 'Destination IP:Port' 'TOS' 'DSCP' 'DSCP Name')${NC}"
+    printf '+%s+\n' "$(rpt '-' "$inner")"
+
+    local pkt_num=0
+    local dscp_counts=""   # colon-separated "dscp:count" pairs for summary
+
+    while IFS= read -r merged_line; do
+        echo "$merged_line" | grep -qiE 'tos 0x' || continue
+        echo "$merged_line" | grep -qE '>'        || continue
+
+        # Extract TOS hex
+        local tos_hex
+        tos_hex=$(printf '%s' "$merged_line" \
+            | grep -oE 'tos 0x[0-9a-fA-F]+' \
+            | awk '{print $2}' | head -1)
+        [[ -z "$tos_hex" ]] && continue
+
+        # Extract src > dst address pair
+        local addr_match
+        addr_match=$(printf '%s' "$merged_line" | grep -oE \
+            '[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}[.:][0-9]+ +> +[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}[.:][0-9]+' \
+            | head -1)
+        [[ -z "$addr_match" ]] && continue
+
+        local src_raw dst_raw
+        src_raw=$(printf '%s' "$addr_match" | awk '{print $1}')
+        dst_raw=$(printf '%s' "$addr_match" | awk '{print $3}')
+
+        # Convert dot-notation port to colon notation for display
+        local src_disp dst_disp
+        src_disp=$(printf '%s' "$src_raw" | awk -F'.' '{
+            if (NF==5) printf "%s.%s.%s.%s:%s",$1,$2,$3,$4,$5
+            else       print $0 }')
+        dst_disp=$(printf '%s' "$dst_raw" | awk -F'.' '{
+            if (NF==5) printf "%s.%s.%s.%s:%s",$1,$2,$3,$4,$5
+            else       print $0 }')
+
+        # Calculate DSCP from TOS byte
+        local tos_dec captured_dscp
+        tos_dec=$(( 16#${tos_hex#0x} ))
+        captured_dscp=$(( tos_dec >> 2 ))
+
+        # Resolve DSCP name for display
+        local dscp_name
+        dscp_name=$(awk -v d="$captured_dscp" 'BEGIN {
+            m[0]="CS0/BE"; m[8]="CS1";  m[10]="AF11"; m[12]="AF12"
+            m[14]="AF13";  m[16]="CS2"; m[18]="AF21"; m[20]="AF22"
+            m[22]="AF23";  m[24]="CS3"; m[26]="AF31"; m[28]="AF32"
+            m[30]="AF33";  m[32]="CS4"; m[34]="AF41"; m[36]="AF42"
+            m[38]="AF43";  m[40]="CS5"; m[44]="VA";   m[46]="EF"
+            m[48]="CS6";   m[56]="CS7"
+            if (d in m) print m[d]
+            else         printf "DSCP-%d", d
+        }')
+
+        # Colour the DSCP name
+        local dscp_col="$GREEN"
+        case "$dscp_name" in
+            CS0/BE)             dscp_col="$DIM"    ;;
+            EF)                 dscp_col="$CYAN"   ;;
+            AF4*|CS5|CS6|CS7)   dscp_col="$YELLOW" ;;
+        esac
+
+        (( pkt_num++ ))
+
+        # Track DSCP value counts for summary
+        local _found_dscp=0
+        local _new_counts=""
+        local _entry
+        while IFS= read -r _entry; do
+            [[ -z "$_entry" ]] && continue
+            local _d _c
+            IFS=':' read -r _d _c <<< "$_entry"
+            if [[ "$_d" == "$captured_dscp" ]]; then
+                _c=$(( _c + 1 ))
+                _found_dscp=1
+            fi
+            _new_counts+="${_d}:${_c}"$'\n'
+        done <<< "$dscp_counts"
+        if (( _found_dscp == 0 )); then
+            _new_counts+="${captured_dscp}:1"$'\n'
+        fi
+        dscp_counts="$_new_counts"
+
+        # Display up to 20 rows
+        if (( pkt_num <= 20 )); then
+            (( ${#src_disp} > 21 )) && src_disp="${src_disp:0:20}~"
+            (( ${#dst_disp} > 21 )) && dst_disp="${dst_disp:0:20}~"
+
+            local row_pfx
+            row_pfx=$(printf '%-4d  %-21s  %-21s  %-6s  %-4d  ' \
+                "$pkt_num" "$src_disp" "$dst_disp" "$tos_hex" "$captured_dscp")
+            bleft " ${row_pfx}${dscp_col}${dscp_name}${NC}"
+        fi
+
+    done < "$merged_file"
+
+    rm -f "$capture_file" "$merged_file"
+
+    # ── Summary ───────────────────────────────────────────────────────────
+    printf '+%s+\n' "$(rpt '-' "$inner")"
+
+    if (( pkt_num == 0 )); then
+        bleft "  ${YELLOW}⚠ No packets with TOS field found in capture.${NC}"
+        bleft "  ${DIM}Ensure a client is actively sending to port ${port} and retry.${NC}"
+    else
+        (( pkt_num > 20 )) && \
+            bleft "  ${DIM}(Showing first 20 of ${pkt_num} packets captured)${NC}"
+
+        bleft "  ${BOLD}Packets captured: ${pkt_num}${NC}"
+        bleft "  ${BOLD}DSCP values observed:${NC}"
+
+        local _entry
+        while IFS= read -r _entry; do
+            [[ -z "$_entry" ]] && continue
+            local _d _c
+            IFS=':' read -r _d _c <<< "$_entry"
+            local _name
+            _name=$(awk -v d="$_d" 'BEGIN {
+                m[0]="CS0/BE"; m[8]="CS1";  m[10]="AF11"; m[12]="AF12"
+                m[14]="AF13";  m[16]="CS2"; m[18]="AF21"; m[20]="AF22"
+                m[22]="AF23";  m[24]="CS3"; m[26]="AF31"; m[28]="AF32"
+                m[30]="AF33";  m[32]="CS4"; m[34]="AF41"; m[36]="AF42"
+                m[38]="AF43";  m[40]="CS5"; m[44]="VA";   m[46]="EF"
+                m[48]="CS6";   m[56]="CS7"
+                if (d in m) print m[d]
+                else         printf "DSCP-%d", d
+            }')
+            bleft "    ${CYAN}DSCP ${_d}${NC}  ${DIM}(${_name})${NC}  — ${_c} packet(s)"
+        done <<< "$dscp_counts"
+    fi
+
+    printf '+%s+\n' "$(rpt '=' "$inner")"
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# _dscp_verify_server_interactive
+#
+# Called from the server dashboard when the operator presses c/C.
+# Presents a listener selection menu, resolves the capture interface using
+# ip route get (VRF or GRT), and runs _dscp_verify_server_run.
+# ---------------------------------------------------------------------------
+
+_dscp_verify_server_interactive() {
+    local inner=$(( COLS - 2 ))
+
+    printf '\033[?25h'
+    printf '\n'
+
+    if (( SERVER_COUNT == 0 )); then
+        printf '+%s+\n' "$(rpt '=' "$inner")"
+        bcenter "${BOLD}${CYAN}Packet Capture — Server${NC}"
+        printf '+%s+\n' "$(rpt '=' "$inner")"
+        bleft "  ${YELLOW}⚠ No server listeners configured.${NC}"
+        printf '+%s+\n' "$(rpt '=' "$inner")"
+        printf '\n'
+        read -r -p "  Press Enter to return to dashboard..." </dev/tty
+        printf '\033[?25l'
+        return 0
+    fi
+
+    # ── Refresh listener state before showing selection menu ─────────────
+    # probe_server_status updates SRV_PREV_STATE[] with the current live
+    # state so the selection table shows CONNECTED/RUNNING/LISTENING etc.
+    # instead of STARTING (which is the initial value before the first
+    # dashboard tick runs probe_server_status).
+    local i
+    for (( i=0; i<SERVER_COUNT; i++ )); do
+        probe_server_status "$i" > /dev/null
+    done
+
+    # ── Column widths for the selection table ─────────────────────────────
+    # Inner usable width after bleft 1-space indent = COLS - 3 = 77
+    # Fields: #(3) Port(6) BindIP(16) VRF(10) Status(10) = 45 + 4 gaps(4) = 49
+    local SC_SN=3 SC_PORT=6 SC_BIND=16 SC_VRF=10 SC_STAT=10
+
+    # ── Listener selection ────────────────────────────────────────────────
+    local selected_idx=-1
+
+    if (( SERVER_COUNT == 1 )); then
+        selected_idx=0
+    else
+        printf '+%s+\n' "$(rpt '=' "$inner")"
+        bcenter "${BOLD}${CYAN}Packet Capture — Select Listener${NC}"
+        printf '+%s+\n' "$(rpt '=' "$inner")"
+
+        # Header row — fixed column widths
+        bleft "${BOLD}$(printf \
+            ' %-*s  %*s  %-*s  %-*s  %-*s' \
+            "$SC_SN"   '#' \
+            "$SC_PORT" 'Port' \
+            "$SC_BIND" 'Bind IP' \
+            "$SC_VRF"  'VRF' \
+            "$SC_STAT" 'Status')${NC}"
+        printf '+%s+\n' "$(rpt '-' "$inner")"
+
+        for (( i=0; i<SERVER_COUNT; i++ )); do
+            local sn=$(( i + 1 ))
+            # Use refreshed state from SRV_PREV_STATE
+            local st="${SRV_PREV_STATE[$i]:-UNKNOWN}"
+            local bind_disp="${SRV_BIND[$i]:-0.0.0.0}"
+            local vrf_disp="${SRV_VRF[$i]:-GRT}"
+
+            # Truncate long fields
+            (( ${#bind_disp} > SC_BIND )) && \
+                bind_disp="${bind_disp:0:$(( SC_BIND - 1 ))}~"
+            (( ${#vrf_disp}  > SC_VRF  )) && \
+                vrf_disp="${vrf_disp:0:$(( SC_VRF - 1 ))}~"
+
+            # Status colour
+            local st_col
+            case "$st" in
+                CONNECTED) st_col="${GREEN}"  ;;
+                RUNNING)   st_col="${CYAN}"   ;;
+                LISTENING) st_col="${BLUE}"   ;;
+                DONE)      st_col="${DIM}"    ;;
+                FAILED)    st_col="${RED}"    ;;
+                *)         st_col="${YELLOW}" ;;
+            esac
+
+            # Build plain portion then append coloured status
+            local plain_part
+            plain_part=$(printf ' %-*s  %*s  %-*s  %-*s  ' \
+                "$SC_SN"   "$sn" \
+                "$SC_PORT" "${SRV_PORT[$i]}" \
+                "$SC_BIND" "$bind_disp" \
+                "$SC_VRF"  "$vrf_disp")
+            bleft "${plain_part}${st_col}$(printf '%-*s' "$SC_STAT" "$st")${NC}"
+
+            # Separator between listeners (not after last)
+            if (( i < SERVER_COUNT - 1 )); then
+                printf '+%s+\n' "$(rpt '-' "$inner")"
+            fi
+        done
+
+        printf '+%s+\n' "$(rpt '=' "$inner")"
+        printf '\n'
+
+        local sel_raw sel_lower
+        while true; do
+            read -r -p "  Listener number to capture (or q to cancel): " \
+                sel_raw </dev/tty
+            sel_lower=$(printf '%s' "$sel_raw" | tr '[:upper:]' '[:lower:]')
+            [[ "$sel_lower" == "q" || -z "$sel_raw" ]] && {
+                printf '\033[?25l'; return 0
+            }
+            if [[ "$sel_raw" =~ ^[0-9]+$ ]] && \
+               (( 10#$sel_raw >= 1 && 10#$sel_raw <= SERVER_COUNT )); then
+                selected_idx=$(( 10#$sel_raw - 1 ))
+                break
+            fi
+            printf '%b\n' \
+                "${RED}  Enter a listener number 1-${SERVER_COUNT} or q to cancel.${NC}"
+        done
+    fi
+
+    # ── Resolve capture interface ─────────────────────────────────────────
+    local iface
+    iface=$(_dscp_verify_server_get_iface "$selected_idx")
+
+    # When bind is 0.0.0.0 or resolution fails, offer manual selection
+    if [[ -z "$iface" ]]; then
+        printf '\n'
+        printf '+%s+\n' "$(rpt '=' "$inner")"
+        bcenter "${BOLD}${CYAN}Packet Capture — Select Interface${NC}"
+        printf '+%s+\n' "$(rpt '=' "$inner")"
+        bleft "  ${YELLOW}Cannot auto-resolve interface (bind is 0.0.0.0 or lookup failed).${NC}"
+        bleft "  ${DIM}Select the interface to capture on:${NC}"
+        printf '+%s+\n' "$(rpt '-' "$inner")"
+
+        # Interface table column widths
+        local IC_SN=3 IC_IF=16 IC_IP=15 IC_VRF=10
+        bleft "${BOLD}$(printf ' %-*s  %-*s  %-*s  %-*s' \
+            "$IC_SN" '#' "$IC_IF" 'Interface' "$IC_IP" 'IP Address' \
+            "$IC_VRF" 'VRF')${NC}"
+        printf '+%s+\n' "$(rpt '-' "$inner")"
+
+        get_interface_list
+
+        local vrf_filter="${SRV_VRF[$selected_idx]:-}"
+        local j disp_idx=0
+        local -a selectable_ifaces=()
+
+        for (( j=0; j<${#IFACE_NAMES[@]}; j++ )); do
+            local iface_vrf="${IFACE_VRFS[$j]:-GRT}"
+            if [[ ( -z "$vrf_filter" && "$iface_vrf" == "GRT" ) || \
+                  ( -n "$vrf_filter" && "$iface_vrf" == "$vrf_filter" ) ]]; then
+                (( disp_idx++ ))
+                selectable_ifaces+=("${IFACE_NAMES[$j]}")
+                local if_disp="${IFACE_NAMES[$j]}"
+                local ip_disp="${IFACE_IPS[$j]}"
+                (( ${#if_disp} > IC_IF )) && if_disp="${if_disp:0:$(( IC_IF-1 ))}~"
+                (( ${#ip_disp} > IC_IP )) && ip_disp="${ip_disp:0:$(( IC_IP-1 ))}~"
+                bleft "$(printf ' %-*s  %-*s  %-*s  %-*s' \
+                    "$IC_SN"  "$disp_idx" \
+                    "$IC_IF"  "$if_disp" \
+                    "$IC_IP"  "$ip_disp" \
+                    "$IC_VRF" "$iface_vrf")"
+            fi
+        done
+
+        printf '+%s+\n' "$(rpt '=' "$inner")"
+        printf '\n'
+
+        if (( ${#selectable_ifaces[@]} == 0 )); then
+            printf '%b\n' "${RED}  No interfaces found for this listener.${NC}"
+            read -r -p "  Press Enter to return to dashboard..." </dev/tty
+            printf '\033[?25l'
+            return 1
+        fi
+
+        local iface_sel
+        while true; do
+            read -r -p "  Interface number (or q to cancel): " iface_sel </dev/tty
+            local iface_lower
+            iface_lower=$(printf '%s' "$iface_sel" | tr '[:upper:]' '[:lower:]')
+            [[ "$iface_lower" == "q" || -z "$iface_sel" ]] && {
+                printf '\033[?25l'; return 0
+            }
+            if [[ "$iface_sel" =~ ^[0-9]+$ ]] && \
+               (( 10#$iface_sel >= 1 && \
+                  10#$iface_sel <= ${#selectable_ifaces[@]} )); then
+                iface="${selectable_ifaces[$(( 10#$iface_sel - 1 ))]}"
+                break
+            fi
+            printf '%b\n' \
+                "${RED}  Enter 1-${#selectable_ifaces[@]} or q to cancel.${NC}"
+        done
+    fi
+
+    # ── Run capture ───────────────────────────────────────────────────────
+    _dscp_verify_server_run "$selected_idx" "$iface"
+
+    printf '\n'
+    read -r -p "  Press Enter to return to dashboard..." </dev/tty
+    printf '\033[?25l'
+    return 0
+}
+
+
 # =============================================================================
 # SECTION 15 — MAIN MENU
 # =============================================================================
@@ -6020,28 +6659,65 @@ main_menu() {
             2)
                 build_vrf_maps; get_interface_list; run_server_mode; echo ""
                 read -r -p "  Press Enter to return to menu..." </dev/tty
-                SERVER_COUNT=0; SERVER_PIDS=()
+                # Reset configuration only — PIDs already cleaned by
+                # run_dashboard exit / cleanup trap during the session
+                SERVER_COUNT=0
                 SRV_PORT=(); SRV_BIND=(); SRV_VRF=()
                 SRV_ONEOFF=(); SRV_LOGFILE=(); SRV_SCRIPT=()
-                SRV_PREV_STATE=(); SRV_BW_CACHE=() ;;
+                SRV_PREV_STATE=(); SRV_BW_CACHE=()
+                SERVER_PIDS=()
+                ;;
             3)
                 build_vrf_maps; get_interface_list; run_client_mode; echo ""
                 read -r -p "  Press Enter to return to menu..." </dev/tty
-                STREAM_COUNT=0; STREAM_PIDS=(); NETEM_IFACES=()
+                # Reset configuration only
+                STREAM_COUNT=0
+                NETEM_IFACES=()
+                S_PROTO=();  S_TARGET=(); S_PORT=();   S_BW=()
+                S_DURATION=(); S_DSCP_NAME=(); S_DSCP_VAL=()
+                S_PARALLEL=(); S_REVERSE=(); S_CCA=()
+                S_WINDOW=();   S_MSS=();    S_BIND=()
+                S_VRF=();      S_DELAY=();  S_JITTER=(); S_LOSS=()
+                S_NOFQ=();     S_LOGFILE=(); S_SCRIPT=()
+                S_START_TS=(); S_STATUS_CACHE=(); S_ERROR_MSG=()
+                S_FINAL_SENDER_BW=(); S_FINAL_RECEIVER_BW=()
+                STREAM_PIDS=()
+                PING_PIDS=();  PING_LOGFILES=()
+                S_RTT_MIN=();  S_RTT_AVG=();  S_RTT_MAX=()
+                S_RTT_JITTER=(); S_RTT_LOSS=(); S_RTT_SAMPLES=()
                 if (( BASH_MAJOR >= 4 )); then
                     PMTU_RESULTS=(); PMTU_STATUS=(); PMTU_RECOMMEND=()
-                fi ;;
+                fi
+                ;;
             4)
                 build_vrf_maps; get_interface_list; run_loopback_mode; echo ""
                 read -r -p "  Press Enter to return to menu..." </dev/tty
+                # Reset configuration only
                 STREAM_COUNT=0; SERVER_COUNT=0
-                STREAM_PIDS=(); SERVER_PIDS=(); NETEM_IFACES=()
-                SRV_PREV_STATE=(); SRV_BW_CACHE=() ;;
+                NETEM_IFACES=()
+                SRV_PORT=(); SRV_BIND=(); SRV_VRF=()
+                SRV_ONEOFF=(); SRV_LOGFILE=(); SRV_SCRIPT=()
+                SRV_PREV_STATE=(); SRV_BW_CACHE=()
+                S_PROTO=();  S_TARGET=(); S_PORT=();   S_BW=()
+                S_DURATION=(); S_DSCP_NAME=(); S_DSCP_VAL=()
+                S_PARALLEL=(); S_REVERSE=(); S_CCA=()
+                S_WINDOW=();   S_MSS=();    S_BIND=()
+                S_VRF=();      S_DELAY=();  S_JITTER=(); S_LOSS=()
+                S_NOFQ=();     S_LOGFILE=(); S_SCRIPT=()
+                S_START_TS=(); S_STATUS_CACHE=(); S_ERROR_MSG=()
+                S_FINAL_SENDER_BW=(); S_FINAL_RECEIVER_BW=()
+                STREAM_PIDS=(); SERVER_PIDS=()
+                PING_PIDS=();   PING_LOGFILES=()
+                S_RTT_MIN=();   S_RTT_AVG=();  S_RTT_MAX=()
+                S_RTT_JITTER=(); S_RTT_LOSS=(); S_RTT_SAMPLES=()
+                ;;
             5)
                 echo ""; show_dscp_table
                 read -r -p "  Press Enter to return to menu..." </dev/tty ;;
             6|q|Q)
-                echo ""; printf '%b\n' "${GREEN}  Goodbye!${NC}"; echo ""; exit 0 ;;
+                echo ""; printf '%b\n' "${GREEN}  Goodbye! Cleaning up...${NC}"; echo "";
+                cleanup "user exit (option 6)"
+                exit 0 ;;
             "") ;;
             *)
                 printf '%b\n' "${RED}  Invalid choice '${choice}'. Enter 1 to 6.${NC}"
