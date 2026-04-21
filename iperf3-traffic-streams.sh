@@ -1922,8 +1922,15 @@ configure_client_streams() {
         done
         S_PARALLEL+=("$pv")
 
+        local rev=0
+
+        # Only prompt for reverse mode if bidirectional is not going to be
+        # enabled. The reverse and bidir flags are mutually exclusive in iperf3.
+        # Bidir is configured after this block — if the user enables bidir,
+        # any reverse setting here is ignored in build_client_command().
+
         local ri; read -r -p "  Reverse mode -R? [no]: " ri </dev/tty
-        local rev=0; [[ "$ri" =~ ^[Yy] ]] && rev=1
+        [[ "$ri" =~ ^[Yy] ]] && rev=1
         S_REVERSE+=("$rev")
 
         local cca="" win="" mss=""
@@ -2164,7 +2171,7 @@ configure_client_streams() {
         fi
         S_NOFQ+=("$nofq")
 
-        # ── Bidirectional simultaneous test  ★ NEW IN v8.2.4 ★ ───────────
+        # ── Bidirectional simultaneous test  ★ NEW IN v8.2.5 ★ ───────────
         local bidir=0
         echo ""
         printf '%b\n' "${CYAN}  -- Bidirectional Test --${NC}"
@@ -2173,6 +2180,20 @@ configure_client_streams() {
             bdi </dev/tty
         if [[ "$bdi" =~ ^[Yy] ]]; then
             bidir=1
+
+            # If reverse mode was previously enabled, clear it now.
+            # --bidir and -R are mutually exclusive in iperf3 >= 3.7.
+            # --bidir supersedes -R since it measures both directions.
+
+            if (( rev == 1 )); then
+                S_REVERSE[-1]=0
+                rev=0
+                printf '%b\n' \
+                    "${YELLOW}  NOTE: Reverse mode (-R) cleared â --bidir supersedes it.${NC}"
+                printf '%b\n' \
+                    "${YELLOW}        --bidir measures both TX and RX simultaneously.${NC}"
+            fi
+
             if (( BIDIR_SUPPORTED )); then
                 printf '%b\n' \
                     "${GREEN}  Bidirectional enabled via --bidir flag (iperf3 >= 3.7).${NC}"
@@ -3273,7 +3294,17 @@ build_client_command() {
     fi
     cmd+=" -i 1"
     (( S_PARALLEL[$idx] > 1 ))  && cmd+=" -P ${S_PARALLEL[$idx]}"
-    (( S_REVERSE[$idx]  == 1 )) && cmd+=" -R"
+
+    # Do not add -R when --bidir is enabled. The two flags are mutually
+    # exclusive. --bidir already measures both TX and RX simultaneously.
+    # Adding -R with --bidir causes iperf3 to exit immediately with:
+    # "parameter error - cannot be both reverse and bidirectional"
+
+    if (( S_REVERSE[$idx] == 1 )); then
+        if [[ "${S_BIDIR[$idx]:-0}" != "1" || (( BIDIR_SUPPORTED == 0 )) ]]; then
+            cmd+=" -R"
+        fi
+    fi
     if [[ -n "${S_DSCP_VAL[$idx]}" ]] && (( S_DSCP_VAL[$idx] >= 0 )); then
         cmd+=" -S $(( S_DSCP_VAL[$idx] * 4 ))"
     fi
