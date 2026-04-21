@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
 # iperf3-traffic-streams.sh — Enterprise-grade iperf3 multi-stream traffic manager
-# Version: 8.2.1.1
+# Version: 8.2.5
 # Author : Waqas Daar (waqasdaar@gmail.com)
 # =============================================================================
 
@@ -199,6 +199,7 @@ declare -a IFACE_IPS=()
 declare -a IFACE_STATES=()
 declare -a IFACE_SPEEDS=()
 declare -a IFACE_VRFS=()
+declare -a S_CLEANUP_QUEUED=()   # 1 = cleanup already triggered for stream i
 
 STREAM_COUNT=0
 SERVER_COUNT=0
@@ -208,12 +209,30 @@ PROMPT_DSCP_VAL=-1
 SELECTED_IFACE=""
 SELECTED_IP=""
 SELECTED_VRF=""
+BIDIR_SUPPORTED=0
 _PREV_DYNAMIC_LINES=0
 
 
-# =============================================================================
-# RTT & LATENCY STATE  ★ NEW IN v8.2.3 ★
-# =============================================================================
+# When a stream is configured for bidirectional simultaneous testing, a second
+# iperf3 process is launched with --reverse (-R) alongside the forward stream.
+# Both processes run in parallel for the full test duration.
+#
+#   S_BIDIR[$i]        1 = bidirectional enabled, 0 = unidirectional
+#   BIDIR_PIDS[$i]     PID of the reverse iperf3 process
+#   BIDIR_LOGFILES[$i] log file path for the reverse process
+#   S_BIDIR_BW[$i]     current live RX bandwidth string (from reverse log)
+#   S_BIDIR_SPARK[$i]  sparkline variable name suffix for reverse direction
+#
+# Sparkline ring buffers for reverse direction follow the same naming as
+# the forward direction but use role prefix "r" instead of "c":
+#   _SPARK_r_<idx>
+
+declare -a S_BIDIR=()
+declare -a BIDIR_PIDS=()
+declare -a BIDIR_LOGFILES=()
+declare -a S_BIDIR_BW=()
+
+
 # Parallel ping process tracking and live RTT state per client stream.
 # One background ping process runs alongside each iperf3 client stream.
 # RTT values are parsed from the ping log on every dashboard tick.
@@ -660,6 +679,256 @@ parse_live_bandwidth_from_log() {
     fi
 }
 
+# ---------------------------------------------------------------------------
+# _parse_bidir_bw_from_log  <logfile>  <direction>
+#
+# Parses bandwidth from an iperf3 --bidir log file (client side).
+#
+# iperf3 --bidir client log formats:
+#
+#   iperf3 >= 3.7 compound format (stream ID + role in adjacent brackets):
+#     [  5][TX-C]   0.00-1.00   sec   112 MBytes   940 Mbits/sec
+#     [  8][RX-C]   0.00-1.00   sec   108 MBytes   906 Mbits/sec
+#     [SUM][TX-C]   0.00-1.00   sec   ...   (parallel streams)
+#     [SUM][RX-C]   0.00-1.00   sec   ...   (parallel streams)
+#
+#   Standalone role format (some builds):
+#     [TX-C]   0.00-1.00   sec   112 MBytes   940 Mbits/sec
+#     [RX-C]   0.00-1.00   sec   108 MBytes   906 Mbits/sec
+#
+# direction "tx" → look for [TX-C] tagged lines (client transmit)
+# direction "rx" → look for [RX-C] tagged lines (client receive)
+#
+# SUM lines are always preferred over individual stream lines because they
+# carry the correct aggregate bandwidth for parallel (-P) connections.
+# ---------------------------------------------------------------------------
+_parse_bidir_bw_from_log() {
+    local logfile="$1"
+    local direction="${2:-tx}"
+
+    [[ ! -f "$logfile" || ! -s "$logfile" ]] && { printf '%s' '---'; return; }
+
+    # Determine the role tag suffix for the requested direction
+    local role
+    case "$direction" in
+        tx) role="TX-C" ;;
+        rx) role="RX-C" ;;
+        *)  role="TX-C" ;;
+    esac
+
+    local ll=""
+
+    # ── Priority 1: [SUM][TX-C] / [SUM][RX-C] — parallel bidir ───────────
+    if [[ -z "$ll" ]]; then
+        ll=$(grep -E "\[SUM\]\[${role}\]" "$logfile" 2>/dev/null \
+            | grep -E '[0-9.]+-[0-9.]+[[:space:]]+sec' \
+            | grep -vE '[[:space:]](sender|receiver)[[:space:]]*$' \
+            | grep -vE '[[:space:]]0\.00[[:space:]]+bits/sec' \
+            | tail -1)
+    fi
+
+    # ── Priority 2: [ N][TX-C] / [ N][RX-C] — single stream compound ──────
+    # Matches lines like:  [  5][TX-C]   0.00-1.00   sec   112 MBytes ...
+    # Skips lines with 0.00 bits/sec (common in early bidir negotiation).
+    if [[ -z "$ll" ]]; then
+        ll=$(grep -E "\]\[${role}\]" "$logfile" 2>/dev/null \
+            | grep -E '[0-9.]+-[0-9.]+[[:space:]]+sec' \
+            | grep -vE '[[:space:]](sender|receiver)[[:space:]]*$' \
+            | grep -vE '^\[SUM\]' \
+            | grep -vE '[[:space:]]0\.00[[:space:]]+bits/sec' \
+            | tail -1)
+    fi
+
+    # ── Priority 3: standalone ^[TX-C] / ^[RX-C] — older iperf3 format ───
+    if [[ -z "$ll" ]]; then
+        ll=$(grep -E "^\[${role}\]" "$logfile" 2>/dev/null \
+            | grep -E '[0-9.]+-[0-9.]+[[:space:]]+sec' \
+            | grep -vE '[[:space:]](sender|receiver)[[:space:]]*$' \
+            | tail -1)
+    fi
+
+    # ── Priority 4: [TX] / [RX] without -C suffix (some older builds) ─────
+    local role_short
+    case "$direction" in
+        tx) role_short="TX" ;;
+        rx) role_short="RX" ;;
+    esac
+    if [[ -z "$ll" ]]; then
+        ll=$(grep -E "\]\[${role_short}\]|^\[${role_short}\]" \
+             "$logfile" 2>/dev/null \
+            | grep -E '[0-9.]+-[0-9.]+[[:space:]]+sec' \
+            | grep -vE '[[:space:]](sender|receiver)[[:space:]]*$' \
+            | tail -1)
+    fi
+
+    # ── Priority 5: plain SUM / stream-ID fallback ────────────────────────
+    if [[ -z "$ll" ]]; then
+        ll=$(grep -E '^\[SUM\][[:space:]]+[0-9.]+-[0-9.]+[[:space:]]+sec' \
+             "$logfile" 2>/dev/null \
+             | grep -vE '[[:space:]](sender|receiver)[[:space:]]*$' \
+             | tail -1)
+    fi
+    if [[ -z "$ll" ]]; then
+        ll=$(grep -E '^\[[[:space:]]*[0-9]+\][[:space:]]+[0-9.]+-[0-9.]+[[:space:]]+sec' \
+             "$logfile" 2>/dev/null \
+             | grep -vE '[[:space:]](sender|receiver)[[:space:]]*$' \
+             | tail -1)
+    fi
+
+    [[ -z "$ll" ]] && { printf '%s' '---'; return; }
+
+    local result
+    result=$(printf '%s\n' "$ll" | awk '
+    {
+        for (i = 1; i <= NF; i++) {
+            if ($i ~ /^[KMGkmg]?bits\/sec$/) {
+                if (i > 1) { print $(i-1) " " $i; exit }
+            }
+        }
+    }')
+
+    if [[ -n "$result" ]]; then
+        _normalise_text_bw "$result"
+    else
+        printf '%s' '---'
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# _parse_srv_live_bw  <logfile>
+#
+# Parses the most recent per-interval bandwidth line from a server log.
+#
+# iperf3 server log formats in priority order:
+#
+#   [SUM][RX-S]  (parallel streams, bidir server receive — highest priority)
+#   [SUM][TX-S]  (parallel streams, bidir server transmit)
+#   [RX-S]       (single stream, bidir server receive)
+#   [TX-S]       (single stream, bidir server transmit)
+#   [SUM]        (parallel streams, unidirectional)
+#   [  N]        (single stream, unidirectional)
+#
+# [SUM] lines must be checked before bare stream-ID lines because individual
+# stream lines for parallel connections each carry a fraction of the total
+# bandwidth. The [SUM] line carries the aggregate value.
+#
+# For bidir sessions the bare [RX-S] per-stream lines often carry 0 bps
+# while [SUM][RX-S] carries the correct aggregate. Always prefer SUM.
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# _parse_srv_live_bw  <logfile>
+#
+# Parses live per-interval bandwidth from an iperf3 server log.
+#
+# iperf3 server log line formats observed in practice:
+#
+#   Standard unidirectional (single stream):
+#     [  5]   0.00-1.00   sec   112 MBytes   940 Mbits/sec
+#
+#   Standard unidirectional (parallel, SUM line):
+#     [SUM]   0.00-1.00   sec   112 MBytes   940 Mbits/sec
+#
+#   Bidirectional --bidir (stream ID and role combined):
+#     [  5][RX-S]   0.00-1.00   sec  0.00 Bytes  0.00 bits/sec
+#     [  8][TX-S]   0.00-1.00   sec   128 KBytes  1.05 Mbits/sec
+#
+#   Bidirectional --bidir (parallel, SUM lines):
+#     [SUM][RX-S]   0.00-1.00   sec  ...
+#     [SUM][TX-S]   0.00-1.00   sec  ...
+#
+# Direction priority for server dashboard:
+#   TX-S  (server transmitting to client) is the active traffic direction
+#   in a bidir session where the client sends --reverse data. This is what
+#   shows meaningful non-zero bandwidth on the server side.
+#   RX-S  lines are zero when the client is not sending in that direction.
+#
+# The function tries TX-S first, then RX-S, then falls back to plain lines.
+# ---------------------------------------------------------------------------
+_parse_srv_live_bw() {
+    local logfile="$1"
+    [[ ! -f "$logfile" || ! -s "$logfile" ]] && { printf '%s' '---'; return; }
+
+    local ll=""
+
+    # ── Priority 1: [SUM][TX-S] — parallel bidir, server transmit ─────────
+    # The SUM line aggregates all parallel streams. Always prefer SUM over
+    # individual stream lines to get the correct total bandwidth.
+    if [[ -z "$ll" ]]; then
+        ll=$(grep -E '\[SUM\]\[TX-S\]' "$logfile" 2>/dev/null \
+            | grep -E '[0-9.]+-[0-9.]+[[:space:]]+sec' \
+            | grep -vE '[[:space:]](sender|receiver)[[:space:]]*$' \
+            | tail -1)
+    fi
+
+    # ── Priority 2: [SUM][RX-S] — parallel bidir, server receive ──────────
+    if [[ -z "$ll" ]]; then
+        ll=$(grep -E '\[SUM\]\[RX-S\]' "$logfile" 2>/dev/null \
+            | grep -E '[0-9.]+-[0-9.]+[[:space:]]+sec' \
+            | grep -vE '[[:space:]](sender|receiver)[[:space:]]*$' \
+            | tail -1)
+    fi
+
+    # ── Priority 3: [N][TX-S] — single stream bidir, server transmit ──────
+    # Format: [  8][TX-S]   0.00-1.00   sec   128 KBytes  1.05 Mbits/sec
+    # The stream-ID bracket [ N] is followed immediately by [TX-S].
+    # We match any line containing ][TX-S] to handle varying ID widths.
+    if [[ -z "$ll" ]]; then
+        ll=$(grep -E '\]\[TX-S\]' "$logfile" 2>/dev/null \
+            | grep -E '[0-9.]+-[0-9.]+[[:space:]]+sec' \
+            | grep -vE '[[:space:]](sender|receiver)[[:space:]]*$' \
+            | grep -vE '^\[SUM\]' \
+            | tail -1)
+    fi
+
+    # ── Priority 4: [N][RX-S] — single stream bidir, server receive ───────
+    # Only use if TX-S produced nothing (e.g. purely one-directional bidir).
+    if [[ -z "$ll" ]]; then
+        ll=$(grep -E '\]\[RX-S\]' "$logfile" 2>/dev/null \
+            | grep -E '[0-9.]+-[0-9.]+[[:space:]]+sec' \
+            | grep -vE '[[:space:]](sender|receiver)[[:space:]]*$' \
+            | grep -vE '^\[SUM\]' \
+            | tail -1)
+    fi
+
+    # ── Priority 5: [SUM] — parallel streams, unidirectional ──────────────
+    if [[ -z "$ll" ]]; then
+        ll=$(grep -E '^\[SUM\][[:space:]]+[0-9.]+-[0-9.]+[[:space:]]+sec' \
+             "$logfile" 2>/dev/null \
+             | grep -vE '[[:space:]](sender|receiver)[[:space:]]*$' \
+             | tail -1)
+    fi
+
+    # ── Priority 6: plain stream-ID — single stream, unidirectional ───────
+    if [[ -z "$ll" ]]; then
+        ll=$(grep -E '^\[[[:space:]]*[0-9]+\][[:space:]]+[0-9.]+-[0-9.]+[[:space:]]+sec' \
+             "$logfile" 2>/dev/null \
+             | grep -vE '[[:space:]](sender|receiver)[[:space:]]*$' \
+             | tail -1)
+    fi
+
+    [[ -z "$ll" ]] && { printf '%s' '---'; return; }
+
+    # ── Extract bandwidth value and unit from matched line ─────────────────
+    # The awk scans all fields for a unit token matching bits/sec variants
+    # and returns the preceding numeric field paired with the unit.
+    local result
+    result=$(printf '%s\n' "$ll" | awk '
+    {
+        for (i = 1; i <= NF; i++) {
+            if ($i ~ /^[KMGkmg]?bits\/sec$/) {
+                if (i > 1) { print $(i-1) " " $i; exit }
+            }
+        }
+    }')
+
+    if [[ -n "$result" ]]; then
+        _normalise_text_bw "$result"
+    else
+        printf '%s' '---'
+    fi
+}
+
 parse_final_bw_from_log() {
     local logfile="$1" direction="$2"
     [[ ! -f "$logfile" || ! -s "$logfile" ]] && printf '%s' "" && return
@@ -693,15 +962,51 @@ _capture_final_bw() {
     local idx="$1"
     local lf="${S_LOGFILE[$idx]:-}"
     [[ -n "${S_FINAL_SENDER_BW[$idx]:-}" ]] && return
-    local sbw rbw
-    sbw=$(parse_final_bw_from_log "$lf" "sender")
-    rbw=$(parse_final_bw_from_log "$lf" "receiver")
-    if [[ -z "$sbw" || "$sbw" == "---" ]]; then
-        sbw=$(parse_live_bandwidth_from_log "$lf")
+
+    local sbw="" rbw=""
+
+    if [[ "${S_BIDIR[$idx]:-0}" == "1" && (( BIDIR_SUPPORTED == 1 )) ]]; then
+        # ── --bidir log: TX summary in [TX-C] receiver line ───────────────
+        # iperf3 --bidir final summary lines are tagged with [TX-C] and
+        # [RX-C] and include "sender" / "receiver" labels.
+        local tx_sum_line rx_sum_line
+
+        tx_sum_line=$(grep -E '\[TX-C\].*receiver' "$lf" 2>/dev/null | tail -1)
+        [[ -z "$tx_sum_line" ]] && \
+            tx_sum_line=$(grep -E '\[TX-C\].*sender' "$lf" 2>/dev/null | tail -1)
+
+        rx_sum_line=$(grep -E '\[RX-C\].*receiver' "$lf" 2>/dev/null | tail -1)
+        [[ -z "$rx_sum_line" ]] && \
+            rx_sum_line=$(grep -E '\[RX-C\].*sender' "$lf" 2>/dev/null | tail -1)
+
+        if [[ -n "$tx_sum_line" ]]; then
+            sbw=$(printf '%s\n' "$tx_sum_line" \
+                | awk '{for(i=1;i<=NF;i++) if($i~/[KMG]?bits\/sec/) print $(i-1),$i}' \
+                | head -1)
+            [[ -n "$sbw" ]] && sbw=$(_normalise_text_bw "$sbw")
+        fi
+
+        if [[ -n "$rx_sum_line" ]]; then
+            rbw=$(printf '%s\n' "$rx_sum_line" \
+                | awk '{for(i=1;i<=NF;i++) if($i~/[KMG]?bits\/sec/) print $(i-1),$i}' \
+                | head -1)
+            [[ -n "$rbw" ]] && rbw=$(_normalise_text_bw "$rbw")
+        fi
+
+        # Fallback to live parsing if summary not yet available
+        [[ -z "$sbw" || "$sbw" == "---" ]] && \
+            sbw=$(_parse_bidir_bw_from_log "$lf" "tx")
+        [[ -z "$rbw" || "$rbw" == "---" ]] && \
+            rbw=$(_parse_bidir_bw_from_log "$lf" "rx")
+    else
+        # ── Standard log ──────────────────────────────────────────────────
+        sbw=$(parse_final_bw_from_log "$lf" "sender")
+        rbw=$(parse_final_bw_from_log "$lf" "receiver")
+        [[ -z "$sbw" || "$sbw" == "---" ]] && \
+            sbw=$(parse_live_bandwidth_from_log "$lf")
+        [[ -z "$rbw" || "$rbw" == "---" ]] && rbw="$sbw"
     fi
-    if [[ -z "$rbw" || "$rbw" == "---" ]]; then
-        rbw="$sbw"
-    fi
+
     S_FINAL_SENDER_BW[$idx]="${sbw:-N/A}"
     S_FINAL_RECEIVER_BW[$idx]="${rbw:-N/A}"
 }
@@ -750,7 +1055,7 @@ cleanup() {
         done
     fi
 
-    # ★ NEW IN v8.2.3 ★ — Terminate parallel RTT ping processes
+    # Terminate parallel RTT ping processes
     if (( ${#PING_PIDS[@]} > 0 )); then
         tty_echo ""; tty_echo "${BOLD}  RTT Ping Processes:${NC}"
         local i
@@ -761,6 +1066,24 @@ cleanup() {
                 kill -TERM "$pid" 2>/dev/null
                 wait "$pid" 2>/dev/null
                 tty_echo "    ${GREEN}[STOP  ]${NC}  PID $pid  rtt-ping stream $((i+1))"
+            fi
+        done
+    fi
+
+    # ── ★ NEW IN v8.2.4 ★ — Terminate bidirectional reverse processes ────
+    if (( ${#BIDIR_PIDS[@]} > 0 )); then
+        tty_echo ""; tty_echo "${BOLD}  Bidirectional RX Processes:${NC}"
+        local i
+        for i in "${!BIDIR_PIDS[@]}"; do
+            local pid="${BIDIR_PIDS[$i]}"
+            [[ -z "$pid" || "$pid" == "0" ]] && continue
+            if kill -0 "$pid" 2>/dev/null; then
+                kill -TERM "$pid" 2>/dev/null
+                wait "$pid" 2>/dev/null
+                tty_echo "    ${GREEN}[STOP  ]${NC}  PID $pid  bidir-rx stream $((i+1))"
+            else
+                wait "$pid" 2>/dev/null
+                tty_echo "    ${CYAN}[DONE  ]${NC}  PID $pid  bidir-rx stream $((i+1))  (already exited)"
             fi
         done
     fi
@@ -892,6 +1215,11 @@ detect_forceflush() {
     "$IPERF3_BIN" --help 2>&1 | grep -q 'forceflush' \
         && FORCEFLUSH_SUPPORTED=1 || FORCEFLUSH_SUPPORTED=0
     version_ge 3 12 && NOFQ_SUPPORTED=1 || NOFQ_SUPPORTED=0
+    # --bidir flag available in iperf3 >= 3.7
+    "$IPERF3_BIN" --help 2>&1 | grep -q '\-\-bidir' \
+        && BIDIR_SUPPORTED=1 || BIDIR_SUPPORTED=0
+    # Also accept version check as fallback
+    (( BIDIR_SUPPORTED == 0 )) && version_ge 3 7 && BIDIR_SUPPORTED=1
 }
 
 check_root() {
@@ -1826,6 +2154,7 @@ configure_client_streams() {
         S_DELAY+=("$dly"); S_JITTER+=("$jit"); S_LOSS+=("$loss")
 
         local nofq=0
+        local nofq=0
         if [[ "$OS_TYPE" == "linux" ]]; then
             (( NOFQ_SUPPORTED )) && {
                 local nfi; read -r -p "  Disable FQ socket pacing? [no]: " nfi </dev/tty
@@ -1833,6 +2162,35 @@ configure_client_streams() {
             }
         fi
         S_NOFQ+=("$nofq")
+
+        # ── Bidirectional simultaneous test  ★ NEW IN v8.2.4 ★ ───────────
+        local bidir=0
+        echo ""
+        printf '%b\n' "${CYAN}  -- Bidirectional Test --${NC}"
+        local bdi
+        read -r -p "  Enable bidirectional simultaneous test (TX + RX)? [y/N]: " \
+            bdi </dev/tty
+        if [[ "$bdi" =~ ^[Yy] ]]; then
+            bidir=1
+            if (( BIDIR_SUPPORTED )); then
+                printf '%b\n' \
+                    "${GREEN}  Bidirectional enabled via --bidir flag (iperf3 >= 3.7).${NC}"
+                printf '%b\n' \
+                    "${GREEN}  Both TX and RX run in a single iperf3 connection.${NC}"
+            else
+                printf '%b\n' \
+                    "${YELLOW}  WARNING: iperf3 < 3.7 detected — --bidir not supported.${NC}"
+                printf '%b\n' \
+                    "${YELLOW}  Bidirectional will use two separate connections.${NC}"
+                printf '%b\n' \
+                    "${YELLOW}  Ensure the server is running iperf3 >= 3.7 or${NC}"
+                printf '%b\n' \
+                    "${YELLOW}  configure a second server port for the reverse stream.${NC}"
+            fi
+        else
+            printf '%b\n' "${DIM}  Unidirectional — TX only.${NC}"
+        fi
+        S_BIDIR+=("$bidir")
 
         S_LOGFILE+=(""); S_SCRIPT+=(""); S_START_TS+=(0)
         S_STATUS_CACHE+=("STARTING"); S_ERROR_MSG+=("")
@@ -2101,6 +2459,7 @@ show_stream_summary() {
                 [[ -n "${S_DELAY[$i]}" ]] && ex+=" delay:${S_DELAY[$i]}ms"
                 [[ -n "${S_LOSS[$i]}"  ]] && ex+=" loss:${S_LOSS[$i]}%"
             fi
+            [[ "${S_BIDIR[$i]:-0}" == "1" ]] && ex+=" ${GREEN}[BIDIR TX+RX]${NC}"
             [[ -n "$ex" ]] && printf '%b    %s%b\n' "$CYAN" "$ex" "$NC"
         done
         printf '  %s\n' "$(rpt '-' 72)"
@@ -2329,6 +2688,176 @@ _rtt_parse() {
 }
 
 # ---------------------------------------------------------------------------
+# _cleanup_stream_procs  <stream_index>
+#
+# Phase 1 cleanup: terminates all processes associated with a finished stream.
+# Called immediately when a stream reaches DONE or FAILED state during the
+# dashboard loop.
+#
+# Does NOT delete log files — those are needed by parse_final_results() and
+# display_results_table() which run after the dashboard exits.
+# File deletion is handled separately by _cleanup_stream_files() which is
+# called from run_client_mode() after results have been displayed.
+#
+# After this function completes:
+#   STREAM_PIDS[$idx] = 0
+#   PING_PIDS[$idx]   = 0
+#   BIDIR_PIDS[$idx]  = 0
+#   S_STATUS_CACHE[$idx] = "CLEANED"
+#   G_LAST_NOTIFY updated with timestamped message
+# ---------------------------------------------------------------------------
+_cleanup_stream_procs() {
+    local idx="$1"
+    local sn=$(( idx + 1 ))
+    local label="Stream-${sn}"
+
+    # ── 1. Terminate iperf3 client process ────────────────────────────────
+    local cpid="${STREAM_PIDS[$idx]:-0}"
+    if [[ "$cpid" != "0" && "$cpid" =~ ^[0-9]+$ ]]; then
+        if kill -0 "$cpid" 2>/dev/null; then
+            kill -SIGTERM "$cpid" 2>/dev/null
+            local _w=0
+            while kill -0 "$cpid" 2>/dev/null && (( _w < 6 )); do
+                sleep 0.5; (( _w++ )) || true
+            done
+            kill -0 "$cpid" 2>/dev/null && kill -SIGKILL "$cpid" 2>/dev/null
+            wait "$cpid" 2>/dev/null
+        fi
+        STREAM_PIDS[$idx]=0
+    fi
+
+    # ── 2. Terminate RTT background ping ──────────────────────────────────
+    # Try the stored PID first. If it is 0 or already dead, also check
+    # PING_LOGFILES[$idx] — the ping process writes to a known log path
+    # so we can find and kill it by matching the log file argument.
+    local rpid="${PING_PIDS[$idx]:-0}"
+    if [[ "$rpid" != "0" && "$rpid" =~ ^[0-9]+$ ]]; then
+        if kill -0 "$rpid" 2>/dev/null; then
+            kill -SIGTERM "$rpid" 2>/dev/null
+            sleep 0.3
+            kill -0 "$rpid" 2>/dev/null && kill -SIGKILL "$rpid" 2>/dev/null
+            wait "$rpid" 2>/dev/null
+        fi
+        PING_PIDS[$idx]=0
+    fi
+
+    # Fallback: find ping process by log file path and kill it
+    # This catches cases where PING_PIDS[$idx] was 0 due to array mismatch
+    local rtt_log="${PING_LOGFILES[$idx]:-${TMPDIR}/rtt_${idx}.log}"
+    if [[ -n "$rtt_log" ]]; then
+        # Find any ping process that has this log file open for writing
+        local stray_pid
+        if [[ "$OS_TYPE" == "linux" ]]; then
+            # Use /proc to find processes writing to the rtt log
+            stray_pid=$(fuser "$rtt_log" 2>/dev/null | tr ' ' '\n' \
+                | grep -E '^[0-9]+$' | head -1)
+        else
+            # macOS: use lsof
+            stray_pid=$(lsof -t "$rtt_log" 2>/dev/null | head -1)
+        fi
+        if [[ -n "$stray_pid" && "$stray_pid" =~ ^[0-9]+$ ]]; then
+            if kill -0 "$stray_pid" 2>/dev/null; then
+                kill -SIGTERM "$stray_pid" 2>/dev/null
+                sleep 0.2
+                kill -0 "$stray_pid" 2>/dev/null && \
+                    kill -SIGKILL "$stray_pid" 2>/dev/null
+                wait "$stray_pid" 2>/dev/null
+            fi
+        fi
+        PING_PIDS[$idx]=0
+    fi
+
+    # ── 3. Terminate bidir reverse process ────────────────────────────────
+    local bpid="${BIDIR_PIDS[$idx]:-0}"
+    if [[ "$bpid" != "0" && "$bpid" =~ ^[0-9]+$ ]]; then
+        if kill -0 "$bpid" 2>/dev/null; then
+            kill -SIGTERM "$bpid" 2>/dev/null
+            sleep 0.3
+            kill -0 "$bpid" 2>/dev/null && kill -SIGKILL "$bpid" 2>/dev/null
+            wait "$bpid" 2>/dev/null
+        fi
+        BIDIR_PIDS[$idx]=0
+    fi
+
+    # Fallback: find bidir process by log file path
+    local bidir_log="${BIDIR_LOGFILES[$idx]:-}"
+    if [[ -n "$bidir_log" && "$bidir_log" != "${S_LOGFILE[$idx]:-}" ]]; then
+        local stray_bpid=""
+        if [[ "$OS_TYPE" == "linux" ]]; then
+            stray_bpid=$(fuser "$bidir_log" 2>/dev/null | tr ' ' '\n' \
+                | grep -E '^[0-9]+$' | head -1)
+        else
+            stray_bpid=$(lsof -t "$bidir_log" 2>/dev/null | head -1)
+        fi
+        if [[ -n "$stray_bpid" && "$stray_bpid" =~ ^[0-9]+$ ]]; then
+            if kill -0 "$stray_bpid" 2>/dev/null; then
+                kill -SIGTERM "$stray_bpid" 2>/dev/null
+                sleep 0.2
+                kill -0 "$stray_bpid" 2>/dev/null && \
+                    kill -SIGKILL "$stray_bpid" 2>/dev/null
+                wait "$stray_bpid" 2>/dev/null
+            fi
+        fi
+        BIDIR_PIDS[$idx]=0
+    fi
+
+    # ── 4. Clear sparkline ring buffers ───────────────────────────────────
+    _spark_clear "c" "$idx"
+    _spark_clear "r" "$idx"
+
+    # ── 5. Set terminal state and post notification ────────────────────────
+    S_STATUS_CACHE[$idx]="CLEANED"
+
+    local ts; ts="$(date '+%H:%M:%S')"
+    local _new_note="[${ts}] ✔  ${label}: processes stopped"
+    local _existing; _existing="$(_assoc_get G_NOTIFY_LOG 0 2>/dev/null)"
+    local _trimmed
+    _trimmed="$(printf '%s\n' "$_existing" "$_new_note" \
+        | grep -v '^$' | tail -3)"
+    _assoc_set G_NOTIFY_LOG 0 "$_trimmed"
+    _assoc_set G_LAST_NOTIFY 0 "$_new_note"
+}
+
+# ---------------------------------------------------------------------------
+# _cleanup_stream_files  <stream_index>
+#
+# Phase 2 cleanup: deletes all temporary files for a finished stream.
+# Must only be called AFTER parse_final_results() and display_results_table()
+# have completed so that log data is available for the results table.
+#
+# Deletes:
+#   ${TMPDIR}/stream_<sn>.log
+#   ${TMPDIR}/stream_<sn>.sh
+#   ${TMPDIR}/rtt_<idx>.log
+#   ${TMPDIR}/bidir_<sn>.log
+#   ${TMPDIR}/bidir_<sn>.sh
+# ---------------------------------------------------------------------------
+_cleanup_stream_files() {
+    local idx="$1"
+    local sn=$(( idx + 1 ))
+    local files_removed=0
+
+    local -a targets=(
+        "${TMPDIR}/stream_${sn}.log"
+        "${TMPDIR}/stream_${sn}.sh"
+        "${TMPDIR}/rtt_${idx}.log"
+        "${TMPDIR}/bidir_${sn}.log"
+        "${TMPDIR}/bidir_${sn}.sh"
+    )
+
+    local f
+    for f in "${targets[@]}"; do
+        if [[ -f "$f" ]]; then
+            rm -f "$f" && (( files_removed++ )) || true
+        fi
+    done
+
+    local ts; ts="$(date '+%H:%M:%S')"
+    printf '%b[CLEANUP]%b  stream %d  %d file(s) removed\n' \
+        "$CYAN" "$NC" "$sn" "$files_removed"
+}
+
+# ---------------------------------------------------------------------------
 # _rtt_stop  <stream_idx>
 #
 # Gracefully terminates the background ping process for the given stream.
@@ -2409,6 +2938,251 @@ _rtt_display() {
         "  ${DIM}jitter${NC} ${CYAN}${f_jitter}${NC}${DIM}ms${NC}" \
         "  ${DIM}loss${NC} ${loss_col}${f_loss}${NC}" \
         "  ${DIM}(${f_samp} smpl)${NC}"
+}
+
+# =============================================================================
+# SECTION 9c — BIDIRECTIONAL ENGINE  ★ NEW IN v8.2.4 ★
+# =============================================================================
+#
+# For each stream marked S_BIDIR[$i]=1 a second iperf3 client process is
+# launched with the --reverse flag.  This causes the server to send data
+# back to the client, measuring RX (receive) bandwidth simultaneously with
+# the TX (transmit) stream.
+#
+# Both processes share the same server port and target.  iperf3 supports
+# parallel forward+reverse connections on the same port natively.
+#
+# The forward process  → measures TX (client sends to server)
+# The reverse process  → measures RX (server sends to client)
+#
+# Live bandwidth for each direction is parsed independently from separate
+# log files and displayed side-by-side in the dashboard.
+#
+# Public API:
+#   _bidir_build_cmd  <stream_idx>   build the reverse iperf3 command string
+#   _bidir_launch     <stream_idx>   start the reverse process
+#   _bidir_parse_bw   <stream_idx>   read latest RX BW from reverse log
+#   _bidir_stop       <stream_idx>   kill the reverse process
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# _bidir_build_cmd  <stream_idx>
+#
+# Builds the reverse iperf3 command for a bidirectional stream.
+# Identical to the forward command but with --reverse appended and the
+# original --reverse flag removed (to avoid double-reversing).
+# Uses the same VRF, bind IP, port, duration, parallel, DSCP settings.
+# ---------------------------------------------------------------------------
+
+_bidir_build_cmd() {
+    # This function is only called when BIDIR_SUPPORTED=0 (legacy mode).
+    # When BIDIR_SUPPORTED=1 the --bidir flag is added to the forward
+    # command in build_client_command and no separate process is needed.
+    local idx="$1"
+
+    local stream_vrf="${S_VRF[$idx]:-}"
+    local stream_bind="${S_BIND[$idx]:-}"
+    local target="${S_TARGET[$idx]:-}"
+    local port="${S_PORT[$idx]:-}"
+    local duration="${S_DURATION[$idx]:-10}"
+    local parallel="${S_PARALLEL[$idx]:-1}"
+    local protocol="${S_PROTO[$idx]:-TCP}"
+    local bw="${S_BW[$idx]:-}"
+    local dscp="${S_DSCP_VAL[$idx]:--1}"
+    local cca="${S_CCA[$idx]:-}"
+    local win="${S_WINDOW[$idx]:-}"
+    local mss="${S_MSS[$idx]:-}"
+    local nofq="${S_NOFQ[$idx]:-0}"
+
+    # VRF / GRT guard
+    if [[ "$OS_TYPE" == "linux" && -n "$stream_vrf" && \
+          -n "$stream_bind" && "$stream_bind" != "0.0.0.0" ]]; then
+        local _actual_vrf="GRT"
+        local _ki
+        for (( _ki=0; _ki<${#IFACE_IPS[@]}; _ki++ )); do
+            if [[ "${IFACE_IPS[$_ki]}" == "$stream_bind" ]]; then
+                _actual_vrf="${IFACE_VRFS[$_ki]:-GRT}"
+                break
+            fi
+        done
+        [[ "$_actual_vrf" == "GRT" ]] && stream_vrf=""
+    fi
+
+    local cmd=""
+    [[ "$OS_TYPE" == "linux" && -n "$stream_vrf" ]] && \
+        cmd="ip vrf exec ${stream_vrf} "
+
+    cmd+="${IPERF3_BIN} -c ${target} -p ${port}"
+    [[ "$protocol" == "UDP" ]] && cmd+=" -u"
+    [[ -n "$bw" ]] && cmd+=" -b ${bw}"
+
+    if (( duration == 0 )); then
+        version_ge 3 1 && cmd+=" -t 0" || cmd+=" -t 86400"
+    else
+        cmd+=" -t ${duration}"
+    fi
+
+    cmd+=" -i 1"
+    (( parallel > 1 )) && cmd+=" -P ${parallel}"
+    cmd+=" --reverse"
+
+    [[ -n "$dscp" ]] && (( dscp >= 0 )) && \
+        cmd+=" -S $(( dscp * 4 ))"
+    [[ -n "$cca" ]] && cmd+=" -C ${cca}"
+    [[ -n "$win" ]] && cmd+=" -w ${win}"
+    [[ -n "$mss" ]] && cmd+=" -M ${mss}"
+    [[ -n "$stream_bind" ]] && cmd+=" -B ${stream_bind}"
+
+    if [[ "$OS_TYPE" == "linux" ]]; then
+        (( nofq )) && (( NOFQ_SUPPORTED )) && \
+            cmd+=" --no-fq-socket-pacing"
+    fi
+
+    (( FORCEFLUSH_SUPPORTED )) && cmd+=" --forceflush"
+
+    printf '%s' "$cmd"
+}
+
+# ---------------------------------------------------------------------------
+# _bidir_launch  <stream_idx>
+#
+# Starts the reverse iperf3 process for a bidirectional stream.
+# Called immediately after the forward process is launched.
+# ---------------------------------------------------------------------------
+_bidir_launch() {
+    local idx="$1"
+
+    # Initialise state for this index
+    BIDIR_PIDS[$idx]=0
+    BIDIR_LOGFILES[$idx]=""
+    S_BIDIR_BW[$idx]="---"
+
+    [[ "${S_BIDIR[$idx]:-0}" != "1" ]] && return 0
+
+    # When iperf3 supports --bidir the forward stream already handles both
+    # directions in a single process.  No separate reverse process needed.
+    # RX bandwidth is parsed from the forward log using _bidir_parse_bw.
+    if (( BIDIR_SUPPORTED == 1 )); then
+        # Point the bidir log at the forward stream log so _bidir_parse_bw
+        # can parse the RX lines from the same log file.
+        BIDIR_LOGFILES[$idx]="${S_LOGFILE[$idx]:-}"
+        printf '%b[BIDIR  ]%b  stream %d  --bidir  ← RX via forward process\n' \
+            "$CYAN" "$NC" "$(( idx + 1 ))"
+        return 0
+    fi
+
+    # Legacy fallback: iperf3 < 3.7 — launch a separate reverse process.
+    # This only works reliably when the server is not in --one-off mode
+    # and can accept a second simultaneous connection.
+    local sn=$(( idx + 1 ))
+    local lf="${TMPDIR}/bidir_${sn}.log"
+    local sf="${TMPDIR}/bidir_${sn}.sh"
+
+    BIDIR_LOGFILES[$idx]="$lf"
+
+    local cmd; cmd=$(_bidir_build_cmd "$idx")
+
+    # Add a brief delay so the forward stream connects first
+    {
+        printf '#!/usr/bin/env bash\n'
+        printf 'sleep 2\n'
+        printf '%s\n' "$cmd"
+    } > "$sf"
+    chmod +x "$sf"
+
+    bash "$sf" > "$lf" 2>&1 &
+    local pid=$!
+    BIDIR_PIDS[$idx]=$pid
+
+    printf '%b[BIDIR  ]%b  stream %d  PID %-6d  ← RX (legacy --reverse)\n' \
+        "$CYAN" "$NC" "$sn" "$pid"
+}
+
+# ---------------------------------------------------------------------------
+# _bidir_parse_bw  <stream_idx>
+#
+# Reads the latest per-interval bandwidth from the reverse process log.
+# Updates S_BIDIR_BW[$idx] and pushes to the "r" sparkline ring buffer.
+# ---------------------------------------------------------------------------
+_bidir_parse_bw() {
+    local idx="$1"
+    [[ "${S_BIDIR[$idx]:-0}" != "1" ]] && return
+
+    local lf="${BIDIR_LOGFILES[$idx]:-}"
+    [[ -z "$lf" || ! -f "$lf" || ! -s "$lf" ]] && return
+
+    local bw=""
+
+    if (( BIDIR_SUPPORTED == 1 )); then
+        # ── iperf3 --bidir: parse [RX-C] tagged lines ─────────────────────
+        bw=$(_parse_bidir_bw_from_log "$lf" "rx")
+    else
+        # ── Legacy --reverse: plain interval lines ────────────────────────
+        bw=$(parse_live_bandwidth_from_log "$lf")
+    fi
+
+    if [[ -n "$bw" && "$bw" != "---" ]]; then
+        S_BIDIR_BW[$idx]="$bw"
+        _spark_push "r" "$idx" "$bw"
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# _bidir_stop  <stream_idx>
+#
+# Terminates the reverse iperf3 process for a bidirectional stream.
+# ---------------------------------------------------------------------------
+_bidir_stop() {
+    local idx="$1"
+    local pid="${BIDIR_PIDS[$idx]:-0}"
+    [[ "$pid" == "0" ]] && return
+    kill -TERM "$pid" 2>/dev/null
+    wait "$pid" 2>/dev/null
+    BIDIR_PIDS[$idx]=0
+}
+
+# ---------------------------------------------------------------------------
+# _bidir_final_bw  <stream_idx>
+#
+# Returns the final sender BW from the reverse process log (for results table).
+# ---------------------------------------------------------------------------
+
+_bidir_final_bw() {
+    local idx="$1"
+    local lf="${BIDIR_LOGFILES[$idx]:-}"
+    [[ -z "$lf" || ! -f "$lf" ]] && { printf '%s' "N/A"; return; }
+
+    local fbw=""
+
+    if (( BIDIR_SUPPORTED == 1 )); then
+        # RX summary from [RX-C] tagged summary line
+        local rx_line
+        rx_line=$(grep -E '\[RX-C\].*receiver' "$lf" 2>/dev/null | tail -1)
+        [[ -z "$rx_line" ]] && \
+            rx_line=$(grep -E '\[RX-C\].*sender' "$lf" 2>/dev/null | tail -1)
+        [[ -z "$rx_line" ]] && \
+            rx_line=$(grep -E '\[RX-C\]' "$lf" 2>/dev/null \
+                | grep -E 'sender|receiver' | tail -1)
+
+        if [[ -n "$rx_line" ]]; then
+            fbw=$(printf '%s\n' "$rx_line" \
+                | awk '{for(i=1;i<=NF;i++) if($i~/[KMG]?bits\/sec/) print $(i-1),$i}' \
+                | head -1)
+            [[ -n "$fbw" ]] && fbw=$(_normalise_text_bw "$fbw")
+        fi
+
+        # Fallback to live RX parse
+        [[ -z "$fbw" || "$fbw" == "---" ]] && \
+            fbw=$(_parse_bidir_bw_from_log "$lf" "rx")
+    else
+        fbw=$(parse_final_bw_from_log "$lf" "receiver")
+        [[ -z "$fbw" || "$fbw" == "---" ]] && \
+            fbw=$(parse_final_bw_from_log "$lf" "sender")
+        [[ -z "$fbw" || "$fbw" == "---" ]] && \
+            fbw=$(parse_live_bandwidth_from_log "$lf")
+    fi
+
+    printf '%s' "${fbw:-N/A}"
 }
 # =============================================================================
 # SECTION 10 — COMMAND BUILDING AND LAUNCHING
@@ -2502,6 +3276,15 @@ build_client_command() {
         (( S_NOFQ[$idx] )) && (( NOFQ_SUPPORTED )) && cmd+=" --no-fq-socket-pacing"
     fi
     (( FORCEFLUSH_SUPPORTED )) && cmd+=" --forceflush"
+
+    # ── ★ v8.2.4 ★ Bidirectional via --bidir flag ──────────────────────
+    # When bidir is enabled AND iperf3 supports --bidir, add the flag to
+    # the forward stream command.  No separate reverse process is launched.
+    # When BIDIR_SUPPORTED=0 the reverse process is handled by _bidir_launch.
+    if [[ "${S_BIDIR[$idx]:-0}" == "1" ]] && (( BIDIR_SUPPORTED == 1 )); then
+        cmd+=" --bidir"
+    fi
+
     printf '%s' "$cmd"
 }
 
@@ -2578,8 +3361,13 @@ launch_servers() {
 
 launch_clients() {
     STREAM_PIDS=()
+    # RTT ping tracking arrays
     PING_PIDS=()
     PING_LOGFILES=()
+
+    # ★ NEW IN v8.2.4 ★ — initialise bidir tracking arrays
+    BIDIR_PIDS=()
+    BIDIR_LOGFILES=()
 
     # ── Pre-launch VRF/bind consistency validation ────────────────────────
     # Refresh the interface list so VRF membership data is current, then
@@ -2654,12 +3442,14 @@ launch_clients() {
         printf '%b[STARTED]%b  stream %d  PID %-6d  %s -> %s:%s\n' \
             "$GREEN" "$NC" "$sn" "$pid" "${S_PROTO[$i]}" "${S_TARGET[$i]}" "${S_PORT[$i]}"
 
-        # ★ NEW IN v8.2.3 ★ — launch parallel RTT ping for this stream
+        # RTT ping
         _rtt_launch "$i"
         if [[ "${PING_PIDS[$i]:-0}" != "0" ]]; then
             printf '%b[PING   ]%b  stream %d  PID %-6d  rtt → %s\n' \
                 "$CYAN" "$NC" "$sn" "${PING_PIDS[$i]}" "${S_TARGET[$i]}"
         fi
+        # ── ★ NEW IN v8.2.4 ★ — launch reverse (RX) process for bidir ───
+        _bidir_launch "$i"
     done
 }
 
@@ -2686,37 +3476,121 @@ wait_for_servers() {
 apply_netem() {
     [[ "$OS_TYPE" == "macos" ]] && return 0
     NETEM_IFACES=()
+
     local i
     for (( i=0; i<STREAM_COUNT; i++ )); do
-        local dly="${S_DELAY[$i]:-}" jit="${S_JITTER[$i]:-}" loss="${S_LOSS[$i]:-}"
+        local dly="${S_DELAY[$i]:-}"
+        local jit="${S_JITTER[$i]:-}"
+        local loss="${S_LOSS[$i]:-}"
+
         [[ -z "$dly" && -z "$jit" && -z "$loss" ]] && continue
+
         if (( IS_ROOT == 0 )); then
-            printf '%b\n' "${YELLOW}  WARNING: tc netem skipped for stream $((i+1)) -- not root.${NC}"; continue
+            printf '%b\n' \
+                "${YELLOW}  WARNING: tc netem skipped for stream $((i+1)) -- not root.${NC}"
+            continue
         fi
+
+        # ── Resolve egress interface ───────────────────────────────────────
+        # When a VRF is configured the route lookup MUST be performed inside
+        # that VRF's routing table. Using plain "ip route get" queries the GRT
+        # and returns the wrong interface when the target is only reachable
+        # via a VRF-bound interface.
         local oif=""
+        local stream_vrf="${S_VRF[$i]:-}"
+        local stream_target="${S_TARGET[$i]}"
+
         if command -v ip >/dev/null 2>&1; then
-            oif=$(ip route get "${S_TARGET[$i]}" 2>/dev/null \
-                | grep -oE '\bdev [^ ]+' | awk '{print $2}' | head -1)
+            if [[ -n "$stream_vrf" ]]; then
+                # VRF-aware route lookup — two methods for kernel compatibility
+                # Primary:  ip route get vrf <vrf> <target>  (kernel >= 4.12)
+                oif=$(ip route get vrf "${stream_vrf}" "${stream_target}" \
+                    2>/dev/null \
+                    | grep -oE '\bdev [^ ]+' | awk '{print $2}' | head -1)
+
+                # Fallback: ip vrf exec <vrf> ip route get <target>
+                if [[ -z "$oif" ]]; then
+                    oif=$(ip vrf exec "${stream_vrf}" \
+                        ip route get "${stream_target}" 2>/dev/null \
+                        | grep -oE '\bdev [^ ]+' | awk '{print $2}' | head -1)
+                fi
+            else
+                # GRT route lookup
+                oif=$(ip route get "${stream_target}" 2>/dev/null \
+                    | grep -oE '\bdev [^ ]+' | awk '{print $2}' | head -1)
+            fi
         fi
+
         if [[ -z "$oif" ]]; then
-            printf '%b\n' "${YELLOW}  WARNING: cannot resolve route for ${S_TARGET[$i]} -- netem skipped for stream $((i+1)).${NC}"
+            local _vrf_hint=""
+            [[ -n "$stream_vrf" ]] && \
+                _vrf_hint=" (VRF: ${stream_vrf})"
+            printf '%b\n' \
+                "${YELLOW}  WARNING: cannot resolve route for ${stream_target}${_vrf_hint}" \
+                "-- netem skipped for stream $((i+1)).${NC}"
             continue
         fi
+
         if [[ "$oif" == lo || "$oif" == lo0 || "$oif" =~ ^lo[0-9] ]]; then
-            printf '%b\n' "${YELLOW}  WARNING: stream $((i+1)) routes via loopback (${oif}) -- netem skipped.${NC}"
+            printf '%b\n' \
+                "${YELLOW}  WARNING: stream $((i+1)) routes via loopback (${oif})" \
+                "-- netem skipped.${NC}"
             continue
         fi
+
+        # ── Check for duplicate interface ──────────────────────────────────
         local already_applied=0
         local applied_iface
         for applied_iface in "${NETEM_IFACES[@]}"; do
             [[ "$applied_iface" == "$oif" ]] && already_applied=1 && break
         done
+
         if (( already_applied )); then
             printf '%b  [NETEM  ]  dev %-12s  already applied -- shared by stream %d%b\n' \
                 "$CYAN" "$oif" "$((i+1))" "$NC"
             continue
         fi
+
+        # ── Read CURRENT netem values on this interface ────────────────────
+        # tc qdisc show gives output like:
+        #   qdisc netem 8001: root refcnt 2 limit 1000 delay 10ms jitter 5ms loss 2%
+        # or:
+        #   qdisc pfifo_fast 0: root refcnt 2 bands 3 priomap ...
+        local cur_qdisc cur_delay cur_jitter cur_loss
+        cur_qdisc=$(tc qdisc show dev "$oif" 2>/dev/null | head -1)
+
+        if printf '%s' "$cur_qdisc" | grep -q 'netem'; then
+            # Extract existing delay
+            cur_delay=$(printf '%s' "$cur_qdisc" \
+                | grep -oE 'delay [0-9]+(\.[0-9]+)?(ms|us|s)' \
+                | awk '{print $2}' | head -1)
+            [[ -z "$cur_delay" ]] && cur_delay="0ms"
+
+            # Extract existing jitter
+            cur_jitter=$(printf '%s' "$cur_qdisc" \
+                | grep -oE 'delay [0-9]+(\.[0-9]+)?(ms|us|s) [0-9]+(\.[0-9]+)?(ms|us|s)' \
+                | awk '{print $3}' | head -1)
+            [[ -z "$cur_jitter" ]] && cur_jitter="0ms"
+
+            # Extract existing loss
+            cur_loss=$(printf '%s' "$cur_qdisc" \
+                | grep -oE 'loss [0-9]+(\.[0-9]+)?%' \
+                | awk '{print $2}' | head -1)
+            [[ -z "$cur_loss" ]] && cur_loss="0%"
+        else
+            cur_delay="none"
+            cur_jitter="none"
+            cur_loss="none"
+        fi
+
+        # ── Format new values for display ──────────────────────────────────
+        local new_delay="${dly:+${dly}ms}"  ; [[ -z "$dly"  ]] && new_delay="0ms"
+        local new_jitter="${jit:+${jit}ms}" ; [[ -z "$jit"  ]] && new_jitter="0ms"
+        local new_loss="${loss:+${loss}%}"  ; [[ -z "$loss" ]] && new_loss="0%"
+
+        # ── Apply tc netem ─────────────────────────────────────────────────
         tc qdisc del dev "$oif" root 2>/dev/null || true
+
         local nc="tc qdisc add dev ${oif} root netem"
         if [[ -n "$dly" && -n "$jit" ]]; then
             nc+=" delay ${dly}ms ${jit}ms"
@@ -2726,12 +3600,98 @@ apply_netem() {
             nc+=" delay 0ms ${jit}ms"
         fi
         [[ -n "$loss" ]] && nc+=" loss ${loss}%"
+
         if bash -c "$nc" 2>/dev/null; then
-            printf '%b[NETEM  ]%b  dev %-12s  delay=%s jitter=%s loss=%s\n' \
-                "$GREEN" "$NC" "$oif" "${dly:-0}ms" "${jit:-0}ms" "${loss:-0}%"
             NETEM_IFACES+=("$oif")
+
+            # ── Print before/after table ───────────────────────────────────
+            local inner=$(( COLS - 2 ))
+            local vrf_label="${stream_vrf:-GRT}"
+
+            printf '\n'
+            printf '+%s+\n' "$(rpt '=' "$inner")"
+            bcenter "${BOLD}${CYAN}tc netem Applied — Stream $((i+1))${NC}"
+            printf '+%s+\n' "$(rpt '=' "$inner")"
+
+            # Stream info row
+            bleft "  Interface : ${BOLD}${oif}${NC}  ${DIM}(routing via ${vrf_label})${NC}"
+            bleft "  Stream    : $((i+1))  ${S_PROTO[$i]} → ${S_TARGET[$i]}:${S_PORT[$i]}"
+
+            printf '+%s+\n' "$(rpt '-' "$inner")"
+
+            # Column header
+            local C1=12 C2=16 C3=16 C4=16
+            bleft "${BOLD}$(printf '%-*s  %-*s  %-*s  %-*s' \
+                "$C1" 'Parameter' \
+                "$C2" 'Before' \
+                "$C3" 'After' \
+                "$C4" 'Change')${NC}"
+
+            printf '+%s+\n' "$(rpt '-' "$inner")"
+
+            # ── Delay row ──────────────────────────────────────────────────
+            local delay_change=""
+            if [[ "$cur_delay" == "none" && -n "$dly" ]]; then
+                delay_change="${GREEN}added${NC}"
+            elif [[ "$cur_delay" != "none" && -n "$dly" ]]; then
+                if [[ "$cur_delay" != "${dly}ms" ]]; then
+                    delay_change="${YELLOW}modified${NC}"
+                else
+                    delay_change="${DIM}unchanged${NC}"
+                fi
+            fi
+
+            local before_delay_disp="$cur_delay"
+            [[ "$cur_delay" == "none" ]] && before_delay_disp="${DIM}none${NC}"
+
+            bleft "$(printf '%-*s  ' "$C1" 'Delay')${DIM}${before_delay_disp}${NC}$(printf '%*s' $(( C2 - ${#cur_delay} )) '')  ${GREEN}${new_delay}${NC}$(printf '%*s' $(( C3 - ${#new_delay} )) '')  ${delay_change}"
+
+            # ── Jitter row ─────────────────────────────────────────────────
+            local jitter_change=""
+            if [[ "$cur_jitter" == "none" && -n "$jit" ]]; then
+                jitter_change="${GREEN}added${NC}"
+            elif [[ "$cur_jitter" != "none" && -n "$jit" ]]; then
+                if [[ "$cur_jitter" != "${jit}ms" ]]; then
+                    jitter_change="${YELLOW}modified${NC}"
+                else
+                    jitter_change="${DIM}unchanged${NC}"
+                fi
+            fi
+
+            local before_jitter_disp="$cur_jitter"
+            [[ "$cur_jitter" == "none" ]] && before_jitter_disp="${DIM}none${NC}"
+
+            bleft "$(printf '%-*s  ' "$C1" 'Jitter')${DIM}${before_jitter_disp}${NC}$(printf '%*s' $(( C2 - ${#cur_jitter} )) '')  ${GREEN}${new_jitter}${NC}$(printf '%*s' $(( C3 - ${#new_jitter} )) '')  ${jitter_change}"
+
+            # ── Loss row ───────────────────────────────────────────────────
+            local loss_change=""
+            if [[ "$cur_loss" == "none" && -n "$loss" ]]; then
+                loss_change="${GREEN}added${NC}"
+            elif [[ "$cur_loss" != "none" && -n "$loss" ]]; then
+                if [[ "$cur_loss" != "${loss}%" ]]; then
+                    loss_change="${YELLOW}modified${NC}"
+                else
+                    loss_change="${DIM}unchanged${NC}"
+                fi
+            fi
+
+            local before_loss_disp="$cur_loss"
+            [[ "$cur_loss" == "none" ]] && before_loss_disp="${DIM}none${NC}"
+
+            bleft "$(printf '%-*s  ' "$C1" 'Packet Loss')${DIM}${before_loss_disp}${NC}$(printf '%*s' $(( C2 - ${#cur_loss} )) '')  ${GREEN}${new_loss}${NC}$(printf '%*s' $(( C3 - ${#new_loss} )) '')  ${loss_change}"
+
+            printf '+%s+\n' "$(rpt '-' "$inner")"
+
+            # Status row
+            bleft "  ${GREEN}✔  netem successfully applied to ${BOLD}${oif}${NC}"
+            bleft "  ${DIM}Command: ${nc}${NC}"
+
+            printf '+%s+\n' "$(rpt '=' "$inner")"
+            printf '\n'
+
         else
-            printf '%b\n' "${RED}  WARNING: tc netem failed on ${oif} for stream $((i+1)).${NC}"
+            printf '%b\n' \
+                "${RED}  WARNING: tc netem failed on ${oif} for stream $((i+1)).${NC}"
         fi
     done
 }
@@ -4521,6 +5481,11 @@ probe_client_status() {
     local proto="${S_PROTO[$idx]:-TCP}"
     local cur="${S_STATUS_CACHE[$idx]:-}"
 
+    # ── Do not overwrite terminal cleanup states ──────────────────────────
+    if [[ "$cur" == "CLEANED" || "$cur" == "CLEANUP_PENDING" ]]; then
+        return
+    fi
+
     if [[ "$cur" == "DONE" ]]; then
         _capture_final_bw "$idx"; return
     fi
@@ -4573,7 +5538,10 @@ probe_client_status() {
         if grep -qE '^\[SUM\][[:space:]]+[0-9.]+-[0-9.]+[[:space:]]+sec.*bits' \
                 "$lf" 2>/dev/null || \
            grep -qE '^\[[[:space:]]*[0-9]+\][[:space:]]+[0-9.]+-[0-9.]+[[:space:]]+sec.*bits' \
+                "$lf" 2>/dev/null || \
+           grep -qE '^\[[[:space:]]*[0-9]+\]\[.*\][[:space:]]+[0-9.]+-[0-9.]+[[:space:]]+sec.*bits' \
                 "$lf" 2>/dev/null; then
+            # Third pattern matches compound bracket format: [  5][TX-C] 0.00-1.00 sec
             has_interval=1
         fi
         if (( has_interval == 0 )); then
@@ -4595,35 +5563,63 @@ probe_client_status() {
 }
 
 probe_server_status() {
+    # ── Changed calling convention ─────────────────────────────────────────
+    # This function NO LONGER prints a return value via printf/echo.
+    # It writes the resolved state directly into SRV_PREV_STATE[$idx] so
+    # that array assignments are visible to the caller (no subshell).
+    #
+    # Callers that previously did:
+    #   local st; st=$(probe_server_status "$i")
+    # Must now do:
+    #   probe_server_status "$i"
+    #   local st="${SRV_PREV_STATE[$i]}"
+    # ──────────────────────────────────────────────────────────────────────
     local idx="$1"
     local pid="${SERVER_PIDS[$idx]:-0}"
-    local lf="${SRV_LOGFILE[$idx]:-}"
     local port="${SRV_PORT[$idx]:-}"
 
-    [[ "$pid" == "0" ]] && { printf '%s' 'FAILED'; return; }
-    kill -0 "$pid" 2>/dev/null || { printf '%s' 'DONE'; return; }
+    # Resolve log file path — guard against SRV_LOGFILE[$idx] being empty
+    local lf="${SRV_LOGFILE[$idx]:-}"
+    [[ -z "$lf" ]] && lf="${TMPDIR}/server_$((idx+1)).log"
 
+    # ── Process liveness check ─────────────────────────────────────────────
+    if [[ "$pid" == "0" ]]; then
+        SRV_PREV_STATE[$idx]="FAILED"
+        return
+    fi
+    if ! kill -0 "$pid" 2>/dev/null; then
+        SRV_PREV_STATE[$idx]="DONE"
+        return
+    fi
+
+    # ── Resolve current connection state ───────────────────────────────────
     local current_state="STARTING"
+
     if [[ -n "$port" ]]; then
         if [[ "$OS_TYPE" == "macos" ]]; then
             if lsof -iTCP:"$port" 2>/dev/null | grep -q "ESTABLISHED"; then
                 current_state="CONNECTED"
             elif lsof -iTCP:"$port" -sTCP:LISTEN >/dev/null 2>&1; then
                 if [[ -f "$lf" && -s "$lf" ]] && \
-                   grep -qiE 'accepted connection|connected|bits/sec' "$lf" 2>/dev/null; then
+                   grep -qiE 'accepted connection|connected|bits/sec' \
+                       "$lf" 2>/dev/null; then
                     current_state="RUNNING"
                 else
                     current_state="LISTENING"
                 fi
             fi
         else
-            if ss -tn 2>/dev/null | grep -qE "ESTAB.*:${port}([[:space:]]|$)"; then
+            if ss -tn 2>/dev/null \
+                    | grep -qE "ESTAB.*:${port}([[:space:]]|$)"; then
                 current_state="CONNECTED"
-            elif ss -tn 2>/dev/null | grep -qE "ESTAB.+:${port}[[:space:]]"; then
+            elif ss -tn 2>/dev/null \
+                    | grep -qE "ESTAB.+:${port}[[:space:]]"; then
                 current_state="CONNECTED"
-            elif ss -tlnp 2>/dev/null | grep -qE ":${port}([[:space:]]|$)"; then
+            elif ss -tlnp 2>/dev/null \
+                    | grep -qE ":${port}([[:space:]]|$)"; then
                 if [[ -f "$lf" && -s "$lf" ]] && \
-                   grep -qiE 'accepted connection|connected|bits/sec' "$lf" 2>/dev/null; then
+                   grep -qiE 'accepted connection|connected|bits/sec' \
+                       "$lf" 2>/dev/null; then
                     current_state="RUNNING"
                 else
                     current_state="LISTENING"
@@ -4632,36 +5628,40 @@ probe_server_status() {
         fi
     fi
 
-    if [[ "$current_state" == "STARTING" ]]; then
-        if [[ -f "$lf" && -s "$lf" ]]; then
-            grep -qiE 'accepted connection|connected' "$lf" 2>/dev/null \
-                && current_state="RUNNING" \
-                || { grep -qi 'server listening\|listening on' "$lf" 2>/dev/null \
-                    && current_state="LISTENING" || current_state="STARTING"; }
+    # Fallback: infer state from log content when socket check found nothing
+    if [[ "$current_state" == "STARTING" && -f "$lf" && -s "$lf" ]]; then
+        if grep -qiE 'accepted connection|connected' "$lf" 2>/dev/null; then
+            current_state="RUNNING"
+        elif grep -qi 'server listening\|listening on' "$lf" 2>/dev/null; then
+            current_state="LISTENING"
         fi
     fi
 
+    # ── State-change side effects ───────────────────────────────────────────
     local prev_state="${SRV_PREV_STATE[$idx]:-}"
 
-    # ── BW cache reset: client disconnected, server back to waiting ───────
-    if [[ "$prev_state" == "CONNECTED" ]]; then
-        case "$current_state" in
-            LISTENING|STARTING)
-                SRV_BW_CACHE[$idx]="---"
-                ;;
-        esac
-    fi
+    # BW cache reset: client disconnected, server back to idle
+    case "$prev_state" in
+        CONNECTED|RUNNING)
+            case "$current_state" in
+                LISTENING|STARTING)
+                    SRV_BW_CACHE[$idx]="---"
+                    ;;
+            esac
+            ;;
+    esac
 
-    # ── ★ NEW IN v8.2.2 ★ Sparkline reset on RUNNING transition ──────────
-    # A transition to RUNNING means a new client connection has just been
-    # accepted. Clear the server ring buffer so the graph always shows only
-    # the current connection's history, never a mix with previous sessions.
-    if [[ "$prev_state" != "RUNNING" && "$current_state" == "RUNNING" ]]; then
+    # Sparkline reset: new client just connected (transition from idle to active)
+    local _prev_active=0 _curr_active=0
+    case "$prev_state"   in CONNECTED|RUNNING) _prev_active=1 ;; esac
+    case "$current_state" in CONNECTED|RUNNING) _curr_active=1 ;; esac
+
+    if (( _prev_active == 0 && _curr_active == 1 )); then
         _spark_clear "s" "$idx"
     fi
 
+    # ── Write result directly into the array (no subshell, no printf) ──────
     SRV_PREV_STATE[$idx]="$current_state"
-    printf '%s' "$current_state"
 }
 
 # =============================================================================
@@ -4949,11 +5949,34 @@ _count_server_frame_lines() {
 #  10+N   bline '='          final border
 # ---------------------------------------------------------------------------
 _count_client_frame_lines_for_state() {
-    local total=10    # fixed structural lines (same anatomy as server)
+    # Fixed structural lines:
+    #   bline'=' + bcenter + bline'=' + bleft-counters + bline'=' +
+    #   bleft-col-hdr + bline'-' +
+    #   bline'=' + bleft-hint + bline'=' = 10
+    # Plus 1 for the notification banner line below the bottom border.
+    local total=11
+
     local i
-    # Per-stream rows
     for (( i=0; i<STREAM_COUNT; i++ )); do
-        (( total++ ))   # main data row always present
+        local st="${S_STATUS_CACHE[$i]:-STARTING}"
+
+        # ── CLEANED and CLEANUP_PENDING: always exactly 1 row ─────────────
+        if [[ "$st" == "CLEANED" || "$st" == "CLEANUP_PENDING" ]]; then
+            (( total++ ))
+            # Per-stream separator (between streams, not after the last)
+            if (( i < STREAM_COUNT - 1 )); then
+                (( total++ ))
+            fi
+            continue
+        fi
+
+        # ── Live stream: main TX row (always present) ─────────────────────
+        (( total++ ))
+
+        # RX row for bidirectional streams
+        if [[ "${S_BIDIR[$i]:-0}" == "1" ]]; then
+            (( total++ ))
+        fi
 
         # RTT row — non-loopback streams only
         local tgt="${S_TARGET[$i]:-}"
@@ -4962,12 +5985,11 @@ _count_client_frame_lines_for_state() {
         fi
 
         # Progress bar row — fixed-duration non-FAILED streams only
-        local st="${S_STATUS_CACHE[$i]:-STARTING}"
         if (( S_DURATION[$i] > 0 )) && [[ "$st" != "FAILED" ]]; then
             (( total++ ))
         fi
 
-        # Per-stream separator — between streams, not after the last
+        # Per-stream separator (between streams, not after the last)
         if (( i < STREAM_COUNT - 1 )); then
             (( total++ ))
         fi
@@ -5042,55 +6064,47 @@ _render_progress_bar() {
 _render_client_frame() {
     local now; now=$(date +%s)
     local i
-    for (( i=0; i<STREAM_COUNT; i++ )); do probe_client_status "$i"; done
 
-    # ── Stream counters ───────────────────────────────────────────────────
-    local nc=0 ni=0 ns=0 nd=0 nf=0
+    # ── Per-tick: probe status, parse RTT, parse bidir BW ─────────────────
+    for (( i=0; i<STREAM_COUNT; i++ )); do
+        probe_client_status "$i"
+        # Only parse RTT and bidir BW for streams that are still active.
+        # DONE, FAILED, CLEANED, and CLEANUP_PENDING streams have no running
+        # processes to read from. Continuing to parse them increments the
+        # sample counter and causes RTT values to update after streams finish.
+        local _pst="${S_STATUS_CACHE[$i]:-STARTING}"
+        case "$_pst" in
+            DONE|FAILED|CLEANED|CLEANUP_PENDING)
+                # Do not parse — processes are stopped or being stopped
+                ;;
+            *)
+                _rtt_parse "$i"
+                _bidir_parse_bw "$i"
+                ;;
+        esac
+    done
+
+    # ── Stream counters ────────────────────────────────────────────────────
+    local nc=0 ni=0 ns=0 nd=0 nf=0 n_cleaned=0
     for (( i=0; i<STREAM_COUNT; i++ )); do
         case "${S_STATUS_CACHE[$i]}" in
-            CONNECTED)  (( nc++ )) ;; CONNECTING) (( ni++ )) ;;
-            STARTING)   (( ns++ )) ;; DONE)       (( nd++ )) ;; FAILED) (( nf++ )) ;;
+            CONNECTED)       (( nc++       )) ;;
+            CONNECTING)      (( ni++       )) ;;
+            STARTING)        (( ns++       )) ;;
+            DONE)            (( nd++       )) ;;
+            FAILED)          (( nf++       )) ;;
+            CLEANED)         (( n_cleaned++ )) ;;
+            CLEANUP_PENDING) (( n_cleaned++ )) ;;
         esac
     done
     local act=$(( nc + ni + ns ))
     local fts="${S_START_TS[0]:-0}"; (( fts == 0 )) && fts="$now"
     local efmt; efmt=$(format_seconds $(( now - fts )))
 
-    # ── Column widths ─────────────────────────────────────────────────────
-    #
-    #  Inner usable width (after bleft's 1-space indent) = COLS - 3 = 77
-    #
-    #  Field widths (visible chars):
-    #    C_SN      3    stream number
-    #    C_PROTO   5    protocol
-    #    C_TARGET 15    target IP
-    #    C_PORT    5    port number
-    #    C_BW     13    bandwidth
-    #    C_SPARK  11    sparkline  (1 space + 10 spark chars)
-    #    C_TIME    6    time remaining
-    #    C_DSCP    5    DSCP name
-    #    C_STAT    9    status
-    #
-    #  Separating spaces: 8 gaps × 2 spaces = 16
-    #  Total = 3+5+15+5+13+11+6+5+9 + 16 = 88 → exceeds 77 at 80 cols.
-    #
-    #  Reduce C_TARGET to fit:
-    #    77 - (3+5+5+13+11+6+5+9+16) = 77 - 73 = 4  → too small.
-    #
-    #  Solution: reduce gaps to 1 space between fields:
-    #    8 gaps × 1 space = 8
-    #    77 - 8 - (3+5+5+13+11+6+5+9) = 77 - 8 - 57 = 12 → C_TARGET = 12
-    #
-    #  Final widths:
-    #    C_SN=3  C_PROTO=5  C_TARGET=12  C_PORT=5
-    #    C_BW=13  C_SPARK=11  C_TIME=6  C_DSCP=5  C_STAT=9
-    #    gaps=8 (1 space between each pair)
-    #    total = 3+5+12+5+13+11+6+5+9+8 = 77  ✓
-    #
-    local C_SN=3 C_PROTO=5 C_TARGET=12 C_PORT=5
-    local C_BW=13 C_SPARK=11 C_TIME=6 C_DSCP=5 C_STAT=9
+    # ── Column widths ──────────────────────────────────────────────────────
+    local C_SN=3 C_PROTO=5 C_TARGET=15 C_PORT=5
+    local C_BW=13 C_SPARK=10 C_TIME=6 C_DSCP=4 C_STAT=9
 
-    # Single reusable format string — 1 space between every field
     local ROW_FMT
     ROW_FMT="%-${C_SN}s %-${C_PROTO}s %-${C_TARGET}s %${C_PORT}s %-${C_BW}s %-${C_SPARK}s %${C_TIME}s %${C_DSCP}s %-${C_STAT}s"
 
@@ -5099,45 +6113,89 @@ _render_client_frame() {
         (( S_DURATION[$i] > 0 )) && has_fixed_dur=1 && break
     done
 
-    # ── Top border + title ────────────────────────────────────────────────
+    # ── Top border + title ─────────────────────────────────────────────────
     bline '='
     bcenter "${BOLD}${CYAN}iperf3 Traffic Streams -- Live Dashboard${NC}"
     bline '='
 
-    # ── Summary bar ───────────────────────────────────────────────────────
+    # ── Summary bar ────────────────────────────────────────────────────────
     bleft "$(printf \
         '  Active:%-3d  Connected:%-3d  Done:%-3d  Failed:%-3d  Elapsed:%s' \
         "$act" "$nc" "$nd" "$nf" "$efmt")"
     bline '='
 
-    # ── Column header ─────────────────────────────────────────────────────
+    # ── Column header ──────────────────────────────────────────────────────
     # shellcheck disable=SC2059
     bleft "${BOLD}$(printf "$ROW_FMT" \
         '#' 'Proto' 'Target' 'Port' 'Bandwidth' 'Last 10s' \
         'Time' 'DSCP' 'Status')${NC}"
     bline '-'
 
-    # ── Per-stream rows ───────────────────────────────────────────────────
+    # ── Per-stream rows ────────────────────────────────────────────────────
     for (( i=0; i<STREAM_COUNT; i++ )); do
         local sn=$(( i + 1 ))
         local st="${S_STATUS_CACHE[$i]:-STARTING}"
         local lf="${S_LOGFILE[$i]:-}"
 
-        # RTT parse
-        _rtt_parse "$i"
+        # ── CLEANED state: render tombstone row and skip all live logic ────
+        if [[ "$st" == "CLEANED" || "$st" == "CLEANUP_PENDING" ]]; then
+            local tgt_c="${S_TARGET[$i]:-?}"
+            (( ${#tgt_c} > C_TARGET )) && tgt_c="${tgt_c:0:$(( C_TARGET-1 ))}~"
 
-        # ── Bandwidth ─────────────────────────────────────────────────────
-        local bw="---"
-        [[ "$st" == "CONNECTED" ]] && bw=$(parse_live_bandwidth_from_log "$lf")
-        [[ "$st" == "DONE"      ]] && bw="${S_FINAL_SENDER_BW[$i]:-N/A}"
+            if [[ "$st" == "CLEANUP_PENDING" ]]; then
+                # Transient one-tick spinner row
+                local plain_pending
+                plain_pending=$(printf \
+                    "%-${C_SN}s %-${C_PROTO}s %-${C_TARGET}s %${C_PORT}s %-${C_BW}s %-${C_SPARK}s %${C_TIME}s %${C_DSCP}s " \
+                    "$sn" "${S_PROTO[$i]}" "$tgt_c" "${S_PORT[$i]}" \
+                    "---" "··········" "--:--" "---")
+                bleft "${YELLOW}${plain_pending}$(printf '%-*s' "$C_STAT" "CLEANING…")${NC}"
+            else
+                # CLEANED tombstone: dim row with em-dashes
+                local plain_cleaned
+                plain_cleaned=$(printf \
+                    "%-${C_SN}s %-${C_PROTO}s %-${C_TARGET}s %${C_PORT}s %-${C_BW}s %-${C_SPARK}s %${C_TIME}s %${C_DSCP}s " \
+                    "$sn" "${S_PROTO[$i]}" "$tgt_c" "${S_PORT[$i]}" \
+                    "---" "··········" "------" "---")
+                bleft "${DIM}${plain_cleaned}$(printf '%-*s' "$C_STAT" "── DONE ──")${NC}"
+            fi
 
-        # ── Sparkline ─────────────────────────────────────────────────────
-        if [[ "$st" == "CONNECTED" && "$bw" != "---" ]]; then
-            _spark_push "c" "$i" "$bw"
+            # Per-stream separator
+            if (( i < STREAM_COUNT - 1 )); then
+                bline '-'
+            fi
+            continue
         fi
-        local spark_str; spark_str=$(_spark_render "c" "$i")
 
-        # ── Time remaining / elapsed ──────────────────────────────────────
+       # ── TX bandwidth (forward direction) ──────────────────────────────
+        local bw_tx="---"
+        if [[ "$st" == "CONNECTED" ]]; then
+            if [[ "${S_BIDIR[$i]:-0}" == "1" && \
+                  (( BIDIR_SUPPORTED == 1 )) ]]; then
+                # ── Bidir TX: try [TX-C] tagged lines first ────────────────
+                bw_tx=$(_parse_bidir_bw_from_log "$lf" "tx")
+
+                # ── Fallback: if [TX-C] returns ---, try plain interval ────
+                # Some iperf3 builds and UDP bidir sessions do not emit
+                # per-interval [TX-C] lines. In that case the plain stream-ID
+                # interval lines carry the TX bandwidth.
+                if [[ "$bw_tx" == "---" || -z "$bw_tx" ]]; then
+                    bw_tx=$(parse_live_bandwidth_from_log "$lf")
+                fi
+            else
+                bw_tx=$(parse_live_bandwidth_from_log "$lf")
+            fi
+        fi
+        [[ "$st" == "DONE" ]] && bw_tx="${S_FINAL_SENDER_BW[$i]:-N/A}"
+
+        # ── RX bandwidth (reverse direction, bidir only) ───────────────────
+        local bw_rx="${S_BIDIR_BW[$i]:-???}"
+        local spark_rx=""
+        if [[ "${S_BIDIR[$i]:-0}" == "1" ]]; then
+            spark_rx=$(_spark_render "r" "$i")
+        fi
+
+        # ── Time remaining / elapsed ───────────────────────────────────────
         local td="--:--"
         local sts="${S_START_TS[$i]:-0}"; (( sts == 0 )) && sts="$now"
         local dur="${S_DURATION[$i]:-10}"
@@ -5147,8 +6205,7 @@ _render_client_frame() {
         case "$st" in
             CONNECTED|STARTING|CONNECTING)
                 if (( dur == 0 )); then
-                    td="inf"
-                    show_bar=0
+                    td="inf"; show_bar=0
                 else
                     local rem=$(( dur - stream_elapsed ))
                     (( rem < 0 )) && rem=0
@@ -5161,18 +6218,17 @@ _render_client_frame() {
                 (( dur > 0 )) && { show_bar=1; stream_elapsed=$dur; }
                 ;;
             FAILED)
-                td="failed"
-                show_bar=0
+                td="failed"; show_bar=0
                 ;;
         esac
 
-        # ── DSCP ──────────────────────────────────────────────────────────
+        # ── DSCP display ───────────────────────────────────────────────────
         local dscp_disp="---"
         [[ -n "${S_DSCP_NAME[$i]}" ]] && dscp_disp="${S_DSCP_NAME[$i]}"
         [[ "$dscp_disp" == "---" && -n "${S_DSCP_VAL[$i]}" ]] && \
             (( S_DSCP_VAL[$i] >= 0 )) && dscp_disp="${S_DSCP_VAL[$i]}"
 
-        # ── Status colour ─────────────────────────────────────────────────
+        # ── Status colour ──────────────────────────────────────────────────
         local sb sc
         case "$st" in
             CONNECTED)  sb="CONNECTED"  sc="$GREEN"  ;;
@@ -5183,46 +6239,118 @@ _render_client_frame() {
             *)          sb="$st"        sc="$NC"     ;;
         esac
 
-        # ── Field value preparation ───────────────────────────────────────
+        # ── Field truncation ───────────────────────────────────────────────
         local tgt="${S_TARGET[$i]:-?}"
-        local bw_disp="$bw"
+        local bw_tx_disp="$bw_tx"
+        (( ${#tgt}        > C_TARGET )) && tgt="${tgt:0:$(( C_TARGET-1 ))}~"
+        (( ${#bw_tx_disp} > C_BW     )) && bw_tx_disp="${bw_tx_disp:0:$(( C_BW-1 ))}~"
+        (( ${#dscp_disp}  > C_DSCP   )) && dscp_disp="${dscp_disp:0:$(( C_DSCP-1 ))}~"
 
-        (( ${#tgt}     > C_TARGET )) && tgt="${tgt:0:$(( C_TARGET - 1 ))}~"
-        (( ${#bw_disp} > C_BW     )) && bw_disp="${bw_disp:0:$(( C_BW - 1 ))}~"
-        (( ${#dscp_disp} > C_DSCP )) && dscp_disp="${dscp_disp:0:$(( C_DSCP - 1 ))}~"
+        # ── TX row ─────────────────────────────────────────────────────────
+        local tx_label=""
+        if [[ "${S_BIDIR[$i]:-0}" == "1" ]]; then
+            tx_label="${GREEN}↑ TX${NC} "
+        fi
 
-        # ── Data row ──────────────────────────────────────────────────────
-        # Build the plain portion (no colour codes) then append the
-        # coloured status so ANSI bytes do not distort printf column widths.
-        local plain_part
-        # shellcheck disable=SC2059
-        plain_part=$(printf \
+        local plain_tx
+        plain_tx=$(printf \
             "%-${C_SN}s %-${C_PROTO}s %-${C_TARGET}s %${C_PORT}s %-${C_BW}s %-${C_SPARK}s %${C_TIME}s %${C_DSCP}s " \
             "$sn" "${S_PROTO[$i]}" "$tgt" "${S_PORT[$i]}" \
-            "$bw_disp" "$spark_str" "$td" "$dscp_disp")
-        bleft "${plain_part}${sc}$(printf '%-*s' "$C_STAT" "$sb")${NC}"
+            "$bw_tx_disp" "$spark_tx" "$td" "$dscp_disp")
+        bleft "${tx_label}${plain_tx}${sc}$(printf '%-*s' "$C_STAT" "$sb")${NC}"
 
-        # ── RTT row ───────────────────────────────────────────────────────
+        # ── RX row (bidirectional only) ────────────────────────────────────
+        if [[ "${S_BIDIR[$i]:-0}" == "1" ]]; then
+            local bw_rx_disp="$bw_rx"
+            (( ${#bw_rx_disp} > C_BW )) && \
+                bw_rx_disp="${bw_rx_disp:0:$(( C_BW-1 ))}~"
+
+            local rx_st="STARTING"
+            local rx_lf="${BIDIR_LOGFILES[$i]:-}"
+
+            if (( BIDIR_SUPPORTED == 1 )); then
+                case "$st" in
+                    CONNECTED|CONNECTING|STARTING)
+                        if [[ -f "$rx_lf" && -s "$rx_lf" ]]; then
+                            # Match both compound format [ N][RX-C] and standalone [RX-C]
+                            # Also accept [RX] for older iperf3 builds
+                            if grep -qE '\]\[RX-C\].*[0-9.]+-[0-9.]+|\]\[RX\].*[0-9.]+-[0-9.]+|^\[RX-C\].*[0-9.]+-[0-9.]+' \
+                                    "$rx_lf" 2>/dev/null; then
+                                rx_st="CONNECTED"
+                            else
+                                rx_st="CONNECTING"
+                            fi
+                        else
+                            rx_st="STARTING"
+                        fi
+                        ;;
+                    DONE)    rx_st="DONE"   ;;
+                    FAILED)  rx_st="FAILED" ;;
+                    *)       rx_st="$st"    ;;
+                esac
+            else
+                local rx_pid="${BIDIR_PIDS[$i]:-0}"
+                if [[ "$rx_pid" == "0" ]]; then
+                    rx_st="N/A"
+                elif kill -0 "$rx_pid" 2>/dev/null; then
+                    if [[ -f "$rx_lf" && -s "$rx_lf" ]]; then
+                        if grep -qE '[[:space:]][0-9.]+-[0-9.]+[[:space:]]+sec.*bits' \
+                                "$rx_lf" 2>/dev/null; then
+                            rx_st="CONNECTED"
+                        else
+                            rx_st="CONNECTING"
+                        fi
+                    else
+                        rx_st="STARTING"
+                    fi
+                else
+                    if [[ -f "$rx_lf" ]] && \
+                       grep -qE 'sender|receiver' "$rx_lf" 2>/dev/null; then
+                        rx_st="DONE"
+                    else
+                        rx_st="FAILED"
+                    fi
+                fi
+            fi
+
+            local rx_sc
+            case "$rx_st" in
+                CONNECTED)  rx_sc="$GREEN"  ;;
+                CONNECTING) rx_sc="$YELLOW" ;;
+                STARTING)   rx_sc="$YELLOW" ;;
+                DONE)       rx_sc="$CYAN"   ;;
+                FAILED)     rx_sc="$RED"    ;;
+                *)          rx_sc="$DIM"    ;;
+            esac
+
+            local plain_rx
+            plain_rx=$(printf \
+                "%-${C_SN}s %-${C_PROTO}s %-${C_TARGET}s %${C_PORT}s %-${C_BW}s %-${C_SPARK}s %${C_TIME}s %${C_DSCP}s " \
+                "" "" "" "" "$bw_rx_disp" "$spark_rx" "" "")
+            bleft "${CYAN}↓ RX${NC} ${plain_rx}${rx_sc}$(printf '%-*s' "$C_STAT" "$rx_st")${NC}"
+        fi
+
+        # ── RTT row ────────────────────────────────────────────────────────
         local stream_tgt="${S_TARGET[$i]:-}"
         if [[ ! "$stream_tgt" =~ ^127\. && "$stream_tgt" != "::1" ]]; then
             local rtt_str; rtt_str=$(_rtt_display "$i")
             bleft "$rtt_str"
         fi
 
-        # ── Progress bar row ──────────────────────────────────────────────
+        # ── Progress bar row ───────────────────────────────────────────────
         if (( show_bar && has_fixed_dur )); then
             local bar_str; bar_str=$(_render_progress_bar "$stream_elapsed" "$dur")
             local bar_indent=$(( C_SN + 1 + C_PROTO + 1 + C_TARGET + 1 + C_PORT + 1 ))
             bleft "$(printf '%*s' "$bar_indent" '')${bar_str}"
         fi
 
-        # Per-stream separator (between streams, not after the last)
+        # Per-stream separator
         if (( i < STREAM_COUNT - 1 )); then
             bline '-'
         fi
     done
 
-    # ── Footer ────────────────────────────────────────────────────────────
+    # ── Footer ─────────────────────────────────────────────────────────────
     bline '='
     if _all_streams_loopback; then
         bleft "  ${YELLOW}Ctrl+C${NC} to stop all streams"
@@ -5230,6 +6358,22 @@ _render_client_frame() {
         bleft "  ${YELLOW}Ctrl+C${NC} to stop all streams  ${DIM}|${NC}  ${CYAN}[v/p]${NC} DSCP verify"
     fi
     bline '='
+
+    # ── Notification banner (cleanup events) ───────────────────────────────
+    # Renders one line below the bottom border. This line is always printed
+    # (blank when no notification) so the line counter stays consistent.
+    local _notify_msg
+    _notify_msg="$(_assoc_get G_LAST_NOTIFY 0 2>/dev/null)"
+    if [[ -n "$_notify_msg" ]]; then
+        local _max_len=$(( COLS - 4 ))
+        (( ${#_notify_msg} > _max_len )) && \
+            _notify_msg="${_notify_msg:0:${_max_len}}…"
+        local _padded
+        printf -v _padded "%-${COLS}s" "  ${_notify_msg}"
+        printf '\033[1;97;42m%s\033[0m\033[K\n' "$_padded"
+    else
+        printf '\033[K\n'
+    fi
 }
 
 _render_server_frame() {
@@ -5239,74 +6383,81 @@ _render_server_frame() {
         [[ "$pid" != "0" ]] && kill -0 "$pid" 2>/dev/null && (( running++ ))
     done
 
-    # ── Column widths (must sum to COLS-4 = 76 for | sp … sp | borders) ──
-    #
-    #  Inner width = COLS - 2 = 78
-    #  bleft adds 1 leading space → usable = 77
-    #
-    #  Field widths (visible chars, no separating spaces counted here):
-    #    C_SN     3    e.g. " 1"
-    #    C_PORT   5    e.g. " 5201"
-    #    C_BIND  16    e.g. " 192.168.114.200"
-    #    C_VRF    8    e.g. " vrf10   "
-    #    C_BW    13    e.g. " 941.23 Mbps "
-    #    C_SPARK 11    e.g. " ▄▄▅▃▄▅▄▆▅▄"   (1 space + 10 spark chars)
-    #    C_STAT   9    e.g. " LISTENING"
-    #
-    #  Separating spaces between fields: 6 gaps × 2 spaces = 12
-    #  Total = 3+5+16+8+13+11+9 + 12 = 77  ✓ (fits inside bleft's 1-space indent)
-    #
+    # ── Column widths ──────────────────────────────────────────────────────
     local C_SN=3 C_PORT=5 C_BIND=16 C_VRF=8
     local C_BW=13 C_SPARK=11 C_STAT=9
 
-    # Build one reusable format string so header and every data row use
-    # exactly the same field widths — this is what guarantees alignment.
     local ROW_FMT
     ROW_FMT="%-${C_SN}s  %${C_PORT}s  %-${C_BIND}s  %-${C_VRF}s  %-${C_BW}s  %-${C_SPARK}s  %-${C_STAT}s"
 
-    # ── Top border + title ────────────────────────────────────────────────
+    # ── Top border + title ─────────────────────────────────────────────────
     bline '='
     bcenter "${BOLD}${CYAN}iperf3 Traffic Streams -- Server Dashboard${NC}"
     bline '='
 
-    # ── Summary bar ───────────────────────────────────────────────────────
+    # ── Summary bar ────────────────────────────────────────────────────────
     bleft "$(printf '  Listeners active: %d / %d' "$running" "$SERVER_COUNT")"
     bline '='
 
-    # ── Column header (uses same ROW_FMT for perfect alignment) ──────────
+    # ── Column header ──────────────────────────────────────────────────────
     # shellcheck disable=SC2059
     bleft "${BOLD}$(printf "$ROW_FMT" \
         '#' 'Port' 'Bind IP' 'VRF' 'Bandwidth' 'Last 10s' 'Status')${NC}"
     bline '-'
 
-    # ── Per-listener rows ─────────────────────────────────────────────────
+    # ── Per-listener rows ──────────────────────────────────────────────────
     for (( i=0; i<SERVER_COUNT; i++ )); do
-        local sn=$(( i + 1 )) lf="${SRV_LOGFILE[$i]:-}"
-        local st; st=$(probe_server_status "$i")
+        local sn=$(( i + 1 ))
 
-        # ── Bandwidth ─────────────────────────────────────────────────────
-        local bw
+        # Resolve log file — guard against SRV_LOGFILE[$i] being empty
+        local lf="${SRV_LOGFILE[$i]:-}"
+        [[ -z "$lf" ]] && lf="${TMPDIR}/server_${sn}.log"
+
+        # ── Probe server status ────────────────────────────────────────────
+        # probe_server_status writes directly into SRV_PREV_STATE[$i].
+        # Do NOT call it in a subshell — the sparkline reset and BW cache
+        # updates inside it must survive into the parent shell.
+        probe_server_status "$i"
+        local st="${SRV_PREV_STATE[$i]:-STARTING}"
+
+        # ── Bandwidth ──────────────────────────────────────────────────────
+        # Use _parse_srv_live_bw which handles both plain interval lines
+        # and --bidir tagged lines ([RX-S]/[TX-S]) from the server log.
+        local bw="---"
         case "$st" in
             CONNECTED|RUNNING)
-                local live_bw; live_bw=$(parse_live_bandwidth_from_log "$lf")
-                if [[ "$live_bw" != "---" && -n "$live_bw" ]]; then
-                    bw="$live_bw"; SRV_BW_CACHE[$i]="$live_bw"
+                local live_bw
+                live_bw=$(_parse_srv_live_bw "$lf")
+                if [[ -n "$live_bw" && "$live_bw" != "---" ]]; then
+                    bw="$live_bw"
+                    SRV_BW_CACHE[$i]="$live_bw"
                 else
-                    bw="${SRV_BW_CACHE[$i]:----}"
+                    # Use cached value while waiting for next interval line.
+                    # This prevents flickering to "---" between the TCP
+                    # handshake and the first 1-second interval being written.
+                    local _cached="${SRV_BW_CACHE[$i]:-}"
+                    if [[ -n "$_cached" && "$_cached" != "---" ]]; then
+                        bw="$_cached"
+                    fi
                 fi
                 ;;
-            LISTENING|STARTING) bw="---"; SRV_BW_CACHE[$i]="---" ;;
-            *)                  bw="---" ;;
+            LISTENING|STARTING)
+                bw="---"
+                SRV_BW_CACHE[$i]="---"
+                ;;
         esac
 
-        # ── Sparkline ─────────────────────────────────────────────────────
-        if [[ ( "$st" == "CONNECTED" || "$st" == "RUNNING" ) && \
-              "$bw" != "---" && -n "$bw" ]]; then
-            _spark_push "s" "$i" "$bw"
-        fi
+        # ── Sparkline ──────────────────────────────────────────────────────
+        case "$st" in
+            CONNECTED|RUNNING)
+                if [[ -n "$bw" && "$bw" != "---" ]]; then
+                    _spark_push "s" "$i" "$bw"
+                fi
+                ;;
+        esac
         local spark_str; spark_str=$(_spark_render "s" "$i")
 
-        # ── Status colour ─────────────────────────────────────────────────
+        # ── Status colour ──────────────────────────────────────────────────
         local sb sc
         case "$st" in
             CONNECTED) sb="CONNECTED" sc="$GREEN"  ;;
@@ -5318,14 +6469,13 @@ _render_server_frame() {
             *)         sb="$st"       sc="$NC"     ;;
         esac
 
-        # ── Field value preparation ───────────────────────────────────────
+        # ── Field preparation ──────────────────────────────────────────────
         local vrf_disp="${SRV_VRF[$i]:-GRT}"
         [[ "$OS_TYPE" == "macos" ]] && vrf_disp="N/A"
 
         local bind_disp="${SRV_BIND[$i]:-0.0.0.0}"
         local bw_disp="$bw"
 
-        # Truncate fields that exceed their column width
         (( ${#bind_disp} > C_BIND - 1 )) && \
             bind_disp="${bind_disp:0:$(( C_BIND - 2 ))}~"
         (( ${#vrf_disp}  > C_VRF  - 1 )) && \
@@ -5333,12 +6483,11 @@ _render_server_frame() {
         (( ${#bw_disp}   > C_BW   - 1 )) && \
             bw_disp="${bw_disp:0:$(( C_BW   - 2 ))}~"
 
-        # ── Data row — status cell gets colour wrapping ───────────────────
-        # Build the plain portion first (all fields except status), then
-        # append the coloured status so ANSI bytes do not upset printf width.
+        # ── Data row ──────────────────────────────────────────────────────
         local plain_part
         # shellcheck disable=SC2059
-        plain_part=$(printf "%-${C_SN}s  %${C_PORT}s  %-${C_BIND}s  %-${C_VRF}s  %-${C_BW}s  %-${C_SPARK}s  " \
+        plain_part=$(printf \
+            "%-${C_SN}s  %${C_PORT}s  %-${C_BIND}s  %-${C_VRF}s  %-${C_BW}s  %-${C_SPARK}s  " \
             "$sn" "${SRV_PORT[$i]}" "$bind_disp" "$vrf_disp" \
             "$bw_disp" "$spark_str")
         bleft "${plain_part}${sc}$(printf '%-*s' "$C_STAT" "$sb")${NC}"
@@ -5349,7 +6498,7 @@ _render_server_frame() {
         fi
     done
 
-    # ── Footer ────────────────────────────────────────────────────────────
+    # ── Footer ─────────────────────────────────────────────────────────────
     bline '='
     bleft "  ${YELLOW}Ctrl+C${NC} to stop all listeners  ${DIM}|${NC}  ${CYAN}[c]${NC} Packet capture"
     bline '='
@@ -5362,10 +6511,21 @@ _render_server_frame() {
 # pre-reserve vertical space on the first tick and to reposition the
 # cursor correctly on every subsequent tick.
 # ---------------------------------------------------------------------------
+
 run_dashboard() {
     local mode="${1:-client}"
     local count
     [[ "$mode" == "server" ]] && count=$SERVER_COUNT || count=$STREAM_COUNT
+
+    # ── Initialise per-stream cleanup tracking arrays ──────────────────────
+    # S_CLEANUP_QUEUED[$i] = "1" means cleanup has already been triggered
+    # for stream i. Prevents double-cleanup on slow ticks.
+    if [[ "$mode" != "server" ]]; then
+        local _ci
+        for (( _ci=0; _ci<STREAM_COUNT; _ci++ )); do
+            S_CLEANUP_QUEUED[$_ci]="${S_CLEANUP_QUEUED[$_ci]:-0}"
+        done
+    fi
 
     # Probe status BEFORE calculating pre-reserve size
     if [[ "$mode" != "server" ]]; then
@@ -5396,10 +6556,10 @@ run_dashboard() {
     local first_tick=1
     local _dashboard_running=1
 
-    # ── Main render loop ──────────────────────────────────────────────────
+    # ── Main render loop ───────────────────────────────────────────────────
     while (( _dashboard_running == 1 )); do
 
-        # Probe client status on every tick after the first
+        # ── Per-tick state probe ───────────────────────────────────────────
         if (( first_tick == 0 )) && [[ "$mode" != "server" ]]; then
             local j
             for (( j=0; j<STREAM_COUNT; j++ )); do
@@ -5407,13 +6567,52 @@ run_dashboard() {
             done
         fi
 
-        # Move cursor to top of last rendered block (skip on first tick)
+        # ── Stream cleanup state machine ───────────────────────────────────
+        # Runs in client mode only. For each stream that has just finished
+        # (DONE or FAILED) and has not yet been cleaned up, transition to
+        # CLEANUP_PENDING and immediately execute _cleanup_stream().
+        #
+        # The S_CLEANUP_QUEUED guard ensures this fires exactly once per
+        # stream regardless of how many ticks the state lingers.
+        if [[ "$mode" != "server" ]]; then
+            local _si
+            for (( _si=0; _si<STREAM_COUNT; _si++ )); do
+                local _cur_st="${S_STATUS_CACHE[$_si]:-}"
+
+                # Only act on terminal states that have not been cleaned yet
+                if [[ "$_cur_st" == "DONE" || "$_cur_st" == "FAILED" ]]; then
+                    if [[ "${S_CLEANUP_QUEUED[$_si]:-0}" != "1" ]]; then
+
+                        # Mark as queued immediately to prevent re-entry
+                        S_CLEANUP_QUEUED[$_si]="1"
+
+                        # Transition to CLEANUP_PENDING so the renderer
+                        # shows the spinner row on this tick
+                        S_STATUS_CACHE[$_si]="CLEANUP_PENDING"
+
+                        # Execute cleanup synchronously.
+                        # _cleanup_stream() will:
+                        #   - SIGTERM/SIGKILL the iperf3 PID (if still alive)
+                        #   - SIGTERM/SIGKILL the RTT ping PID
+                        #   - SIGTERM/SIGKILL the bidir reverse PID
+                        #   - Remove log files for this stream
+                        #   - Clear sparkline ring buffer keys
+                        #   - Set S_STATUS_CACHE[$_si] = "CLEANED"
+                        #   - Write a timestamped message to G_LAST_NOTIFY
+                        _cleanup_stream_procs "$_si"
+                        # State is now CLEANED (set inside _cleanup_stream_procs)
+                    fi
+                fi
+            done
+        fi
+
+        # ── Move cursor to top of last rendered block ──────────────────────
         if (( first_tick == 0 )); then
             printf '\033[%dA' "$_last_total"
         fi
         first_tick=0
 
-        # Render the frame and measure actual line count
+        # ── Render the frame and measure actual line count ─────────────────
         local fixed_lines
         if [[ "$mode" == "server" ]]; then
             _render_server_frame
@@ -5426,7 +6625,7 @@ run_dashboard() {
         # Erase stale content below current frame
         printf '\033[J'
 
-        # Dynamic panels (client only)
+        # ── Dynamic panels (client only) ───────────────────────────────────
         local completed_lines=0 failed_lines=0
         if [[ "$mode" != "server" ]]; then
             completed_lines=$(_count_completed_panel_lines)
@@ -5435,7 +6634,7 @@ run_dashboard() {
             (( failed_lines    > 0 )) && _render_failed_panel
         fi
 
-        # DSCP hint (client, non-loopback, CONNECTED streams only)
+        # ── DSCP hint (client, non-loopback, CONNECTED streams only) ──────
         local _hint_lines=0
         if [[ "$mode" != "server" ]] && ! _all_streams_loopback; then
             local _any_verifiable=0
@@ -5457,47 +6656,46 @@ run_dashboard() {
             fi
         fi
 
-        # Record total rendered lines for next tick cursor positioning
+        # ── Record total rendered lines for next tick cursor positioning ───
         local dynamic_lines=$(( completed_lines + failed_lines ))
         _last_total=$(( fixed_lines + dynamic_lines + _hint_lines ))
         _PREV_DYNAMIC_LINES=$dynamic_lines
 
-        # ── Check whether all processes have finished ─────────────────────
+        # ── Exit condition: client mode ────────────────────────────────────
+        # Exit when every stream is either CLEANED or FAILED (all finished
+        # and all resources have been released by _cleanup_stream).
+        # CLEANED is the terminal state set by _cleanup_stream after a
+        # DONE or FAILED stream has been fully torn down.
         #
-        # Client mode: exit automatically when all iperf3 client processes
-        # have finished — the test is complete.
-        #
-        # Server mode: NEVER exit automatically based on process liveness.
-        # iperf3 server processes may exit after serving one client
-        # (--one-off / -1 mode) and that is expected and normal.
-        # The server dashboard runs until the operator presses Ctrl+C.
-        # The cleanup trap handles all process termination.
-        #
-
+        # Server mode: NEVER exits automatically. Runs until Ctrl+C.
         if [[ "$mode" != "server" ]]; then
-            local _any_alive=0
+            local _all_finished=1
             local j
             for (( j=0; j<STREAM_COUNT; j++ )); do
-                local pid="${STREAM_PIDS[$j]:-0}"
-                if [[ "$pid" != "0" ]] && kill -0 "$pid" 2>/dev/null; then
-                    _any_alive=1
-                    break
-                fi
+                local _jst="${S_STATUS_CACHE[$j]:-STARTING}"
+                case "$_jst" in
+                    CLEANED|FAILED)
+                        # Terminal states — this stream is finished
+                        ;;
+                    *)
+                        # Any other state means at least one stream is
+                        # still running or pending cleanup
+                        _all_finished=0
+                        break
+                        ;;
+                esac
             done
 
-            if (( _any_alive == 0 )); then
+            if (( _all_finished == 1 )); then
                 _dashboard_running=0
                 continue
             fi
         fi
 
-        # Server mode falls through — dashboard keeps running indefinitely
-        # until CLEANUP_DONE=1 is set by a signal trap (Ctrl+C etc.)
         # ── Non-blocking keyboard poll (10 × 0.1 s = 1 s per tick) ───────
         local key_pressed="" key_lower=""
         local tick_slice
         for (( tick_slice=0; tick_slice<10; tick_slice++ )); do
-            # Use a subshell-safe read that does not block the signal queue
             if IFS= read -r -s -n 1 -t 0.1 key_pressed </dev/tty 2>/dev/null; then
                 key_lower=$(printf '%s' "$key_pressed" | tr '[:upper:]' '[:lower:]')
                 break
@@ -5505,8 +6703,6 @@ run_dashboard() {
             key_pressed=""
             key_lower=""
 
-            # Check after each 0.1 s slice whether a signal was received
-            # (the trap will have set CLEANUP_DONE=1 before returning here)
             if (( CLEANUP_DONE == 1 )); then
                 _dashboard_running=0
                 break
@@ -5519,7 +6715,7 @@ run_dashboard() {
             continue
         fi
 
-        # ── Handle DSCP verify keypress — client mode (v or p) ───────────
+        # ── Handle DSCP verify keypress — client mode (v or p) ────────────
         if [[ "$mode" != "server" ]] && \
            ! _all_streams_loopback && \
            [[ "$key_lower" == "v" || "$key_lower" == "p" ]]; then
@@ -5546,7 +6742,7 @@ run_dashboard() {
             first_tick=1
         fi
 
-        # ── Handle DSCP verify keypress — server mode (c) ────────────────
+        # ── Handle packet capture keypress — server mode (c) ──────────────
         if [[ "$mode" == "server" ]] && [[ "$key_lower" == "c" ]]; then
 
             printf '\033[?25h'
@@ -5567,7 +6763,7 @@ run_dashboard() {
         fi
 
     done
-    # ── End of render loop ────────────────────────────────────────────────
+    # ── End of render loop ─────────────────────────────────────────────────
 
     # Restore cursor visibility
     printf '\033[?25h'
@@ -5594,6 +6790,9 @@ parse_final_results() {
             RESULT_LOSS_PCT+=("-"); RESULT_LOSS_COUNT+=("-")
             continue
         fi
+        # CLEANED and CLEANUP_PENDING are post-completion states that still
+        # have valid log data available (files not deleted until Phase 2).
+        # Treat them identically to DONE for results parsing.
 
         local lf="${S_LOGFILE[$i]:-}"
         local sbw="N/A" rbw="N/A" rtx="0" jit="N/A" lpct="N/A" lcnt="N/A"
@@ -5692,23 +6891,17 @@ display_results_table() {
                 "$C_TGT"   "$tgt" \
                 "$C_PORT"  "${S_PORT[$i]}" \
                 "$RED" "$err" "$NC"
+        # ── Normal stream row ─────────────────────────────────────────────
         else
-            # ── Normal stream row ─────────────────────────────────────────
-
-            # Extra column: retransmits (TCP) or jitter+loss (UDP)
             local extra
             [[ "$proto" == "TCP" ]] \
                 && extra="Retx: ${RESULT_RTX[$i]:-0}" \
                 || extra="J:${RESULT_JITTER[$i]:-N/A} L:${RESULT_LOSS_PCT[$i]:-N/A}"
 
-            # RTT summary string: min/avg/max
-            local rtt_col="$GREEN"
-            local rtt_sum="---"
-            local rmin="${S_RTT_MIN[$i]:-}"
-            local ravg="${S_RTT_AVG[$i]:-}"
-            local rmax="${S_RTT_MAX[$i]:-}"
-            local rsamples="${S_RTT_SAMPLES[$i]:-0}"
-
+            # RTT summary
+            local rtt_col="$GREEN" rtt_sum="---"
+            local rmin="${S_RTT_MIN[$i]:-}" ravg="${S_RTT_AVG[$i]:-}"
+            local rmax="${S_RTT_MAX[$i]:-}" rsamples="${S_RTT_SAMPLES[$i]:-0}"
             if [[ -n "$ravg" && "$ravg" != "---" && "$rsamples" != "0" ]]; then
                 rtt_sum=$(printf '%s/%s/%s' "$rmin" "$ravg" "$rmax")
                 local avg_int
@@ -5719,8 +6912,12 @@ display_results_table() {
                 fi
             fi
 
-            printf '  %-*s  %-*s  %-*s  %*s  %b%-*s%b  %b%-*s%b  %-*s  %b%-*s%b\n' \
-                "$C_SN"    "$sn" \
+            # ── ★ NEW IN v8.2.4 ★ — TX row ───────────────────────────────
+            local tx_pfx=""
+            [[ "${S_BIDIR[$i]:-0}" == "1" ]] && tx_pfx="${GREEN}→ TX${NC}  "
+
+            printf '  %b%-*s%b  %-*s  %-*s  %*s  %b%-*s%b  %b%-*s%b  %-*s  %b%-*s%b\n' \
+                "$GREEN"   "$C_SN"    "$sn"    "$NC" \
                 "$C_PROTO" "$proto" \
                 "$C_TGT"   "$tgt" \
                 "$C_PORT"  "${S_PORT[$i]}" \
@@ -5728,6 +6925,20 @@ display_results_table() {
                 "$CYAN"    "$C_RBW"   "${RESULT_RECEIVER_BW[$i]:-N/A}" "$NC" \
                 "$C_EXTRA" "$extra" \
                 "$rtt_col" "$C_RTT"   "$rtt_sum"  "$NC"
+
+            # ── ★ NEW IN v8.2.4 ★ — RX row (bidirectional only) ──────────
+            if [[ "${S_BIDIR[$i]:-0}" == "1" ]]; then
+                local rx_final; rx_final=$(_bidir_final_bw "$i")
+                printf '  %b%-*s%b  %-*s  %-*s  %*s  %b%-*s%b  %-*s  %-*s  %-*s\n' \
+                    "$CYAN"  "$C_SN"    "←RX"   "$NC" \
+                    "$C_PROTO" "" \
+                    "$C_TGT"   "" \
+                    "$C_PORT"  "" \
+                    "$CYAN"  "$C_SBW"  "$rx_final" "$NC" \
+                    "$C_RBW"  "(reverse)" \
+                    "$C_EXTRA" "" \
+                    "$C_RTT"  ""
+            fi
         fi
 
         # ── MTU annotation ────────────────────────────────────────────────
@@ -5774,13 +6985,23 @@ display_results_table() {
     # ── Completion summary ────────────────────────────────────────────────
     local tf=0 td=0
     for (( i=0; i<STREAM_COUNT; i++ )); do
-        [[ "${S_STATUS_CACHE[$i]}" == "FAILED" ]] && (( tf++ ))
-        [[ "${S_STATUS_CACHE[$i]}" == "DONE"   ]] && (( td++ ))
+        case "${S_STATUS_CACHE[$i]}" in
+            FAILED)
+                (( tf++ ))
+                ;;
+            DONE|CLEANED|CLEANUP_PENDING)
+                # CLEANED and CLEANUP_PENDING are post-completion states —
+                # they count as successfully completed streams
+                (( td++ ))
+                ;;
+        esac
     done
     if (( tf > 0 )); then
-        printf '%b  %d stream(s) FAILED.  %d completed OK.%b\n' "$RED" "$tf" "$td" "$NC"
+        printf '%b  %d stream(s) FAILED.  %d completed OK.%b\n' \
+            "$RED" "$tf" "$td" "$NC"
     else
-        printf '%b  All %d stream(s) completed successfully.%b\n' "$GREEN" "$td" "$NC"
+        printf '%b  All %d stream(s) completed successfully.%b\n' \
+            "$GREEN" "$STREAM_COUNT" "$NC"
     fi
 
     # ── MTU advisory footer (unchanged) ───────────────────────────────────
@@ -5907,9 +7128,18 @@ run_client_mode() {
     sleep 1
     run_dashboard "client"
     echo ""
+
+    # Phase 1 process cleanup has already run inside run_dashboard().
+    # Log files are still present at this point for results parsing.
     parse_final_results
     display_results_table
     offer_log_view
+
+    # Phase 2: delete log files now that results have been read and displayed
+    local _ci
+    for (( _ci=0; _ci<STREAM_COUNT; _ci++ )); do
+        _cleanup_stream_files "$_ci"
+    done
 }
 
 run_loopback_mode() {
@@ -5990,7 +7220,16 @@ run_loopback_mode() {
     echo ""; launch_clients
     echo ""; printf '%b\n' "${GREEN}  Running. Opening dashboard...${NC}"; sleep 1
     run_dashboard "client"
-    echo ""; parse_final_results; display_results_table; offer_log_view
+    echo ""
+    parse_final_results
+    display_results_table
+    offer_log_view
+
+    # Phase 2: delete log files after results are displayed
+    local _ci
+    for (( _ci=0; _ci<STREAM_COUNT; _ci++ )); do
+        _cleanup_stream_files "$_ci"
+    done
 }
 
 # ---------------------------------------------------------------------------
@@ -6617,7 +7856,7 @@ _dscp_verify_server_interactive() {
 show_main_menu() {
     clear; echo ""
     bline '='; bempty
-    bcenter "${BOLD}${CYAN}iperf3 Traffic Streams  v8.2.1${NC}"
+    bcenter "${BOLD}${CYAN}iperf3 Traffic Streams  v8.2.5${NC}"
     bempty; bline '='
 
     if [[ "$OS_TYPE" == "macos" ]]; then
