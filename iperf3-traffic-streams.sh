@@ -200,6 +200,7 @@ declare -a IFACE_STATES=()
 declare -a IFACE_SPEEDS=()
 declare -a IFACE_VRFS=()
 declare -a S_CLEANUP_QUEUED=()   # 1 = cleanup already triggered for stream i
+declare -a S_NETEM_IFACE=()
 
 STREAM_COUNT=0
 SERVER_COUNT=0
@@ -2801,11 +2802,19 @@ _cleanup_stream_procs() {
         BIDIR_PIDS[$idx]=0
     fi
 
-    # ── 4. Clear sparkline ring buffers ───────────────────────────────────
+    # ── 4. Remove tc netem for this stream ────────────────────────────────
+    # Lifts network impairment on the stream's egress interface immediately
+    # when the stream finishes. Does nothing if netem was not configured
+    # for this stream or if it was already removed.
+    if [[ "$OS_TYPE" == "linux" ]]; then
+        _remove_netem_for_stream "$idx"
+    fi
+
+    # ── 5. Clear sparkline ring buffers ───────────────────────────────────
     _spark_clear "c" "$idx"
     _spark_clear "r" "$idx"
 
-    # ── 5. Set terminal state and post notification ────────────────────────
+    # ── 6. Set terminal state and post notification ────────────────────────
     S_STATUS_CACHE[$idx]="CLEANED"
 
     local ts; ts="$(date '+%H:%M:%S')"
@@ -3483,6 +3492,9 @@ apply_netem() {
         local jit="${S_JITTER[$i]:-}"
         local loss="${S_LOSS[$i]:-}"
 
+        # Initialise per-stream netem tracking to empty
+        S_NETEM_IFACE[$i]=""
+
         [[ -z "$dly" && -z "$jit" && -z "$loss" ]] && continue
 
         if (( IS_ROOT == 0 )); then
@@ -3491,23 +3503,17 @@ apply_netem() {
             continue
         fi
 
-        # ── Resolve egress interface ───────────────────────────────────────
-        # When a VRF is configured the route lookup MUST be performed inside
-        # that VRF's routing table. Using plain "ip route get" queries the GRT
-        # and returns the wrong interface when the target is only reachable
-        # via a VRF-bound interface.
+        # ── Resolve egress interface via VRF-aware route lookup ────────────
         local oif=""
         local stream_vrf="${S_VRF[$i]:-}"
         local stream_target="${S_TARGET[$i]}"
 
         if command -v ip >/dev/null 2>&1; then
             if [[ -n "$stream_vrf" ]]; then
-                # VRF-aware route lookup — two methods for kernel compatibility
-                # Primary:  ip route get vrf <vrf> <target>  (kernel >= 4.12)
+                # Primary: ip route get vrf <vrf> <target>  (kernel >= 4.12)
                 oif=$(ip route get vrf "${stream_vrf}" "${stream_target}" \
                     2>/dev/null \
                     | grep -oE '\bdev [^ ]+' | awk '{print $2}' | head -1)
-
                 # Fallback: ip vrf exec <vrf> ip route get <target>
                 if [[ -z "$oif" ]]; then
                     oif=$(ip vrf exec "${stream_vrf}" \
@@ -3515,7 +3521,6 @@ apply_netem() {
                         | grep -oE '\bdev [^ ]+' | awk '{print $2}' | head -1)
                 fi
             else
-                # GRT route lookup
                 oif=$(ip route get "${stream_target}" 2>/dev/null \
                     | grep -oE '\bdev [^ ]+' | awk '{print $2}' | head -1)
             fi
@@ -3523,8 +3528,7 @@ apply_netem() {
 
         if [[ -z "$oif" ]]; then
             local _vrf_hint=""
-            [[ -n "$stream_vrf" ]] && \
-                _vrf_hint=" (VRF: ${stream_vrf})"
+            [[ -n "$stream_vrf" ]] && _vrf_hint=" (VRF: ${stream_vrf})"
             printf '%b\n' \
                 "${YELLOW}  WARNING: cannot resolve route for ${stream_target}${_vrf_hint}" \
                 "-- netem skipped for stream $((i+1)).${NC}"
@@ -3546,49 +3550,36 @@ apply_netem() {
         done
 
         if (( already_applied )); then
+            # Still record the interface for this stream so cleanup works
+            S_NETEM_IFACE[$i]="$oif"
             printf '%b  [NETEM  ]  dev %-12s  already applied -- shared by stream %d%b\n' \
                 "$CYAN" "$oif" "$((i+1))" "$NC"
             continue
         fi
 
         # ── Read CURRENT netem values on this interface ────────────────────
-        # tc qdisc show gives output like:
-        #   qdisc netem 8001: root refcnt 2 limit 1000 delay 10ms jitter 5ms loss 2%
-        # or:
-        #   qdisc pfifo_fast 0: root refcnt 2 bands 3 priomap ...
-        local cur_qdisc cur_delay cur_jitter cur_loss
+        local cur_qdisc
         cur_qdisc=$(tc qdisc show dev "$oif" 2>/dev/null | head -1)
 
+        local cur_delay="none" cur_jitter="none" cur_loss="none"
         if printf '%s' "$cur_qdisc" | grep -q 'netem'; then
-            # Extract existing delay
             cur_delay=$(printf '%s' "$cur_qdisc" \
                 | grep -oE 'delay [0-9]+(\.[0-9]+)?(ms|us|s)' \
                 | awk '{print $2}' | head -1)
             [[ -z "$cur_delay" ]] && cur_delay="0ms"
 
-            # Extract existing jitter
             cur_jitter=$(printf '%s' "$cur_qdisc" \
                 | grep -oE 'delay [0-9]+(\.[0-9]+)?(ms|us|s) [0-9]+(\.[0-9]+)?(ms|us|s)' \
                 | awk '{print $3}' | head -1)
             [[ -z "$cur_jitter" ]] && cur_jitter="0ms"
 
-            # Extract existing loss
             cur_loss=$(printf '%s' "$cur_qdisc" \
                 | grep -oE 'loss [0-9]+(\.[0-9]+)?%' \
                 | awk '{print $2}' | head -1)
             [[ -z "$cur_loss" ]] && cur_loss="0%"
-        else
-            cur_delay="none"
-            cur_jitter="none"
-            cur_loss="none"
         fi
 
-        # ── Format new values for display ──────────────────────────────────
-        local new_delay="${dly:+${dly}ms}"  ; [[ -z "$dly"  ]] && new_delay="0ms"
-        local new_jitter="${jit:+${jit}ms}" ; [[ -z "$jit"  ]] && new_jitter="0ms"
-        local new_loss="${loss:+${loss}%}"  ; [[ -z "$loss" ]] && new_loss="0%"
-
-        # ── Apply tc netem ─────────────────────────────────────────────────
+        # ── Build tc netem command ─────────────────────────────────────────
         tc qdisc del dev "$oif" root 2>/dev/null || true
 
         local nc="tc qdisc add dev ${oif} root netem"
@@ -3603,89 +3594,69 @@ apply_netem() {
 
         if bash -c "$nc" 2>/dev/null; then
             NETEM_IFACES+=("$oif")
+            S_NETEM_IFACE[$i]="$oif"
 
-            # ── Print before/after table ───────────────────────────────────
+            # ── Before/after table ─────────────────────────────────────────
             local inner=$(( COLS - 2 ))
             local vrf_label="${stream_vrf:-GRT}"
+            local new_delay="${dly:+${dly}ms}"; [[ -z "$dly"  ]] && new_delay="0ms"
+            local new_jitter="${jit:+${jit}ms}"; [[ -z "$jit" ]] && new_jitter="0ms"
+            local new_loss="${loss:+${loss}%}"; [[ -z "$loss" ]] && new_loss="0%"
 
             printf '\n'
             printf '+%s+\n' "$(rpt '=' "$inner")"
             bcenter "${BOLD}${CYAN}tc netem Applied — Stream $((i+1))${NC}"
             printf '+%s+\n' "$(rpt '=' "$inner")"
-
-            # Stream info row
             bleft "  Interface : ${BOLD}${oif}${NC}  ${DIM}(routing via ${vrf_label})${NC}"
-            bleft "  Stream    : $((i+1))  ${S_PROTO[$i]} → ${S_TARGET[$i]}:${S_PORT[$i]}"
-
+            bleft "  Stream    : $((i+1))  ${S_PROTO[$i]} → ${stream_target}:${S_PORT[$i]}"
             printf '+%s+\n' "$(rpt '-' "$inner")"
 
-            # Column header
-            local C1=12 C2=16 C3=16 C4=16
+            # Column widths
+            local _CP=14 _CB=14 _CA=14 _CC=10
+
             bleft "${BOLD}$(printf '%-*s  %-*s  %-*s  %-*s' \
-                "$C1" 'Parameter' \
-                "$C2" 'Before' \
-                "$C3" 'After' \
-                "$C4" 'Change')${NC}"
-
+                "$_CP" 'Parameter' \
+                "$_CB" 'Before' \
+                "$_CA" 'After' \
+                "$_CC" 'Change')${NC}"
             printf '+%s+\n' "$(rpt '-' "$inner")"
 
-            # ── Delay row ──────────────────────────────────────────────────
-            local delay_change=""
-            if [[ "$cur_delay" == "none" && -n "$dly" ]]; then
-                delay_change="${GREEN}added${NC}"
-            elif [[ "$cur_delay" != "none" && -n "$dly" ]]; then
-                if [[ "$cur_delay" != "${dly}ms" ]]; then
-                    delay_change="${YELLOW}modified${NC}"
+            # Helper: change label
+            _netem_change_label() {
+                local before="$1" after="$2" param_set="$3"
+                if [[ "$before" == "none" && "$param_set" == "1" ]]; then
+                    printf '%b' "${GREEN}added${NC}"
+                elif [[ "$before" != "none" && "$before" != "$after" ]]; then
+                    printf '%b' "${YELLOW}modified${NC}"
+                elif [[ "$before" != "none" && "$before" == "$after" ]]; then
+                    printf '%b' "${DIM}unchanged${NC}"
                 else
-                    delay_change="${DIM}unchanged${NC}"
+                    printf '%b' "${DIM}---${NC}"
                 fi
-            fi
+            }
 
-            local before_delay_disp="$cur_delay"
-            [[ "$cur_delay" == "none" ]] && before_delay_disp="${DIM}none${NC}"
+            # Delay row
+            local _d_before="$cur_delay"; [[ "$cur_delay" == "none" ]] && _d_before="${DIM}none${NC}"
+            local _d_change; _d_change=$(_netem_change_label \
+                "$cur_delay" "$new_delay" "${dly:+1}")
+            bleft "$(printf '%-*s  %-*s  %-*s  ' \
+                "$_CP" 'Delay' "$_CB" "$cur_delay" "$_CA" "$new_delay")${_d_change}"
 
-            bleft "$(printf '%-*s  ' "$C1" 'Delay')${DIM}${before_delay_disp}${NC}$(printf '%*s' $(( C2 - ${#cur_delay} )) '')  ${GREEN}${new_delay}${NC}$(printf '%*s' $(( C3 - ${#new_delay} )) '')  ${delay_change}"
+            # Jitter row
+            local _j_change; _j_change=$(_netem_change_label \
+                "$cur_jitter" "$new_jitter" "${jit:+1}")
+            bleft "$(printf '%-*s  %-*s  %-*s  ' \
+                "$_CP" 'Jitter' "$_CB" "$cur_jitter" "$_CA" "$new_jitter")${_j_change}"
 
-            # ── Jitter row ─────────────────────────────────────────────────
-            local jitter_change=""
-            if [[ "$cur_jitter" == "none" && -n "$jit" ]]; then
-                jitter_change="${GREEN}added${NC}"
-            elif [[ "$cur_jitter" != "none" && -n "$jit" ]]; then
-                if [[ "$cur_jitter" != "${jit}ms" ]]; then
-                    jitter_change="${YELLOW}modified${NC}"
-                else
-                    jitter_change="${DIM}unchanged${NC}"
-                fi
-            fi
-
-            local before_jitter_disp="$cur_jitter"
-            [[ "$cur_jitter" == "none" ]] && before_jitter_disp="${DIM}none${NC}"
-
-            bleft "$(printf '%-*s  ' "$C1" 'Jitter')${DIM}${before_jitter_disp}${NC}$(printf '%*s' $(( C2 - ${#cur_jitter} )) '')  ${GREEN}${new_jitter}${NC}$(printf '%*s' $(( C3 - ${#new_jitter} )) '')  ${jitter_change}"
-
-            # ── Loss row ───────────────────────────────────────────────────
-            local loss_change=""
-            if [[ "$cur_loss" == "none" && -n "$loss" ]]; then
-                loss_change="${GREEN}added${NC}"
-            elif [[ "$cur_loss" != "none" && -n "$loss" ]]; then
-                if [[ "$cur_loss" != "${loss}%" ]]; then
-                    loss_change="${YELLOW}modified${NC}"
-                else
-                    loss_change="${DIM}unchanged${NC}"
-                fi
-            fi
-
-            local before_loss_disp="$cur_loss"
-            [[ "$cur_loss" == "none" ]] && before_loss_disp="${DIM}none${NC}"
-
-            bleft "$(printf '%-*s  ' "$C1" 'Packet Loss')${DIM}${before_loss_disp}${NC}$(printf '%*s' $(( C2 - ${#cur_loss} )) '')  ${GREEN}${new_loss}${NC}$(printf '%*s' $(( C3 - ${#new_loss} )) '')  ${loss_change}"
+            # Loss row
+            local _l_change; _l_change=$(_netem_change_label \
+                "$cur_loss" "$new_loss" "${loss:+1}")
+            bleft "$(printf '%-*s  %-*s  %-*s  ' \
+                "$_CP" 'Packet Loss' "$_CB" "$cur_loss" "$_CA" "$new_loss")${_l_change}"
 
             printf '+%s+\n' "$(rpt '-' "$inner")"
-
-            # Status row
-            bleft "  ${GREEN}✔  netem successfully applied to ${BOLD}${oif}${NC}"
+            bleft "  ${GREEN}✔  netem applied to ${BOLD}${oif}${NC}${GREEN} — will be removed when stream finishes${NC}"
             bleft "  ${DIM}Command: ${nc}${NC}"
-
             printf '+%s+\n' "$(rpt '=' "$inner")"
             printf '\n'
 
@@ -3694,6 +3665,50 @@ apply_netem() {
                 "${RED}  WARNING: tc netem failed on ${oif} for stream $((i+1)).${NC}"
         fi
     done
+}
+
+# ---------------------------------------------------------------------------
+# _remove_netem_for_stream  <stream_index>
+#
+# Removes the tc netem qdisc from the egress interface that was configured
+# for this specific stream. Called from _cleanup_stream_procs() so that
+# netem impairment is lifted as soon as the stream finishes rather than
+# waiting for the global cleanup() signal handler.
+#
+# Uses S_NETEM_IFACE[$idx] which is set by apply_netem() for each stream
+# that had netem applied. Streams that shared an interface will each try
+# to remove it — the second attempt is a safe no-op because tc returns
+# an error when the qdisc is already gone (suppressed with 2>/dev/null).
+#
+# After removal the interface is removed from NETEM_IFACES so the global
+# cleanup() handler does not attempt to remove it a second time.
+# ---------------------------------------------------------------------------
+_remove_netem_for_stream() {
+    local idx="$1"
+    local iface="${S_NETEM_IFACE[$idx]:-}"
+
+    # Nothing to do if no netem was applied for this stream
+    [[ -z "$iface" ]] && return 0
+
+    # Attempt removal — safe even if already removed
+    if tc qdisc del dev "$iface" root 2>/dev/null; then
+        local ts; ts="$(date '+%H:%M:%S')"
+        printf '%b[NETEM  ]%b  [%s]  dev %-12s  netem removed (stream %d finished)\n' \
+            "$GREEN" "$NC" "$ts" "$iface" "$(( idx + 1 ))"
+    fi
+
+    # Clear from S_NETEM_IFACE so duplicate calls are no-ops
+    S_NETEM_IFACE[$idx]=""
+
+    # Remove from the global NETEM_IFACES array so cleanup() skips it
+    local new_netem_ifaces=()
+    local entry
+    for entry in "${NETEM_IFACES[@]}"; do
+        [[ "$entry" != "$iface" ]] && new_netem_ifaces+=("$entry")
+    done
+    NETEM_IFACES=("${new_netem_ifaces[@]}")
+
+    return 0
 }
 
 # =============================================================================
@@ -7911,6 +7926,7 @@ main_menu() {
                 read -r -p "  Press Enter to return to menu..." </dev/tty
                 # Reset configuration only
                 STREAM_COUNT=0
+                S_NETEM_IFACE=()
                 NETEM_IFACES=()
                 S_PROTO=();  S_TARGET=(); S_PORT=();   S_BW=()
                 S_DURATION=(); S_DSCP_NAME=(); S_DSCP_VAL=()
@@ -7934,6 +7950,7 @@ main_menu() {
                 # Reset configuration only
                 STREAM_COUNT=0; SERVER_COUNT=0
                 NETEM_IFACES=()
+                S_NETEM_IFACE=()
                 SRV_PORT=(); SRV_BIND=(); SRV_VRF=()
                 SRV_ONEOFF=(); SRV_LOGFILE=(); SRV_SCRIPT=()
                 SRV_PREV_STATE=(); SRV_BW_CACHE=()
