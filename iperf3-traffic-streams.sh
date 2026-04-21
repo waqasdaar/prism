@@ -860,6 +860,23 @@ _spark_render() {
 #
 # Returns normalised bandwidth string e.g. "1.07 Mbps" or "" on failure.
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# _extract_bw_from_line  <line>
+#
+# Extracts the bandwidth value and unit from a single iperf3 interval line.
+# Handles all iperf3 output formats including TCP bidir with extra fields:
+#
+#   [  5][TX-C]  0.00-1.00  sec  128 KBytes  1.05 Mbits/sec    5   2.63 KBytes
+#   [  7][RX-C]  0.00-1.00  sec  128 KBytes  1.05 Mbits/sec
+#   [SUM]  0.00-1.00  sec  1.12 GBytes   963 Mbits/sec
+#   [  5]  0.00-1.00  sec  112 MBytes   940 Mbits/sec
+#
+# Strategy: scan all fields for a token ending in "bits/sec".
+# The field immediately before it is the numeric bandwidth value.
+#
+# Portability: uses only basic awk string matching (~), no ERE grouping,
+# compatible with BSD awk (macOS), gawk, mawk, and nawk.
+# ---------------------------------------------------------------------------
 _extract_bw_from_line() {
     local line="$1"
     [[ -z "$line" ]] && { printf '%s' ''; return; }
@@ -868,10 +885,19 @@ _extract_bw_from_line() {
     result=$(printf '%s\n' "$line" | awk '
     {
         for (i = 1; i <= NF; i++) {
-            # Match unit tokens: bits/sec, Kbits/sec, Mbits/sec, Gbits/sec
-            # Also accept lowercase variants and the common typo "bit/sec"
-            if ($i ~ /^[KMGkmg]?bits?\/(sec|s)$/) {
-                if (i > 1 && $(i-1) ~ /^[0-9]+(\.[0-9]+)?$/) {
+            # Match unit tokens ending in bits/sec:
+            #   bits/sec  Kbits/sec  Mbits/sec  Gbits/sec  (and lowercase)
+            # Use two separate checks to avoid ERE grouping — portable on
+            # BSD awk (macOS), gawk, mawk, nawk.
+            if ($i == "bits/sec"  || \
+                $i == "Kbits/sec" || $i == "kbits/sec" || \
+                $i == "Mbits/sec" || $i == "mbits/sec" || \
+                $i == "Gbits/sec" || $i == "gbits/sec" || \
+                $i == "bits/s"    || \
+                $i == "Kbits/s"   || $i == "kbits/s"   || \
+                $i == "Mbits/s"   || $i == "mbits/s"   || \
+                $i == "Gbits/s"   || $i == "gbits/s") {
+                if (i > 1 && $(i-1) ~ /^[0-9][0-9]*(\.[0-9][0-9]*)?$/) {
                     print $(i-1) " " $i
                     exit
                 }
