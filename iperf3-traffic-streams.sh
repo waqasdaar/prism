@@ -138,6 +138,356 @@ _init_ansi_lengths() {
     _LEN_NC=${#NC}
 }
 
+# ---------------------------------------------------------------------------
+# _theme_detect_default
+#
+# Returns "dark", "light", or "mono" based on environment hints.
+# Checks COLORFGBG first (set by xterm, rxvt, konsole, iTerm2, etc.),
+# then falls back to TERM and finally "dark" as a safe default.
+#
+# COLORFGBG format: "foreground;background"
+#   foreground 0  = black text on light bg  → light theme
+#   background 0  = dark background         → dark theme
+#   background 15 = light background        → light theme
+# ---------------------------------------------------------------------------
+_theme_detect_default() {
+    if [[ -n "${COLORFGBG:-}" ]]; then
+        # Extract background colour index (field after last semicolon)
+        local bg
+        bg=$(printf '%s' "$COLORFGBG" | awk -F';' '{print $NF}')
+        if [[ "$bg" =~ ^[0-9]+$ ]]; then
+            # Indices 0-6 are dark colours → dark terminal
+            # Indices 7-15 are light colours → light terminal
+            if (( bg <= 6 )); then
+                printf '%s' "dark"
+                return
+            else
+                printf '%s' "light"
+                return
+            fi
+        fi
+    fi
+
+    # Fallback: check TERM for known light-background terminals
+    case "${TERM:-}" in
+        *-light|apple-terminal) printf '%s' "light"; return ;;
+    esac
+
+    printf '%s' "dark"
+}
+
+# ---------------------------------------------------------------------------
+# _theme_load
+#
+# Reads the saved theme from the preferences file. If no preferences file
+# exists, auto-detects using _theme_detect_default and saves the result.
+# ---------------------------------------------------------------------------
+_theme_load() {
+    if [[ -f "$THEME_PREFS_FILE" ]]; then
+        local saved
+        saved=$(cat "$THEME_PREFS_FILE" 2>/dev/null | tr -d '[:space:]')
+        case "$saved" in
+            dark|light|mono)
+                THEME_CURRENT="$saved"
+                _theme_apply "$THEME_CURRENT"
+                return
+                ;;
+        esac
+    fi
+    # No valid saved theme — auto-detect and save
+    THEME_CURRENT=$(_theme_detect_default)
+    _theme_save "$THEME_CURRENT"
+    _theme_apply "$THEME_CURRENT"
+}
+
+# ---------------------------------------------------------------------------
+# _theme_save  <theme_name>
+#
+# Persists the theme name to the preferences file.
+# Creates the directory if it does not exist.
+# ---------------------------------------------------------------------------
+_theme_save() {
+    local theme="$1"
+    mkdir -p "$THEME_PREFS_DIR" 2>/dev/null || return
+    printf '%s\n' "$theme" > "$THEME_PREFS_FILE" 2>/dev/null
+}
+
+# ---------------------------------------------------------------------------
+# _theme_apply  <theme_name>
+#
+# Reassigns all global colour variables to the values for the requested
+# theme. Also reinitialises the ANSI byte-length counters so vlen() stays
+# accurate after the theme switch.
+#
+# Dark theme  — vivid colours designed for black/dark-grey backgrounds
+# Light theme — darker/more saturated hues that remain readable on white
+# Mono theme  — all colour variables set to empty string (no escape codes)
+# ---------------------------------------------------------------------------
+_theme_apply() {
+    local theme="${1:-dark}"
+    THEME_CURRENT="$theme"
+
+    case "$theme" in
+
+        # ── Dark terminal theme ───────────────────────────────────────────
+        # Standard ANSI colours — bright on dark backgrounds.
+        dark)
+            RED=$'\033[0;31m'
+            GREEN=$'\033[0;32m'
+            YELLOW=$'\033[1;33m'
+            BLUE=$'\033[0;34m'
+            CYAN=$'\033[0;36m'
+            BOLD=$'\033[1m'
+            DIM=$'\033[2m'
+            NC=$'\033[0m'
+            ;;
+
+        # ── Light terminal theme ──────────────────────────────────────────
+        # Darker, more saturated variants that remain readable on white or
+        # light-grey terminal backgrounds where the standard colours wash out.
+        #
+        # Colour mapping:
+        #   RED    → bold dark red     (1;31)  — standard red too light
+        #   GREEN  → bold dark green   (0;32)  — same, readable on white
+        #   YELLOW → bold dark yellow  (0;33)  — avoid 1;33 which is near-white
+        #   BLUE   → bold blue         (1;34)  — standard blue readable
+        #   CYAN   → bold dark cyan    (0;36)  — teal, readable on white
+        #   BOLD   → bold              (1)
+        #   DIM    → dark grey         (0;90)  — 2m (dim) invisible on light bg
+        #   NC     → reset
+        light)
+            RED=$'\033[1;31m'
+            GREEN=$'\033[0;32m'
+            YELLOW=$'\033[0;33m'
+            BLUE=$'\033[1;34m'
+            CYAN=$'\033[0;36m'
+            BOLD=$'\033[1m'
+            DIM=$'\033[0;90m'
+            NC=$'\033[0m'
+            ;;
+
+        # ── Monochrome / accessibility theme ─────────────────────────────
+        # All colour escape sequences are cleared. Output uses only bold
+        # and dim for structural emphasis. Compatible with screen readers,
+        # high-contrast terminals, and colour-blind users.
+        mono)
+            RED=''
+            GREEN=''
+            YELLOW=''
+            BLUE=''
+            CYAN=''
+            BOLD=$'\033[1m'
+            DIM=$'\033[2m'
+            NC=$'\033[0m'
+            ;;
+
+        *)
+            # Unknown theme — silently fall back to dark
+            _theme_apply "dark"
+            return
+            ;;
+    esac
+
+    # Reinitialise ANSI byte-length counters so vlen() stays accurate
+    _init_ansi_lengths
+}
+
+# ---------------------------------------------------------------------------
+# _theme_name_display  <theme_name>
+#
+# Returns a human-readable, coloured label for a theme name.
+# Used in the menu and confirmation messages.
+# ---------------------------------------------------------------------------
+_theme_name_display() {
+    case "$1" in
+        dark)  printf '%b' "${BOLD}Dark${NC}  ${DIM}(vivid colours, dark background)${NC}" ;;
+        light) printf '%b' "${BOLD}Light${NC} ${DIM}(darker colours, light background)${NC}" ;;
+        mono)  printf '%b' "${BOLD}Mono${NC}  ${DIM}(no colour, accessibility mode)${NC}" ;;
+        *)     printf '%s' "$1" ;;
+    esac
+}
+
+# ---------------------------------------------------------------------------
+# show_theme_menu
+#
+# Interactive theme selection menu. Called from main_menu option 6.
+# Displays the current theme, the auto-detected default, and all three
+# options. Applies and saves the selection immediately.
+# ---------------------------------------------------------------------------
+
+show_theme_menu() {
+    clear
+    local inner=$(( COLS - 2 ))
+
+    # ── Header ────────────────────────────────────────────────────────────
+    printf '+%s+\n' "$(rpt '=' $inner)"
+    bcenter "Colour Theme"
+    printf '+%s+\n' "$(rpt '=' $inner)"
+
+    # ── Status block ──────────────────────────────────────────────────────
+    # Use a fixed label column width so values line up vertically.
+    local detected; detected=$(_theme_detect_default)
+    local _lw=16   # label column width
+
+    _tline() {
+        local label="$1" value="$2" note="$3"
+        # Build the full content string in plain text first so we can
+        # measure its length precisely before padding.
+        local content
+        content=$(printf '%-*s%s' "$_lw" "$label" "$value")
+        [[ -n "$note" ]] && content+="  ($note)"
+        # Pad to fill inner width minus the 2-space left indent
+        local rp=$(( inner - 2 - ${#content} - 1 ))
+        (( rp < 0 )) && rp=0
+        printf '|  %s%s|\n' "$content" "$(rpt ' ' $rp)"
+    }
+
+    _tline "Active"         "${THEME_CURRENT:-dark}" ""
+    _tline "Auto-detected"  "${detected}"            "from COLORFGBG / TERM"
+    _tline "Saved to"       "${THEME_PREFS_FILE}"    ""
+    printf '+%s+\n' "$(rpt '=' $inner)"
+
+    # ── Table column layout ───────────────────────────────────────────────
+    #
+    # Total usable width inside borders = inner - 2 (left indent)
+    #                                             - 1 (right space before |)
+    #                                   = inner - 3
+    #
+    # Fixed columns:
+    #   C_NUM    = 1   (#)
+    #   C_NAME   = 10  (theme name)
+    #   C_STATUS = 8   ("active" or blank)
+    #
+    # Gaps between columns: 2 spaces each, 3 gaps = 6 chars
+    #
+    # Remaining space goes entirely to the description column.
+    #
+    local usable=$(( inner - 3 ))
+    local C_NUM=1 C_NAME=10 C_STATUS=8
+    local gaps=6   # 3 gaps × 2 spaces
+    local C_DESC=$(( usable - C_NUM - C_NAME - C_STATUS - gaps ))
+    (( C_DESC < 20 )) && C_DESC=20
+
+    # ── Column header ─────────────────────────────────────────────────────
+    local header
+    printf -v header '%-*s  %-*s  %-*s  %-*s' \
+        $C_NUM    '#' \
+        $C_NAME   'Theme' \
+        $C_DESC   'Description' \
+        $C_STATUS 'Status'
+
+    local hlen=${#header}
+    local hrp=$(( inner - 2 - hlen - 1 ))
+    (( hrp < 0 )) && hrp=0
+
+    printf '+%s+\n' "$(rpt '-' $inner)"
+    printf '|  %s%s|\n' "$header" "$(rpt ' ' $hrp)"
+    printf '+%s+\n' "$(rpt '-' $inner)"
+
+    # ── Theme row helper ───────────────────────────────────────────────────
+    # All arithmetic is done on plain-text strings so column positions
+    # are exact. No ANSI codes inside the measured fields.
+    _trow() {
+        local num="$1" name="$2" desc="$3"
+
+        local status_text=""
+        [[ -n "$name" && "$THEME_CURRENT" == "$name" ]] && status_text="active"
+
+        local name_cap=""
+        [[ -n "$name" ]] && \
+            name_cap=$(printf '%s' "$name" \
+                | awk '{print toupper(substr($0,1,1)) substr($0,2)}')
+
+        # Truncate description to C_DESC if needed
+        if (( ${#desc} > C_DESC )); then
+            desc="${desc:0:$(( C_DESC - 1 ))}~"
+        fi
+
+        local row
+        printf -v row '%-*s  %-*s  %-*s  %-*s' \
+            $C_NUM    "$num" \
+            $C_NAME   "$name_cap" \
+            $C_DESC   "$desc" \
+            $C_STATUS "$status_text"
+
+        # The row was built with exact field widths so its length should
+        # equal usable. Compute right-padding defensively anyway.
+        local rlen=${#row}
+        local rrp=$(( inner - 2 - rlen - 1 ))
+        (( rrp < 0 )) && rrp=0
+
+        printf '|  %s%s|\n' "$row" "$(rpt ' ' $rrp)"
+    }
+
+    _trow "1" "dark"  "Vivid ANSI colours for dark/black terminal backgrounds"
+    printf '+%s+\n' "$(rpt '-' $inner)"
+    _trow "2" "light" "Darker hues for white or light-grey terminal backgrounds"
+    printf '+%s+\n' "$(rpt '-' $inner)"
+    _trow "3" "mono"  "No colour codes, bold/dim only — accessibility mode"
+    printf '+%s+\n' "$(rpt '-' $inner)"
+    _trow "4" ""      "Auto-detect — reset to terminal default (${detected})"
+    printf '+%s+\n' "$(rpt '-' $inner)"
+    _trow "5" ""      "Back to main menu"
+    printf '+%s+\n' "$(rpt '=' $inner)"
+
+    # ── Palette swatch ─────────────────────────────────────────────────────
+    # The swatch line is the only line that uses ANSI codes.
+    # We measure the visible character count independently and pad correctly.
+    printf '+%s+\n' "$(rpt '-' $inner)"
+    case "$THEME_CURRENT" in
+        dark|light)
+            # Build swatch tokens with known visible widths
+            # Each token: 3 visible chars + 2 space separators = 5 visible each
+            # Tokens: RED GRN YLW BLU CYN BLD DIM = 7 × 5 - 2 trailing = 33
+            local swatch_label="Palette:  "
+            local swatch_visible=$(( ${#swatch_label} + 33 ))
+            local swatch_rp=$(( inner - 2 - swatch_visible - 1 ))
+            (( swatch_rp < 0 )) && swatch_rp=0
+
+            printf '|  %s' "$swatch_label"
+            printf '%b' "${RED}${BOLD}RED${NC}  "
+            printf '%b' "${GREEN}${BOLD}GRN${NC}  "
+            printf '%b' "${YELLOW}${BOLD}YLW${NC}  "
+            printf '%b' "${BLUE}${BOLD}BLU${NC}  "
+            printf '%b' "${CYAN}${BOLD}CYN${NC}  "
+            printf '%b' "${BOLD}BLD${NC}  "
+            printf '%b' "${DIM}DIM${NC}"
+            printf '%s|\n' "$(rpt ' ' $swatch_rp)"
+            ;;
+        mono)
+            local mono_line="Palette:  BOLD  DIM  (no colour codes active)"
+            local mono_rp=$(( inner - 2 - ${#mono_line} - 1 ))
+            (( mono_rp < 0 )) && mono_rp=0
+            printf '|  %s%s|\n' "$mono_line" "$(rpt ' ' $mono_rp)"
+            ;;
+    esac
+    printf '+%s+\n' "$(rpt '=' $inner)"
+    echo ""
+
+    # ── Prompt ────────────────────────────────────────────────────────────
+    local sel
+    while true; do
+        read -r -p "  Select [1-5]: " sel </dev/tty
+        case "$sel" in
+            1) _theme_apply "dark";  _theme_save "dark"
+               printf '\n  Dark theme applied and saved.\n\n'
+               sleep 0.5; return 0 ;;
+            2) _theme_apply "light"; _theme_save "light"
+               printf '\n  Light theme applied and saved.\n\n'
+               sleep 0.5; return 0 ;;
+            3) _theme_apply "mono";  _theme_save "mono"
+               printf '\n  Monochrome theme applied and saved.\n\n'
+               sleep 0.5; return 0 ;;
+            4) local auto; auto=$(_theme_detect_default)
+               _theme_apply "$auto"; _theme_save "$auto"
+               printf '\n  Auto-detected: %s. Applied and saved.\n\n' "$auto"
+               sleep 0.5; return 0 ;;
+            5|""|q|Q) return 0 ;;
+            *) printf '  Enter 1-5.\n' ;;
+        esac
+    done
+}
+
 COLS=80
 IPERF3_BIN=""
 IPERF3_MAJOR=0; IPERF3_MINOR=0; IPERF3_PATCH=0
@@ -213,6 +563,27 @@ SELECTED_VRF=""
 BIDIR_SUPPORTED=0
 _PREV_DYNAMIC_LINES=0
 
+
+# =============================================================================
+# COLOUR THEME ENGINE
+# =============================================================================
+#
+# Three themes are supported:
+#   dark        — default, optimised for dark terminal backgrounds
+#   light       — adjusted colours for light terminal backgrounds
+#   mono        — monochrome / accessibility mode, no colour codes
+#
+# The active theme is stored in ~/.config/iperf3-streams/theme
+# Auto-detection uses COLORFGBG (set by many terminals: "15;0" = dark,
+# "0;15" = light). Falls back to "dark" when COLORFGBG is unset.
+#
+# All colour variables (RED, GREEN, etc.) are reassigned when the theme
+# changes so every existing printf/bleft call inherits the new values
+# without modification.
+
+THEME_CURRENT=""                          # active theme name
+THEME_PREFS_DIR="${HOME}/.config/iperf3-streams"
+THEME_PREFS_FILE="${THEME_PREFS_DIR}/theme"
 
 # When a stream is configured for bidirectional simultaneous testing, a second
 # iperf3 process is launched with --reverse (-R) alongside the forward stream.
@@ -480,16 +851,64 @@ vlen() {
     local text="$1"
     local total=${#text}
     local plain="$text"
-    local count ansi_bytes=0
-    local temp
+    local ansi_bytes=0
+    local temp count
 
-    temp="${plain//$RED/}";    count=$(( (${#plain} - ${#temp}) / _LEN_RED    )); (( _LEN_RED    > 0 )) && ansi_bytes=$(( ansi_bytes + count * _LEN_RED    )); plain="$temp"
-    temp="${plain//$GREEN/}";  count=$(( (${#plain} - ${#temp}) / _LEN_GREEN  )); (( _LEN_GREEN  > 0 )) && ansi_bytes=$(( ansi_bytes + count * _LEN_GREEN  )); plain="$temp"
-    temp="${plain//$YELLOW/}"; count=$(( (${#plain} - ${#temp}) / _LEN_YELLOW )); (( _LEN_YELLOW > 0 )) && ansi_bytes=$(( ansi_bytes + count * _LEN_YELLOW )); plain="$temp"
-    temp="${plain//$BLUE/}";   count=$(( (${#plain} - ${#temp}) / _LEN_BLUE   )); (( _LEN_BLUE   > 0 )) && ansi_bytes=$(( ansi_bytes + count * _LEN_BLUE   )); plain="$temp"
-    temp="${plain//$CYAN/}";   count=$(( (${#plain} - ${#temp}) / _LEN_CYAN   )); (( _LEN_CYAN   > 0 )) && ansi_bytes=$(( ansi_bytes + count * _LEN_CYAN   )); plain="$temp"
-    temp="${plain//$BOLD/}";   count=$(( (${#plain} - ${#temp}) / _LEN_BOLD   )); (( _LEN_BOLD   > 0 )) && ansi_bytes=$(( ansi_bytes + count * _LEN_BOLD   )); plain="$temp"
-    temp="${plain//$NC/}";     count=$(( (${#plain} - ${#temp}) / _LEN_NC     )); (( _LEN_NC     > 0 )) && ansi_bytes=$(( ansi_bytes + count * _LEN_NC     )); plain="$temp"
+    # For each colour variable: only strip and count if the variable is
+    # non-empty. When a theme sets colour variables to "" (e.g. mono theme),
+    # skipping the substitution avoids two separate bugs:
+    #   1. ${plain//$EMPTY_VAR/} with an empty pattern removes every
+    #      character in Bash, producing a completely wrong length.
+    #   2. Division by _LEN_* = 0 causes a division-by-zero arithmetic error.
+
+    if [[ -n "$RED" ]]; then
+        temp="${plain//$RED/}"
+        count=$(( (${#plain} - ${#temp}) / _LEN_RED ))
+        ansi_bytes=$(( ansi_bytes + count * _LEN_RED ))
+        plain="$temp"
+    fi
+
+    if [[ -n "$GREEN" ]]; then
+        temp="${plain//$GREEN/}"
+        count=$(( (${#plain} - ${#temp}) / _LEN_GREEN ))
+        ansi_bytes=$(( ansi_bytes + count * _LEN_GREEN ))
+        plain="$temp"
+    fi
+
+    if [[ -n "$YELLOW" ]]; then
+        temp="${plain//$YELLOW/}"
+        count=$(( (${#plain} - ${#temp}) / _LEN_YELLOW ))
+        ansi_bytes=$(( ansi_bytes + count * _LEN_YELLOW ))
+        plain="$temp"
+    fi
+
+    if [[ -n "$BLUE" ]]; then
+        temp="${plain//$BLUE/}"
+        count=$(( (${#plain} - ${#temp}) / _LEN_BLUE ))
+        ansi_bytes=$(( ansi_bytes + count * _LEN_BLUE ))
+        plain="$temp"
+    fi
+
+    if [[ -n "$CYAN" ]]; then
+        temp="${plain//$CYAN/}"
+        count=$(( (${#plain} - ${#temp}) / _LEN_CYAN ))
+        ansi_bytes=$(( ansi_bytes + count * _LEN_CYAN ))
+        plain="$temp"
+    fi
+
+    if [[ -n "$BOLD" ]]; then
+        temp="${plain//$BOLD/}"
+        count=$(( (${#plain} - ${#temp}) / _LEN_BOLD ))
+        ansi_bytes=$(( ansi_bytes + count * _LEN_BOLD ))
+        plain="$temp"
+    fi
+
+    if [[ -n "$NC" ]]; then
+        temp="${plain//$NC/}"
+        count=$(( (${#plain} - ${#temp}) / _LEN_NC ))
+        ansi_bytes=$(( ansi_bytes + count * _LEN_NC ))
+        plain="$temp"
+    fi
 
     printf '%d' $(( total - ansi_bytes ))
 }
@@ -703,13 +1122,13 @@ parse_live_bandwidth_from_log() {
 # SUM lines are always preferred over individual stream lines because they
 # carry the correct aggregate bandwidth for parallel (-P) connections.
 # ---------------------------------------------------------------------------
+
 _parse_bidir_bw_from_log() {
     local logfile="$1"
     local direction="${2:-tx}"
 
     [[ ! -f "$logfile" || ! -s "$logfile" ]] && { printf '%s' '---'; return; }
 
-    # Determine the role tag suffix for the requested direction
     local role
     case "$direction" in
         tx) role="TX-C" ;;
@@ -720,23 +1139,26 @@ _parse_bidir_bw_from_log() {
     local ll=""
 
     # ── Priority 1: [SUM][TX-C] / [SUM][RX-C] — parallel bidir ───────────
+    # Prefer SUM lines for parallel streams — they carry the aggregate.
+    # Do NOT skip zero-value lines here: the SUM line is authoritative.
     if [[ -z "$ll" ]]; then
         ll=$(grep -E "\[SUM\]\[${role}\]" "$logfile" 2>/dev/null \
             | grep -E '[0-9.]+-[0-9.]+[[:space:]]+sec' \
             | grep -vE '[[:space:]](sender|receiver)[[:space:]]*$' \
-            | grep -vE '[[:space:]]0\.00[[:space:]]+bits/sec' \
             | tail -1)
     fi
 
     # ── Priority 2: [ N][TX-C] / [ N][RX-C] — single stream compound ──────
-    # Matches lines like:  [  5][TX-C]   0.00-1.00   sec   112 MBytes ...
-    # Skips lines with 0.00 bits/sec (common in early bidir negotiation).
+    # Matches:  [  5][TX-C]   0.00-1.00   sec   112 MBytes   940 Mbits/sec
+    # The ]\[ pattern matches the junction between the two bracket fields.
+    # We take the LAST non-summary interval line regardless of bandwidth value.
+    # Earlier versions skipped 0.00 lines but this caused TCP streams to show
+    # --- during slow-start. We rely on tail -1 to get the most recent line.
     if [[ -z "$ll" ]]; then
         ll=$(grep -E "\]\[${role}\]" "$logfile" 2>/dev/null \
             | grep -E '[0-9.]+-[0-9.]+[[:space:]]+sec' \
             | grep -vE '[[:space:]](sender|receiver)[[:space:]]*$' \
             | grep -vE '^\[SUM\]' \
-            | grep -vE '[[:space:]]0\.00[[:space:]]+bits/sec' \
             | tail -1)
     fi
 
@@ -748,7 +1170,7 @@ _parse_bidir_bw_from_log() {
             | tail -1)
     fi
 
-    # ── Priority 4: [TX] / [RX] without -C suffix (some older builds) ─────
+    # ── Priority 4: [TX] / [RX] without -C suffix — older builds ──────────
     local role_short
     case "$direction" in
         tx) role_short="TX" ;;
@@ -762,13 +1184,17 @@ _parse_bidir_bw_from_log() {
             | tail -1)
     fi
 
-    # ── Priority 5: plain SUM / stream-ID fallback ────────────────────────
+    # ── Priority 5: plain SUM — parallel streams, unidirectional ──────────
     if [[ -z "$ll" ]]; then
         ll=$(grep -E '^\[SUM\][[:space:]]+[0-9.]+-[0-9.]+[[:space:]]+sec' \
              "$logfile" 2>/dev/null \
              | grep -vE '[[:space:]](sender|receiver)[[:space:]]*$' \
              | tail -1)
     fi
+
+    # ── Priority 6: plain stream-ID — single stream, unidirectional ───────
+    # Also catches compound-bracket lines that slipped past priorities 1-4
+    # because the role tag was absent or in an unexpected format.
     if [[ -z "$ll" ]]; then
         ll=$(grep -E '^\[[[:space:]]*[0-9]+\][[:space:]]+[0-9.]+-[0-9.]+[[:space:]]+sec' \
              "$logfile" 2>/dev/null \
@@ -6218,16 +6644,10 @@ _render_client_frame() {
         if [[ "$st" == "CONNECTED" ]]; then
             if [[ "${S_BIDIR[$i]:-0}" == "1" && \
                   (( BIDIR_SUPPORTED == 1 )) ]]; then
-                # ── Bidir TX: try [TX-C] tagged lines first ────────────────
+                # For --bidir streams _parse_bidir_bw_from_log handles all
+                # formats including compound [ N][TX-C] lines (priority 2)
+                # and plain stream-ID lines as a final fallback (priority 6).
                 bw_tx=$(_parse_bidir_bw_from_log "$lf" "tx")
-
-                # ── Fallback: if [TX-C] returns ---, try plain interval ────
-                # Some iperf3 builds and UDP bidir sessions do not emit
-                # per-interval [TX-C] lines. In that case the plain stream-ID
-                # interval lines carry the TX bandwidth.
-                if [[ "$bw_tx" == "---" || -z "$bw_tx" ]]; then
-                    bw_tx=$(parse_live_bandwidth_from_log "$lf")
-                fi
             else
                 bw_tx=$(parse_live_bandwidth_from_log "$lf")
             fi
@@ -7900,35 +8320,94 @@ _dscp_verify_server_interactive() {
 # =============================================================================
 
 show_main_menu() {
-    clear; echo ""
-    bline '='; bempty
-    bcenter "${BOLD}${CYAN}iperf3 Traffic Streams  v8.2.5${NC}"
-    bempty; bline '='
+    clear
+    local inner=$(( COLS - 2 ))
 
-    if [[ "$OS_TYPE" == "macos" ]]; then
-        bleft "  iperf3 ${IPERF3_MAJOR}.${IPERF3_MINOR}.${IPERF3_PATCH}   at ${IPERF3_BIN}  ${YELLOW}[macOS / bash ${BASH_MAJOR}.x]${NC}"
-    else
-        bleft "  iperf3 ${IPERF3_MAJOR}.${IPERF3_MINOR}.${IPERF3_PATCH}   at ${IPERF3_BIN}"
-    fi
+    # ── Header ────────────────────────────────────────────────────────────
+    printf '+%s+\n' "$(rpt '=' $inner)"
+    bcenter "${BOLD}iperf3 Traffic Streams${NC}  v8.2.5"
+    printf '+%s+\n' "$(rpt '=' $inner)"
 
+    # ── System info: plain text only so bleft padding is exact ────────────
+    local _iperf_line="iperf3 ${IPERF3_MAJOR}.${IPERF3_MINOR}.${IPERF3_PATCH}  at ${IPERF3_BIN}"
+    [[ "$OS_TYPE" == "macos" ]] && \
+        _iperf_line+="  [macOS / bash ${BASH_MAJOR}.x]"
+
+    local _root_text
     if (( IS_ROOT )); then
-        bleft "  Running as: ${GREEN}root${NC}  (full feature access)"
+        _root_text="root"
     else
-        if [[ "$OS_TYPE" == "macos" ]]; then
-            bleft "  Running as: ${YELLOW}non-root${NC}  (netem/low-ports may fail; VRF not applicable)"
-        else
-            bleft "  Running as: ${YELLOW}non-root${NC}  (VRF/netem/low-ports may fail)"
-        fi
+        _root_text="non-root"
     fi
+    local _status_line="User  ${_root_text}  ·  Theme  ${THEME_CURRENT:-dark}  ·  OS  ${OS_TYPE}"
 
-    bempty; bline '-'; bempty
-    bleft "   ${BOLD}1${NC}   Interface Table"
-    bleft "   ${BOLD}2${NC}   Server Mode   --  start iperf3 listener(s)"
-    bleft "   ${BOLD}3${NC}   Client Mode   --  generate traffic stream(s)"
-    bleft "   ${BOLD}4${NC}   Loopback Test --  local server + client validation"
-    bleft "   ${BOLD}5${NC}   DSCP Reference Table"
-    bleft "   ${BOLD}6${NC}   Exit"
-    bempty; bline '='; echo ""
+    bleft "$_iperf_line"
+    bleft "$_status_line"
+    printf '+%s+\n' "$(rpt '=' $inner)"
+
+    # ── Section label helper ──────────────────────────────────────────────
+    # Prints a left-aligned section label using plain text so bleft
+    # does not have to account for ANSI bytes in the width calculation.
+    _menu_section() {
+        local label="$1"
+        local rp=$(( inner - 1 - ${#label} ))
+        (( rp < 0 )) && rp=0
+        printf '|  %s%s|\n' "$label" "$(rpt ' ' $(( rp - 2 )))"
+    }
+
+    # ── Menu item helper ──────────────────────────────────────────────────
+    # Prints:  |  N  Name                Description                       |
+    # All fields plain text so column math is exact.
+    _menu_item() {
+        local num="$1"
+        local name="$2"
+        local desc="$3"
+
+        # Fixed column layout within inner width:
+        #   2 spaces indent + 1 num + 2 spaces + 20 name + 1 space + desc + padding + |
+        local name_col=20
+        local name_padded
+        if (( ${#name} >= name_col )); then
+            name_padded="${name:0:$((name_col-1))}~"
+        else
+            name_padded="${name}$(rpt ' ' $(( name_col - ${#name} )))"
+        fi
+
+        local prefix="  ${num}  ${name_padded} "
+        local prefix_len=$(( 2 + ${#num} + 2 + name_col + 1 ))
+        local desc_max=$(( inner - prefix_len - 1 ))
+        local desc_disp="$desc"
+        (( ${#desc_disp} > desc_max )) && \
+            desc_disp="${desc_disp:0:$(( desc_max - 1 ))}~"
+
+        local rp=$(( inner - prefix_len - ${#desc_disp} ))
+        (( rp < 0 )) && rp=0
+        printf '|%s%s%s|\n' \
+            "$prefix" "$desc_disp" "$(rpt ' ' $rp)"
+    }
+
+    # ── NETWORK section ───────────────────────────────────────────────────
+    _menu_section "NETWORK"
+    printf '+%s+\n' "$(rpt '-' $inner)"
+    _menu_item "1" "Interface Table"     "List interfaces, IPs, VRFs and link state"
+    _menu_item "2" "Server Mode"         "Launch one or more iperf3 listeners"
+    _menu_item "3" "Client Mode"         "Generate traffic streams with full QoS control"
+    _menu_item "4" "Loopback Test"       "Self-contained server + client validation"
+    printf '+%s+\n' "$(rpt '-' $inner)"
+
+    # ── REFERENCE section ─────────────────────────────────────────────────
+    _menu_section "REFERENCE"
+    printf '+%s+\n' "$(rpt '-' $inner)"
+    _menu_item "5" "DSCP Reference"      "DSCP / TOS / EF / AF / CS class mappings"
+    _menu_item "6" "Colour Theme"        "Dark · Light · Mono  (active: ${THEME_CURRENT:-dark})"
+    printf '+%s+\n' "$(rpt '-' $inner)"
+
+    # ── SESSION section ───────────────────────────────────────────────────
+    _menu_section "SESSION"
+    printf '+%s+\n' "$(rpt '-' $inner)"
+    _menu_item "7" "Exit"                ""
+    printf '+%s+\n' "$(rpt '=' $inner)"
+    echo ""
 }
 
 main_menu() {
@@ -7998,16 +8477,18 @@ main_menu() {
                 S_RTT_MIN=();   S_RTT_AVG=();  S_RTT_MAX=()
                 S_RTT_JITTER=(); S_RTT_LOSS=(); S_RTT_SAMPLES=()
                 ;;
-            5)
+5)
                 echo ""; show_dscp_table
                 read -r -p "  Press Enter to return to menu..." </dev/tty ;;
-            6|q|Q)
+            6)
+                show_theme_menu ;;
+            7|q|Q)
                 echo ""; printf '%b\n' "${GREEN}  Goodbye! Cleaning up...${NC}"; echo "";
-                cleanup "user exit (option 6)"
+                cleanup "user exit (option 7)"
                 exit 0 ;;
             "") ;;
             *)
-                printf '%b\n' "${RED}  Invalid choice '${choice}'. Enter 1 to 6.${NC}"
+                printf '%b\n' "${RED}  Invalid choice '${choice}'. Enter 1 to 7.${NC}"
                 sleep 1 ;;
         esac
     done
@@ -8019,6 +8500,7 @@ main_menu() {
 
 main() {
     _init_ansi_lengths
+    _theme_load          # load saved theme (or auto-detect and save default)
     register_traps
     init_tmpdir
     find_iperf3
