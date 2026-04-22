@@ -7800,10 +7800,36 @@ _render_client_frame() {
     else
         printf '\033[K\n'
     fi
-    _rc=$(( _rc + 1 ))    # ← arithmetic expansion, not command
+    _rc=$(( _rc + 1 ))
 
-    # ── Store self-measured line count ──────────────────────────────────
-    _LAST_FRAME_LINE_COUNT=$_rc
+    # ── Store self-measured line count ────────────────────────────────────
+    # Dual-track: take the larger of _rc (self-counted) and _expected
+    # (state-based calculation). If _rc is corrupted to a small value,
+    # _expected provides the correct count and prevents frame drift.
+    local _expected_lines
+    _expected_lines=$(_count_client_frame_lines_for_state)
+
+    # Add CWND inline rows that were actually rendered this tick.
+    # _count_client_frame_lines_for_state intentionally excludes CWND
+    # from pre-reservation, so we add them back here after rendering.
+    local _ci _cwnd_rendered=0
+    for (( _ci=0; _ci<STREAM_COUNT; _ci++ )); do
+        local _cst="${S_STATUS_CACHE[$_ci]:-}"
+        case "$_cst" in CLEANED|CLEANUP_PENDING|FAILED) continue ;; esac
+        [[ "${S_PROTO[$_ci]:-TCP}" != "TCP" ]] && continue
+        local _ctgt="${S_TARGET[$_ci]:-}"
+        [[ "$_ctgt" =~ ^127\. || "$_ctgt" == "::1" ]] && continue
+        [[ "${S_CWND_SAMPLES[$_ci]:-0}" == "0" ]] && continue
+        _cwnd_rendered=$(( _cwnd_rendered + 1 ))
+    done
+    _expected_lines=$(( _expected_lines + _cwnd_rendered ))
+
+    # Use whichever count is larger
+    if (( _rc >= _expected_lines )); then
+        _LAST_FRAME_LINE_COUNT=$_rc
+    else
+        _LAST_FRAME_LINE_COUNT=$_expected_lines
+    fi
 }
 
 _render_server_frame() {
