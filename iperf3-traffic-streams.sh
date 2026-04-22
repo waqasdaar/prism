@@ -5128,30 +5128,85 @@ _preflight_traceroute_vrf() {
     tr_bin=$(printf '%s' "$bin_info" | cut -d'|' -f1)
     tr_type=$(printf '%s' "$bin_info" | cut -d'|' -f2)
 
+    # ── Detect the correct no-DNS flag for the installed binary ────────────
+    #
+    # traceroute variants handle DNS suppression differently:
+    #
+    #   GNU traceroute (Linux, most distros):
+    #     Accepts:  --no-dns   (long form, always works)
+    #     Does NOT accept: -n  (short form — invalid on GNU traceroute)
+    #
+    #   BSD traceroute (macOS, FreeBSD):
+    #     Accepts:  -n         (short form)
+    #
+    #   tracepath (Linux iproute2):
+    #     Accepts:  -n         (short form, suppresses DNS on modern versions)
+    #
+    # Detection strategy:
+    #   1. Run "<binary> --help" and grep for "--no-dns".
+    #      If present → GNU traceroute → use --no-dns.
+    #   2. Otherwise assume BSD/tracepath style → use -n.
+    #   3. Verify the chosen flag does not produce an error by running a
+    #      dry-run against localhost. If it fails, fall back to no flag.
+    #
+    local no_dns_flag=""
+    if [[ "$tr_type" == "traceroute" ]]; then
+        local _help_out
+        _help_out=$("${tr_bin}" --help 2>&1 || true)
+        if printf '%s' "$_help_out" | grep -q '\-\-no-dns\|no.dns'; then
+            # GNU traceroute — use long form
+            no_dns_flag="--no-dns"
+        else
+            # BSD traceroute — use short form
+            no_dns_flag="-n"
+        fi
+
+        # Verify the flag is accepted (dry-run with timeout)
+        local _flag_test
+        _flag_test=$(timeout 2 "${tr_bin}" ${no_dns_flag} -m 1 -w 1 127.0.0.1 \
+            2>&1 | grep -c 'invalid option\|unrecognized option\|Unknown option' \
+            || true)
+        if (( _flag_test > 0 )); then
+            # Flag not accepted — run without DNS suppression flag
+            no_dns_flag=""
+        fi
+    elif [[ "$tr_type" == "tracepath" ]]; then
+        # tracepath: test -n support
+        local _tp_test
+        _tp_test=$(timeout 2 "${tr_bin}" -n 127.0.0.1 2>&1 \
+            | grep -c 'invalid option\|unrecognized option\|Unknown option' \
+            || true)
+        if (( _tp_test == 0 )); then
+            no_dns_flag="-n"
+        fi
+    fi
+
+    # ── Build and execute the traceroute command ───────────────────────────
     if [[ "$OS_TYPE" == "linux" && -n "$vrf_name" ]]; then
         if [[ "$tr_type" == "traceroute" ]]; then
             tr_out=$(sudo ip vrf exec "${vrf_name}" \
-                "${tr_bin}" -m 20 -w 2 -q 1 "${target}" \
+                "${tr_bin}" ${no_dns_flag} -m 20 -w 2 -q 1 "${target}" \
                 2>/dev/tty | tail -n +2)
         else
             tr_out=$(sudo ip vrf exec "${vrf_name}" \
-                "${tr_bin}" "${target}" \
+                "${tr_bin}" ${no_dns_flag} "${target}" \
                 2>/dev/tty | tail -n +2)
         fi
     elif [[ "$OS_TYPE" == "linux" ]]; then
         if [[ "$tr_type" == "traceroute" ]]; then
-            tr_out=$("${tr_bin}" -m 20 -w 2 -q 1 "${target}" \
+            tr_out=$("${tr_bin}" ${no_dns_flag} -m 20 -w 2 -q 1 "${target}" \
                 2>/dev/null | tail -n +2)
         else
-            tr_out=$("${tr_bin}" "${target}" \
+            tr_out=$("${tr_bin}" ${no_dns_flag} "${target}" \
                 2>/dev/null | tail -n +2)
         fi
     else
+        # macOS — BSD traceroute always accepts -n
         if [[ "$tr_type" == "traceroute" ]]; then
-            tr_out=$("${tr_bin}" -m 20 -q 1 "${target}" \
+            tr_out=$("${tr_bin}" ${no_dns_flag} -m 20 -q 1 "${target}" \
                 2>/dev/null | tail -n +2)
         else
-            tr_out=$("${tr_bin}" "${target}" \
+            tr_out=$("${tr_bin}" ${no_dns_flag} "${target}" \
                 2>/dev/null | tail -n +2)
         fi
     fi
@@ -5406,11 +5461,13 @@ run_preflight_checks() {
             local vrf_label
             [[ -n "$vrf" ]] && vrf_label="VRF: ${vrf}" || vrf_label="GRT"
 
+            # In run_preflight_checks, find this block and update the cmd_display line:
+
             local cmd_display
             if [[ "$OS_TYPE" == "linux" && -n "$vrf" ]]; then
-                cmd_display="sudo ip vrf exec ${vrf} traceroute ${tgt}"
+                cmd_display="sudo ip vrf exec ${vrf} traceroute -n ${tgt}"
             else
-                cmd_display="traceroute ${tgt}"
+                cmd_display="traceroute -n ${tgt}"
             fi
 
             bleft "  ${BOLD}Target: ${CYAN}${tgt}${NC}  ${DIM}(${vrf_label})${NC}"
