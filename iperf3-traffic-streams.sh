@@ -3615,25 +3615,8 @@ _render_cwnd_reference_table() {
 #
 # Renders the dedicated real-time TCP Congestion Window tracking panel.
 # Called from run_dashboard() when at least one TCP stream is CONNECTED.
-#
-# Layout:
-#   ╔═══════════════════════════════════════════╗
-#   ║   TCP Congestion Window — Live Tracking   ║
-#   ╠═══════════════════════════════════════════╣
-#   ║  Stream 1  192.168.114.200:5201           ║
-#   ║  Phase: Congestion Avoidance              ║
-#   ║                                           ║
-#   ║  cwnd (KBytes)                            ║
-#   ║  128 │▁▂▄▅▆▇██▇█████▇█████████████████  ║
-#   ║    0 └─────────────────────── (30 smpl)   ║
-#   ║                                           ║
-#   ║  cur: 128.0 KB   min: 12.3 KB             ║
-#   ║  max: 256.0 KB   avg: 98.4 KB             ║
-#   ╠═══════════════════════════════════════════╣
-#   ║  TCP CC Phase   Symbol   What it means    ║
-#   ║  Slow Start     ▁▂▄█     cwnd doubles...  ║
-#   ╚═══════════════════════════════════════════╝
 # ---------------------------------------------------------------------------
+
 _render_cwnd_panel() {
     local inner=$(( COLS - 2 ))
 
@@ -3658,15 +3641,13 @@ _render_cwnd_panel() {
     printf '+%s+\033[K\n' "$(rpt '=' $inner)"
 
     # ── Per-stream CWND block ──────────────────────────────────────────────
-    # Each stream contributes exactly 11 lines:
+    # Each stream contributes exactly 5 lines:
     #   1  stream identity line
     #   1  phase line
     #   1  separator (+---+)
-    #   5  chart rows          ← guaranteed by indexed array loop below
-    #   1  x-axis baseline
-    #   1  separator (+---+)
     #   1  statistics row
-    # Total per stream: 11
+    #   1  separator (+---+)
+    # Total per stream: 5
     for (( i=0; i<STREAM_COUNT; i++ )); do
         local st="${S_STATUS_CACHE[$i]:-}"
         case "$st" in CONNECTED|DONE|CLEANED) ;; *) continue ;; esac
@@ -3719,128 +3700,7 @@ _render_cwnd_panel() {
         # ── Line 3: separator ─────────────────────────────────────────────
         printf '+%s+\033[K\n' "$(rpt '-' $inner)"
 
-        # ── Lines 4-8: chart rows (exactly chart_h=5 lines) ───────────────
-        #
-        # Strategy: pre-fill an indexed array with chart_h empty rows,
-        # then overwrite each slot with awk output keyed by row index.
-        # The final render loop iterates exactly chart_h times regardless
-        # of awk edge cases (empty history, single sample, maxv=0, etc.).
-        # This guarantees _count_cwnd_panel_lines stays accurate.
-
-        local chart_w=$(( inner - 12 ))
-        (( chart_w < 20 )) && chart_w=20
-        local chart_h=5
-
-        # Y-axis labels
-        local y_max_label y_mid_label y_zero_label
-        y_max_label=$(printf '%6.0f' "${cwnd_max:-0}" 2>/dev/null \
-            || printf '%6s' "${cwnd_max}")
-        y_mid_label=$(printf '%6.0f' \
-            "$(awk -v m="${cwnd_max:-0}" 'BEGIN{printf "%.0f",m/2}')" \
-            2>/dev/null || printf '%6s' "")
-        y_zero_label=$(printf '%6s' "0")
-
-        # Pre-fill array with blank rows (chart_w spaces each)
-        local -a chart_row_arr=()
-        local _empty_row _ri
-        printf -v _empty_row '%*s' "$chart_w" ''
-        for (( _ri=0; _ri<chart_h; _ri++ )); do
-            chart_row_arr[$_ri]="$_empty_row"
-        done
-
-        # Build chart via awk — output format: "ROW_INDEX<TAB>LINE_CONTENT"
-        # ROW_INDEX is 1-based where 1=top row, chart_h=bottom row.
-        # Using tab-separated index+content avoids any ambiguity with
-        # block characters or spaces inside the chart content itself.
-        local _awk_chart_out
-        _awk_chart_out=$(printf '%s\n' "${cwnd_hist:-0}" | awk \
-            -v w="$chart_w" \
-            -v h="$chart_h" \
-            -v maxv="${cwnd_max:-1}" \
-            'BEGIN {
-                FS    = ":"
-                full  = "\342\226\210"   # U+2588 full block
-                lower = "\342\226\201"   # U+2581 lower eighth
-                empty = " "
-            }
-            {
-                n = split($0, vals, ":")
-
-                # Normalise maxv to avoid division by zero
-                if (maxv <= 0) maxv = 1
-
-                # Build per-column normalised heights [0..h]
-                for (j = 1; j <= n && j <= w; j++) {
-                    v = vals[j] + 0
-                    ht[j] = int((v / maxv) * h + 0.5)
-                    if (ht[j] > h) ht[j] = h
-                    if (ht[j] < 0) ht[j] = 0
-                }
-                total_cols = (n < w) ? n : w
-
-                # Emit rows from top (row=h) to bottom (row=1).
-                # row_index counts from 1 (top) to h (bottom) for the array.
-                for (row = h; row >= 1; row--) {
-                    row_index = h - row + 1
-                    line = ""
-                    for (col = 1; col <= total_cols; col++) {
-                        if (ht[col] >= row) {
-                            line = line full
-                        } else if (ht[col] == row - 1 && row > 1) {
-                            line = line lower
-                        } else {
-                            line = line empty
-                        }
-                    }
-                    # Pad to chart width with spaces
-                    for (col = total_cols + 1; col <= w; col++) {
-                        line = line empty
-                    }
-                    printf "%d\t%s\n", row_index, line
-                }
-            }')
-
-        # Load awk output into the pre-filled array
-        local _idx_num _idx_content
-        while IFS=$'\t' read -r _idx_num _idx_content; do
-            # Validate index before writing — guards against empty lines
-            [[ "$_idx_num" =~ ^[0-9]+$ ]] || continue
-            local _arr_idx=$(( _idx_num - 1 ))
-            if (( _arr_idx >= 0 && _arr_idx < chart_h )); then
-                chart_row_arr[$_arr_idx]="$_idx_content"
-            fi
-        done <<< "$_awk_chart_out"
-
-        # Render exactly chart_h rows — line count is deterministic
-        local _row_num
-        for (( _row_num=0; _row_num<chart_h; _row_num++ )); do
-            local y_label="         "   # 9 spaces (same width as "NNN KB ")
-            case $_row_num in
-                0) y_label="$y_max_label KB" ;;
-                2) y_label="$y_mid_label KB" ;;
-                4) y_label="$y_zero_label KB" ;;
-            esac
-            local row_content="${y_label} │${chart_row_arr[$_row_num]}"
-            # Visible length: y_label chars + 3 (space+│+nothing) + chart_w
-            local visible_len=$(( ${#y_label} + 3 + chart_w ))
-            local row_rp=$(( inner - 2 - visible_len - 1 ))
-            (( row_rp < 0 )) && row_rp=0
-            printf '|  %s%s|\033[K\n' "$row_content" "$(rpt ' ' $row_rp)"
-        done
-
-        # ── Line 9: x-axis baseline ────────────────────────────────────────
-        # "         └──────...──  (N smpl)"
-        # 9 spaces + └ + chart_w × ─ + 2 spaces + sample count
-        local xaxis="         └$(rpt '─' $chart_w)  (${cwnd_samples} smpl)"
-        local xlen=${#xaxis}
-        local xrp=$(( inner - 2 - xlen - 1 ))
-        (( xrp < 0 )) && xrp=0
-        printf '|  %s%s|\033[K\n' "$xaxis" "$(rpt ' ' $xrp)"
-
-        # ── Line 10: separator ─────────────────────────────────────────────
-        printf '+%s+\033[K\n' "$(rpt '-' $inner)"
-
-        # ── Line 11: statistics row ────────────────────────────────────────
+        # ── Line 4: statistics row ─────────────────────────────────────────
         local f_cur f_min f_max f_final f_avg_raw
         f_cur=$(printf '%.1f' "$cwnd_cur"         2>/dev/null || printf '%s' "$cwnd_cur")
         f_min=$(printf '%.1f' "$cwnd_min"         2>/dev/null || printf '%s' "$cwnd_min")
@@ -3850,6 +3710,9 @@ _render_cwnd_panel() {
         f_avg_raw=$(printf '%s\n' "${cwnd_hist:-0}" | awk -F: '
             { s=0; for(i=1;i<=NF;i++) s+=$i+0; printf "%.1f", s/NF }')
 
+        local cwnd_spark
+        cwnd_spark=$(_cwnd_sparkline "$i")
+
         local c_col="$GREEN"
         local c_int; c_int=$(printf '%.0f' "$cwnd_cur" 2>/dev/null || printf '0')
         if   (( c_int < 10  )); then c_col="$RED"
@@ -3857,7 +3720,7 @@ _render_cwnd_panel() {
         elif (( c_int < 200 )); then c_col="$CYAN"
         fi
 
-        # Build plain-text version for right-padding calculation
+        # Build stats line — plain text for padding calculation
         local stat_plain="  Current: ${f_cur} KB    Min: ${f_min} KB    Max: ${f_max} KB    Avg: ${f_avg_raw} KB    Final: ${f_final} KB"
         local sprp=$(( inner - ${#stat_plain} - 1 ))
         (( sprp < 0 )) && sprp=0
@@ -3869,6 +3732,9 @@ _render_cwnd_panel() {
         printf '%bAvg:%b %b%s%b KB    '     "$DIM" "$NC" "$NC"       "$f_avg_raw" "$NC"
         printf '%bFinal:%b %b%s%b KB'       "$DIM" "$NC" "$c_col"    "$f_final"   "$NC"
         printf '%s|\033[K\n' "$(rpt ' ' $sprp)"
+
+        # ── Line 5: separator ─────────────────────────────────────────────
+        printf '+%s+\033[K\n' "$(rpt '-' $inner)"
 
     done
 
@@ -5962,14 +5828,22 @@ _pmtu_annotate_stream_summary() {
             annotation="${YELLOW}Path MTU: ${disc} B  MSS: ${rec} B  ⚠ Fragmentation risk${NC}"
             ;;
         CRITICAL)
-            annotation="${RED}Path MTU: ${disc} B  MSS: ${rec} B  ✗ CRITICAL${NC}"
+            annotation="${RED}Path MTU: ${disc} B  MSS: ${rec} B  ✖ CRITICAL${NC}"
             ;;
         UNKNOWN)
             annotation="${DIM}Path MTU: UNKNOWN (ICMP probe failed)${NC}"
             ;;
     esac
 
-    [[ -n "$annotation" ]] && bleft "    ${annotation}"
+    # ── Use plain printf to match the results table style ─────────────────
+    # The results table uses plain printf (not bleft/box-drawing).
+    # _pmtu_annotate_stream_summary must match that style.
+    # Indent to align under the Sender BW column.
+    if [[ -n "$annotation" ]]; then
+        # C_SN=3  C_PROTO=5  C_TGT=15  C_PORT=5  — each separated by 2 spaces
+        # indent = 3+2+5+2+15+2+5+2 = 36 chars to align under Sender BW
+        printf '  %36s%b\n' '' "$annotation"
+    fi
 }
 
 # =============================================================================
@@ -7169,12 +7043,12 @@ _count_cwnd_panel_lines() {
     done
     (( tcp_count == 0 )) && { printf '%d' 0; return; }
 
-    # Fixed header:  3 lines  (top border + bcenter + title border)
-    # Per stream:   11 lines  (identity + phase + sep + 5 chart rows +
-    #                          x-axis + sep + stats)
-    # Reference table: 12 lines  (sep + header + sep + 6 rows +
-    #                              sep + legend + bottom border)
-    printf '%d' $(( 3 + tcp_count * 11 + 12 ))
+    # Anatomy:
+    #   3  fixed header  (top border + bcenter + title border)
+    #   5  per stream    (identity + phase + sep + stats + sep)
+    #   12 reference table (sep + header + sep + 6 rows +
+    #                       sep + legend + bottom border)
+    printf '%d' $(( 3 + tcp_count * 5 + 12 ))
 }
 
 _render_completed_panel() {
@@ -8412,7 +8286,7 @@ display_results_table() {
         # ── MTU annotation ────────────────────────────────────────────────
         _pmtu_annotate_stream_summary "$i"
 
-        # ── CWND summary sub-row (TCP streams only) ────────────────────────
+        # ── CWND summary sub-row ──────────────────────────────────────────
         if [[ "${S_PROTO[$i]:-TCP}" == "TCP" && \
               ! "${S_TARGET[$i]:-}" =~ ^127\. && \
               "${S_TARGET[$i]:-}" != "::1" ]]; then
@@ -8424,36 +8298,24 @@ display_results_table() {
             if [[ -n "$cwnd_min_r" && "$cwnd_min_r" != "0" && \
                   "$cwnd_samples_r" != "0" ]]; then
 
-                # Format cwnd values
                 local f_cwnd_min f_cwnd_max f_cwnd_final
-                f_cwnd_min=$(printf '%6.1f' "$cwnd_min_r" 2>/dev/null \
-                    || printf '%6s' "$cwnd_min_r")
-                f_cwnd_max=$(printf '%6.1f' "$cwnd_max_r" 2>/dev/null \
-                    || printf '%6s' "$cwnd_max_r")
-                f_cwnd_final=$(printf '%6.1f' "$cwnd_final_r" 2>/dev/null \
-                    || printf '%6s' "${cwnd_final_r:-N/A}")
+                f_cwnd_min=$(printf '%6.1f' "$cwnd_min_r"    2>/dev/null || printf '%6s' "$cwnd_min_r")
+                f_cwnd_max=$(printf '%6.1f' "$cwnd_max_r"    2>/dev/null || printf '%6s' "$cwnd_max_r")
+                f_cwnd_final=$(printf '%6.1f' "$cwnd_final_r" 2>/dev/null || printf '%6s' "${cwnd_final_r:-N/A}")
 
-                # Colour final cwnd
                 local cwnd_final_col="$GREEN"
                 local cwnd_final_int
-                cwnd_final_int=$(printf '%.0f' "${cwnd_final_r:-0}" 2>/dev/null \
-                    || printf '0')
+                cwnd_final_int=$(printf '%.0f' "${cwnd_final_r:-0}" 2>/dev/null || printf '0')
                 if   (( cwnd_final_int < 10  )); then cwnd_final_col="$RED"
                 elif (( cwnd_final_int < 50  )); then cwnd_final_col="$YELLOW"
                 elif (( cwnd_final_int < 200 )); then cwnd_final_col="$CYAN"
                 fi
 
-                # Render the sparkline for the results table
                 local cwnd_spark_r
                 cwnd_spark_r=$(_cwnd_sparkline "$i")
 
-                # Fixed-width detail line aligned under the main row
-                printf '  %*s  ' "$C_SN" ''
-                printf '%b' "$DIM"
-                printf '%-*s  ' "$C_PROTO" ''
-                printf '%-*s  ' "$C_TGT"   ''
-                printf '%*s  '  "$C_PORT"  ''
-                printf '%b' "$NC"
+                # Indent = 36 chars to align under Sender BW column
+                printf '  %-36s' ''
                 printf '%b' "${BOLD}${CYAN}cwnd${NC}  "
                 printf '%b' "${DIM}min${NC} ${CYAN}${f_cwnd_min}${NC}${DIM}KB${NC}  "
                 printf '%b' "${DIM}max${NC} ${YELLOW}${f_cwnd_max}${NC}${DIM}KB${NC}  "
@@ -8474,12 +8336,9 @@ display_results_table() {
             local rsamp="${S_RTT_SAMPLES[$i]:-0}"
 
             if [[ "$ravg" != "---" && "$ravg" != "???" && "$rsamp" != "0" ]]; then
-                # Fixed-width detail line aligned under the main row
-                printf '  %*s  ' "$C_SN" ''
+                # Indent = 36 chars to align under Sender BW column
+                printf '  %-36s' ''
                 printf '%b' "$DIM"
-                printf '%-*s  ' "$C_PROTO" ''
-                printf '%-*s  ' "$C_TGT"   ''
-                printf '%*s  '  "$C_PORT"  ''
                 printf 'min %7.3f ms  avg %7.3f ms  max %7.3f ms  ' \
                     "$rmin" "$ravg" "$rmax" 2>/dev/null || \
                 printf 'min %-7s ms  avg %-7s ms  max %-7s ms  ' \
@@ -8491,7 +8350,6 @@ display_results_table() {
                 printf '%b\n' "$NC"
             fi
         fi
-
         # ── Row separator ─────────────────────────────────────────────────
         if (( i < STREAM_COUNT - 1 )); then
             printf '  %s\n' "$(rpt '·' "$sep_len")"
