@@ -564,29 +564,11 @@ SELECTED_VRF=""
 BIDIR_SUPPORTED=0
 _PREV_DYNAMIC_LINES=0
 _LAST_FRAME_LINE_COUNT=0   # set by _render_client_frame after each render
+_rc=0                      # render counter — reset at start of each _render_client_frame call
 
-
-# ── Self-counting render primitives ────────────────────────────────────────
-# These are used ONLY inside _render_client_frame so that _RENDER_LINE_COUNT
-# always matches the actual number of lines printed. Replace all direct calls
-# to bline/bleft/bcenter/printf-newline inside _render_client_frame with these.
-
-_rc=0   # render counter — reset at start of each _render_client_frame call
-
-_rbline() {
-    bline "${1:--}"
-    (( _rc++ ))
-}
-
-_rbleft() {
-    bleft "$1" "${2:-1}"
-    (( _rc++ ))
-}
-
-_rbcenter() {
-    bcenter "$1"
-    (( _rc++ ))
-}
+_rbline()   { bline "${1:--}";      (( _rc++ )); }
+_rbleft()   { bleft "$1" "${2:-1}"; (( _rc++ )); }
+_rbcenter() { bcenter "$1";         (( _rc++ )); }
 
 _rprintln() {
     # printf with a trailing newline — counts as one line
@@ -3672,7 +3654,7 @@ _render_cwnd_panel() {
     local i
     for (( i=0; i<STREAM_COUNT; i++ )); do
         local st="${S_STATUS_CACHE[$i]:-}"
-        case "$st" in CONNECTED|DONE|CLEANED) ;;  *) continue ;; esac
+        case "$st" in CONNECTED|DONE|CLEANED) ;; *) continue ;; esac
         [[ "${S_PROTO[$i]:-TCP}" != "TCP" ]] && continue
         [[ "${S_CWND_SAMPLES[$i]:-0}" == "0" ]] && continue
         has_tcp_cwnd=1
@@ -3682,14 +3664,24 @@ _render_cwnd_panel() {
     (( has_tcp_cwnd == 0 )) && return
 
     # ── Panel header ───────────────────────────────────────────────────────
+    # 3 fixed header lines counted by _count_cwnd_panel_lines
     printf '+%s+\033[K\n' "$(rpt '=' $inner)"
     bcenter "${BOLD}${CYAN}TCP Congestion Window — Live Tracking${NC}"
     printf '+%s+\033[K\n' "$(rpt '=' $inner)"
 
     # ── Per-stream CWND block ──────────────────────────────────────────────
+    # Each stream contributes exactly 11 lines:
+    #   1  stream identity line
+    #   1  phase line
+    #   1  separator (+---+)
+    #   5  chart rows          ← guaranteed by indexed array loop below
+    #   1  x-axis baseline
+    #   1  separator (+---+)
+    #   1  statistics row
+    # Total per stream: 11
     for (( i=0; i<STREAM_COUNT; i++ )); do
         local st="${S_STATUS_CACHE[$i]:-}"
-        case "$st" in CONNECTED|DONE|CLEANED) ;;  *) continue ;; esac
+        case "$st" in CONNECTED|DONE|CLEANED) ;; *) continue ;; esac
         [[ "${S_PROTO[$i]:-TCP}" != "TCP" ]] && continue
         [[ "${S_CWND_SAMPLES[$i]:-0}" == "0" ]] && continue
 
@@ -3703,20 +3695,19 @@ _render_cwnd_panel() {
         local cwnd_samples="${S_CWND_SAMPLES[$i]:-0}"
         local cwnd_hist="${S_CWND_HISTORY[$i]:-}"
 
-        # ── Stream identity line ───────────────────────────────────────────
+        # ── Line 1: stream identity ────────────────────────────────────────
         local stream_line="Stream ${sn}   ${tgt}:${port}   ${S_DSCP_NAME[$i]:+DSCP: ${S_DSCP_NAME[$i]}}"
         local slen=${#stream_line}
         local srp=$(( inner - 2 - slen - 1 ))
         (( srp < 0 )) && srp=0
         printf '|  %b%s%b%s|\033[K\n' "${BOLD}" "$stream_line" "${NC}" "$(rpt ' ' $srp)"
 
-        # ── Phase detection ────────────────────────────────────────────────
+        # ── Line 2: phase line ─────────────────────────────────────────────
         local phase_raw
         phase_raw=$(_cwnd_detect_phase "$i")
         local phase_code phase_name phase_desc
         IFS='|' read -r phase_code phase_name phase_desc <<< "$phase_raw"
 
-        # Phase colour
         local phase_col
         case "$phase_code" in
             SLOW_START)    phase_col="$GREEN"  ;;
@@ -3728,9 +3719,6 @@ _render_cwnd_panel() {
             *)             phase_col="$DIM"    ;;
         esac
 
-        local phase_line="Phase: ${phase_name}   ${phase_desc}"
-        local plen=${#phase_line}
-        # Account for ANSI in the colour — use plain text length for padding
         local p_plain_len=$(( ${#phase_name} + ${#phase_desc} + 9 ))
         local prp=$(( inner - 2 - p_plain_len - 1 ))
         (( prp < 0 )) && prp=0
@@ -3740,51 +3728,72 @@ _render_cwnd_panel() {
             "$DIM" "$phase_desc" "$NC" \
             "$(rpt ' ' $prp)"
 
+        # ── Line 3: separator ─────────────────────────────────────────────
         printf '+%s+\033[K\n' "$(rpt '-' $inner)"
 
-        # ── ASCII bar chart ────────────────────────────────────────────────
-        # Renders a full-width bar chart of cwnd history.
-        # Each sample maps to one column of the chart using block characters.
-        # Y-axis shows max value at top and 0 at bottom.
-        # Chart height: 5 lines. Width: inner - 10 (for Y-axis labels).
+        # ── Lines 4-8: chart rows (exactly chart_h=5 lines) ───────────────
+        #
+        # Strategy: pre-fill an indexed array with chart_h empty rows,
+        # then overwrite each slot with awk output keyed by row index.
+        # The final render loop iterates exactly chart_h times regardless
+        # of awk edge cases (empty history, single sample, maxv=0, etc.).
+        # This guarantees _count_cwnd_panel_lines stays accurate.
 
         local chart_w=$(( inner - 12 ))
         (( chart_w < 20 )) && chart_w=20
         local chart_h=5
 
-        # Format Y-axis labels
+        # Y-axis labels
         local y_max_label y_mid_label y_zero_label
-        y_max_label=$(printf '%6.0f' "${cwnd_max:-0}" 2>/dev/null || printf '%6s' "${cwnd_max}")
-        y_mid_label=$(printf '%6.0f' "$(awk -v m="${cwnd_max:-0}" 'BEGIN{printf "%.0f",m/2}')" 2>/dev/null || printf '%6s' "")
+        y_max_label=$(printf '%6.0f' "${cwnd_max:-0}" 2>/dev/null \
+            || printf '%6s' "${cwnd_max}")
+        y_mid_label=$(printf '%6.0f' \
+            "$(awk -v m="${cwnd_max:-0}" 'BEGIN{printf "%.0f",m/2}')" \
+            2>/dev/null || printf '%6s' "")
         y_zero_label=$(printf '%6s' "0")
 
-        # Build the bar chart using awk
-        local chart_lines
-        chart_lines=$(printf '%s\n' "${cwnd_hist:-0}" | awk \
+        # Pre-fill array with blank rows (chart_w spaces each)
+        local -a chart_row_arr=()
+        local _empty_row _ri
+        printf -v _empty_row '%*s' "$chart_w" ''
+        for (( _ri=0; _ri<chart_h; _ri++ )); do
+            chart_row_arr[$_ri]="$_empty_row"
+        done
+
+        # Build chart via awk — output format: "ROW_INDEX<TAB>LINE_CONTENT"
+        # ROW_INDEX is 1-based where 1=top row, chart_h=bottom row.
+        # Using tab-separated index+content avoids any ambiguity with
+        # block characters or spaces inside the chart content itself.
+        local _awk_chart_out
+        _awk_chart_out=$(printf '%s\n' "${cwnd_hist:-0}" | awk \
             -v w="$chart_w" \
             -v h="$chart_h" \
             -v maxv="${cwnd_max:-1}" \
             'BEGIN {
-                FS = ":"
+                FS    = ":"
                 full  = "\342\226\210"   # U+2588 full block
-                upper = "\342\226\204"   # U+2584 upper half
                 lower = "\342\226\201"   # U+2581 lower eighth
                 empty = " "
             }
             {
                 n = split($0, vals, ":")
-                # Build array of normalised heights [0..h]
+
+                # Normalise maxv to avoid division by zero
+                if (maxv <= 0) maxv = 1
+
+                # Build per-column normalised heights [0..h]
                 for (j = 1; j <= n && j <= w; j++) {
                     v = vals[j] + 0
-                    if (maxv <= 0) maxv = 1
                     ht[j] = int((v / maxv) * h + 0.5)
                     if (ht[j] > h) ht[j] = h
                     if (ht[j] < 0) ht[j] = 0
                 }
                 total_cols = (n < w) ? n : w
 
-                # Print chart from top row (h) down to row 1
+                # Emit rows from top (row=h) to bottom (row=1).
+                # row_index counts from 1 (top) to h (bottom) for the array.
                 for (row = h; row >= 1; row--) {
+                    row_index = h - row + 1
                     line = ""
                     for (col = 1; col <= total_cols; col++) {
                         if (ht[col] >= row) {
@@ -3795,58 +3804,64 @@ _render_cwnd_panel() {
                             line = line empty
                         }
                     }
-                    # Pad to chart width
+                    # Pad to chart width with spaces
                     for (col = total_cols + 1; col <= w; col++) {
                         line = line empty
                     }
-                    print line
+                    printf "%d\t%s\n", row_index, line
                 }
             }')
 
-        # Render the chart with Y-axis labels
-        local line_num=0
-        while IFS= read -r chart_line; do
-            local y_label=""
-            case $line_num in
+        # Load awk output into the pre-filled array
+        local _idx_num _idx_content
+        while IFS=$'\t' read -r _idx_num _idx_content; do
+            # Validate index before writing — guards against empty lines
+            [[ "$_idx_num" =~ ^[0-9]+$ ]] || continue
+            local _arr_idx=$(( _idx_num - 1 ))
+            if (( _arr_idx >= 0 && _arr_idx < chart_h )); then
+                chart_row_arr[$_arr_idx]="$_idx_content"
+            fi
+        done <<< "$_awk_chart_out"
+
+        # Render exactly chart_h rows — line count is deterministic
+        local _row_num
+        for (( _row_num=0; _row_num<chart_h; _row_num++ )); do
+            local y_label="         "   # 9 spaces (same width as "NNN KB ")
+            case $_row_num in
                 0) y_label="$y_max_label KB" ;;
                 2) y_label="$y_mid_label KB" ;;
                 4) y_label="$y_zero_label KB" ;;
-                *) y_label="         " ;;
             esac
-            local row_content="${y_label} │${chart_line}"
-            local rclen=${#row_content}
-            # Strip block chars from length count — each is 3 bytes but 1 visible char
-            # Approximate: each visible char in chart_line is 1 column wide
+            local row_content="${y_label} │${chart_row_arr[$_row_num]}"
+            # Visible length: y_label chars + 3 (space+│+nothing) + chart_w
             local visible_len=$(( ${#y_label} + 3 + chart_w ))
             local row_rp=$(( inner - 2 - visible_len - 1 ))
             (( row_rp < 0 )) && row_rp=0
             printf '|  %s%s|\033[K\n' "$row_content" "$(rpt ' ' $row_rp)"
-            (( line_num++ ))
-        done <<< "$chart_lines"
+        done
 
-        # X-axis baseline
+        # ── Line 9: x-axis baseline ────────────────────────────────────────
+        # "         └──────...──  (N smpl)"
+        # 9 spaces + └ + chart_w × ─ + 2 spaces + sample count
         local xaxis="         └$(rpt '─' $chart_w)  (${cwnd_samples} smpl)"
         local xlen=${#xaxis}
         local xrp=$(( inner - 2 - xlen - 1 ))
         (( xrp < 0 )) && xrp=0
         printf '|  %s%s|\033[K\n' "$xaxis" "$(rpt ' ' $xrp)"
 
+        # ── Line 10: separator ─────────────────────────────────────────────
         printf '+%s+\033[K\n' "$(rpt '-' $inner)"
 
-        # ── Statistics row ─────────────────────────────────────────────────
-        # Two columns: current/min on left, max/final on right
-        local f_cur f_min f_max f_final f_avg
-        f_cur=$(printf '%.1f' "$cwnd_cur" 2>/dev/null || printf '%s' "$cwnd_cur")
-        f_min=$(printf '%.1f' "$cwnd_min" 2>/dev/null || printf '%s' "$cwnd_min")
-        f_max=$(printf '%.1f' "$cwnd_max" 2>/dev/null || printf '%s' "$cwnd_max")
+        # ── Line 11: statistics row ────────────────────────────────────────
+        local f_cur f_min f_max f_final f_avg_raw
+        f_cur=$(printf '%.1f' "$cwnd_cur"         2>/dev/null || printf '%s' "$cwnd_cur")
+        f_min=$(printf '%.1f' "$cwnd_min"         2>/dev/null || printf '%s' "$cwnd_min")
+        f_max=$(printf '%.1f' "$cwnd_max"         2>/dev/null || printf '%s' "$cwnd_max")
         f_final=$(printf '%.1f' "${cwnd_final:-0}" 2>/dev/null || printf '%s' "${cwnd_final:-N/A}")
 
-        # Compute average from history
-        local f_avg_raw
         f_avg_raw=$(printf '%s\n' "${cwnd_hist:-0}" | awk -F: '
             { s=0; for(i=1;i<=NF;i++) s+=$i+0; printf "%.1f", s/NF }')
 
-        # Colour for current value
         local c_col="$GREEN"
         local c_int; c_int=$(printf '%.0f' "$cwnd_cur" 2>/dev/null || printf '0')
         if   (( c_int < 10  )); then c_col="$RED"
@@ -3854,23 +3869,31 @@ _render_cwnd_panel() {
         elif (( c_int < 200 )); then c_col="$CYAN"
         fi
 
-        # Build stats line — plain text for padding, then print with colour
+        # Build plain-text version for right-padding calculation
         local stat_plain="  Current: ${f_cur} KB    Min: ${f_min} KB    Max: ${f_max} KB    Avg: ${f_avg_raw} KB    Final: ${f_final} KB"
-        local spl=${#stat_plain}
-        local sprp=$(( inner - spl - 1 ))
+        local sprp=$(( inner - ${#stat_plain} - 1 ))
         (( sprp < 0 )) && sprp=0
 
         printf '|  '
-        printf '%bCurrent:%b %b%s%b KB    ' "$DIM" "$NC" "$c_col" "$f_cur" "$NC"
-        printf '%bMin:%b %b%s%b KB    '     "$DIM" "$NC" "$CYAN"  "$f_min" "$NC"
-        printf '%bMax:%b %b%s%b KB    '     "$DIM" "$NC" "$YELLOW" "$f_max" "$NC"
-        printf '%bAvg:%b %b%s%b KB    '     "$DIM" "$NC" "$NC"   "$f_avg_raw" "$NC"
-        printf '%bFinal:%b %b%s%b KB'       "$DIM" "$NC" "$c_col" "$f_final" "$NC"
+        printf '%bCurrent:%b %b%s%b KB    ' "$DIM" "$NC" "$c_col"    "$f_cur"     "$NC"
+        printf '%bMin:%b %b%s%b KB    '     "$DIM" "$NC" "$CYAN"     "$f_min"     "$NC"
+        printf '%bMax:%b %b%s%b KB    '     "$DIM" "$NC" "$YELLOW"   "$f_max"     "$NC"
+        printf '%bAvg:%b %b%s%b KB    '     "$DIM" "$NC" "$NC"       "$f_avg_raw" "$NC"
+        printf '%bFinal:%b %b%s%b KB'       "$DIM" "$NC" "$c_col"    "$f_final"   "$NC"
         printf '%s|\033[K\n' "$(rpt ' ' $sprp)"
 
     done
 
     # ── Reference table ────────────────────────────────────────────────────
+    # _render_cwnd_reference_table prints exactly 12 lines:
+    #   1  +---+ separator
+    #   1  header row
+    #   1  +---+ separator
+    #   6  data rows (one per CC phase)
+    #   1  +---+ separator
+    #   1  legend line
+    #   1  +===+ bottom border
+    # Total: 12
     _render_cwnd_reference_table "$inner"
 }
 
@@ -3899,8 +3922,6 @@ _cleanup_stream_procs() {
     local label="Stream-${sn}"
     local _log_file="/tmp/iperf3_streams_events.log"
 
-    # All informational output goes to the event log, not stdout.
-    # The dashboard render loop owns stdout exclusively.
     _cs_log() {
         printf '[%s]  %s\n' "$(date +%T)" "$*" >> "$_log_file"
     }
@@ -4904,8 +4925,7 @@ _remove_netem_for_stream() {
 
     if tc qdisc del dev "$iface" root 2>/dev/null; then
         local ts; ts="$(date '+%H:%M:%S')"
-        # Write to event log — NOT to stdout.
-        # stdout belongs exclusively to the dashboard render loop.
+        # Log to file — NOT stdout — dashboard owns stdout
         printf '[%s]  NETEM    dev %s  netem removed (stream %d finished)\n' \
             "$ts" "$iface" "$(( idx + 1 ))" >> "$_log_file"
     fi
@@ -4918,7 +4938,6 @@ _remove_netem_for_stream() {
         [[ "$entry" != "$iface" ]] && new_netem_ifaces+=("$entry")
     done
     NETEM_IFACES=("${new_netem_ifaces[@]}")
-
     return 0
 }
 
@@ -7070,12 +7089,11 @@ _count_cwnd_panel_lines() {
     done
     (( tcp_count == 0 )) && { printf '%d' 0; return; }
 
-    # Anatomy:
-    #   3  fixed header  (top border + bcenter + title border)
-    #   11 per stream    (identity + phase + sep + 5 chart rows +
-    #                     x-axis + sep + stats)
-    #   12 reference table (_render_cwnd_reference_table):
-    #      sep + header + sep + 6 data rows + sep + legend + bottom border
+    # Fixed header:  3 lines  (top border + bcenter + title border)
+    # Per stream:   11 lines  (identity + phase + sep + 5 chart rows +
+    #                          x-axis + sep + stats)
+    # Reference table: 12 lines  (sep + header + sep + 6 rows +
+    #                              sep + legend + bottom border)
     printf '%d' $(( 3 + tcp_count * 11 + 12 ))
 }
 
@@ -7228,59 +7246,40 @@ _count_server_frame_lines() {
 #  10+N   bline '='          final border
 # ---------------------------------------------------------------------------
 _count_client_frame_lines_for_state() {
-    # Used ONLY for initial vertical space pre-reservation before the
-    # first render. Computes a tight upper bound based on actual stream
-    # configuration so the reserved block is not grossly oversized.
-    #
-    # Fixed structural lines (same as _render_client_frame):
-    #   bline'=' + bcenter + bline'=' + bleft-counters + bline'=' +
-    #   bleft-col-hdr + bline'-' +
-    #   bline'=' + bleft-hint + bline'=' +
-    #   notification-banner = 11
-    local total=11
+    # Used ONLY for initial vertical space pre-reservation.
+    # Computes a tight upper bound — intentionally excludes CWND inline
+    # row because S_CWND_SAMPLES is always 0 at tick 0.
+    local total=11   # fixed structural lines including notification banner
 
     local i
     for (( i=0; i<STREAM_COUNT; i++ )); do
-
         local st="${S_STATUS_CACHE[$i]:-STARTING}"
 
-        # CLEANED / CLEANUP_PENDING: exactly 1 tombstone row
         if [[ "$st" == "CLEANED" || "$st" == "CLEANUP_PENDING" ]]; then
             (( total++ ))
             if (( i < STREAM_COUNT - 1 )); then (( total++ )); fi
             continue
         fi
 
-        # TX row — always present
-        (( total++ ))
+        (( total++ ))   # TX row
 
-        # RX row — bidir streams only
         if [[ "${S_BIDIR[$i]:-0}" == "1" ]]; then
-            (( total++ ))
+            (( total++ ))   # RX row
         fi
 
-        # RTT row — non-loopback streams only
         local tgt="${S_TARGET[$i]:-}"
         if [[ ! "$tgt" =~ ^127\. && "$tgt" != "::1" ]]; then
-            (( total++ ))
+            (( total++ ))   # RTT row (non-loopback only)
         fi
 
-        # CWND inline row — TCP, non-loopback, only when samples exist.
-        # At pre-reservation time samples are always 0 so this is never
-        # counted here. The self-counting render handles it correctly
-        # from tick 1 onward via _LAST_FRAME_LINE_COUNT.
-        # We do NOT add +1 here for CWND — the pre-reservation intentionally
-        # excludes it since it cannot appear on tick 0. The first tick where
-        # CWND data arrives will update _LAST_FRAME_LINE_COUNT automatically.
+        # CWND inline row intentionally NOT counted here — see note above
 
-        # Progress bar row — fixed-duration non-FAILED streams only
         if (( S_DURATION[$i] > 0 )) && [[ "$st" != "FAILED" ]]; then
-            (( total++ ))
+            (( total++ ))   # progress bar row
         fi
 
-        # Per-stream separator — between streams, not after the last
         if (( i < STREAM_COUNT - 1 )); then
-            (( total++ ))
+            (( total++ ))   # per-stream separator
         fi
     done
 
@@ -7516,7 +7515,6 @@ _render_client_frame() {
         # ── TX sparkline ──────────────────────────────────────────────────
         local spark_tx
         spark_tx=$(_spark_render "c" "$i")
-        # Push current BW into sparkline buffer
         if [[ "$st" == "CONNECTED" && "$bw_tx" != "---" ]]; then
             _spark_push "c" "$i" "$bw_tx"
         fi
@@ -7681,20 +7679,15 @@ _render_client_frame() {
     # ── Notification banner (always exactly 1 line) ───────────────────────
     local _notify_msg
     _notify_msg="$(_assoc_get G_LAST_NOTIFY 0 2>/dev/null)"
+    # Notification banner — always exactly 1 line:
     if [[ -n "$_notify_msg" ]]; then
-        local _max_len=$(( COLS - 4 ))
-        (( ${#_notify_msg} > _max_len )) && \
-            _notify_msg="${_notify_msg:0:${_max_len}}…"
-        local _padded
-        printf -v _padded "%-${COLS}s" "  ${_notify_msg}"
         printf '\033[1;97;42m%s\033[0m\033[K\n' "$_padded"
     else
         printf '\033[K\n'
     fi
-    (( _rc++ ))   # count the notification banner line
+    (( _rc++ ))    # ← count banner line explicitly
 
-    # ── Store self-measured line count ────────────────────────────────────
-    _LAST_FRAME_LINE_COUNT=$_rc
+    _LAST_FRAME_LINE_COUNT=$_rc    # ← store final count
 }
 
 _render_server_frame() {
@@ -7839,6 +7832,10 @@ run_dashboard() {
     [[ "$mode" == "server" ]] && count=$SERVER_COUNT || count=$STREAM_COUNT
 
     # ── Initialise per-stream cleanup tracking arrays ──────────────────────
+    # S_CLEANUP_QUEUED[$i]:
+    #   "0" = not yet queued
+    #   "1" = queued for cleanup (Phase A complete, Phase B pending)
+    #   "2" = cleanup executed  (Phase B complete)
     if [[ "$mode" != "server" ]]; then
         local _ci
         for (( _ci=0; _ci<STREAM_COUNT; _ci++ )); do
@@ -7846,7 +7843,9 @@ run_dashboard() {
         done
     fi
 
-    # ── Probe status BEFORE calculating pre-reserve size ──────────────────
+    # ── Initial status probe before pre-reservation ────────────────────────
+    # Probe stream states now so _count_client_frame_lines_for_state has
+    # accurate state to work with when calculating the pre-reserve size.
     if [[ "$mode" != "server" ]]; then
         local j
         for (( j=0; j<STREAM_COUNT; j++ )); do
@@ -7854,15 +7853,10 @@ run_dashboard() {
         done
     fi
 
-    # ── Calculate pre-reserve line count ──────────────────────────────────
-    # This is used ONLY to reserve blank vertical space before the first
-    # render. It must be >= the actual first-tick line count to prevent
-    # the frame from scrolling on tick 1. Over-estimation is safe because
-    # printf '\033[J' erases everything below the rendered frame.
-    #
-    # _count_client_frame_lines_for_state computes a tight upper bound
-    # based on actual stream configuration. It intentionally excludes the
-    # CWND inline row because S_CWND_SAMPLES is always 0 at tick 0.
+    # ── Calculate pre-reserve line count ───────────────────────────────────
+    # Used ONLY to print blank lines before the first render so the terminal
+    # has room for the frame. Must be >= actual first-tick line count.
+    # Over-estimation is safe — printf '\033[J' erases unused space.
     local pre_lines
     if [[ "$mode" == "server" ]]; then
         pre_lines=$(_count_server_frame_lines)
@@ -7873,21 +7867,28 @@ run_dashboard() {
     FRAME_LINES=$pre_lines
     _PREV_DYNAMIC_LINES=0
 
-    # _last_total tracks the total lines printed last tick (frame +
-    # dynamic panels + hint). Used by the DSCP/capture keypress handler
-    # to move the cursor below the frame before launching interactive mode.
+    # _last_total: total lines printed in the last tick (frame + panels +
+    # hint). Used by the DSCP/capture keypress handlers to move the cursor
+    # below all rendered content before entering interactive mode.
     local _last_total=$pre_lines
 
-    # ── Reserve vertical space and anchor the frame position ──────────────
-    # Print pre_lines blank lines to push the terminal down, then move the
-    # cursor back up to where the frame will start. Save that position with
-    # \033[s so every subsequent tick can return to it with \033[u instead
-    # of using a relative cursor-up calculation.
+    # ── Reserve vertical space and establish the frame anchor ──────────────
     #
-    # Using save/restore (\033[s / \033[u) instead of \033[NA (cursor up N)
-    # makes the dashboard immune to line-count mismatches. Even if the
-    # frame grows by one line (e.g. CWND data appears for the first time),
-    # the cursor always returns to the correct top-of-frame row.
+    # Print pre_lines blank lines to push the terminal scroll buffer down,
+    # giving us a clean rectangular region to render into.  Then move the
+    # cursor back up to the top of that region and save the position with
+    # \033[s (ANSI cursor save).
+    #
+    # Every subsequent tick:
+    #   1. \033[u  — restore cursor to saved position (top of frame)
+    #   2. render  — cursor advances downward through the frame
+    #   3. \033[%dA _last_total — move cursor back up by the exact number
+    #                              of lines just printed
+    #   4. \033[s  — re-save the position at the true top of the frame
+    #
+    # This self-correcting anchor means any one-tick line-count discrepancy
+    # (e.g. when the CWND panel first appears and adds lines) is absorbed
+    # immediately on the next tick rather than accumulating as drift.
     local k
     for (( k=0; k<pre_lines; k++ )); do printf '\n'; done
     printf '\033[%dA' "$pre_lines"
@@ -7896,13 +7897,16 @@ run_dashboard() {
 
     local _dashboard_running=1
 
-    # ── Main render loop ───────────────────────────────────────────────────
+    # ═══════════════════════════════════════════════════════════════════════
+    # Main render loop
+    # ═══════════════════════════════════════════════════════════════════════
     while (( _dashboard_running == 1 )); do
 
         # ── Per-tick state probe ───────────────────────────────────────────
-        # Probe all stream statuses at the start of every tick so the
-        # render sees fresh state. Skip on the very first tick because
-        # probe_client_status was already called above before pre-reservation.
+        # Refresh all stream statuses so the renderer sees current state.
+        # _render_client_frame also calls probe_client_status internally,
+        # but probing here first ensures the cleanup state machine below
+        # (Phase A) operates on the latest state before rendering.
         if [[ "$mode" != "server" ]]; then
             local j
             for (( j=0; j<STREAM_COUNT; j++ )); do
@@ -7912,9 +7916,15 @@ run_dashboard() {
 
         # ── Stream cleanup state machine — Phase A ─────────────────────────
         # Transition DONE/FAILED → CLEANUP_PENDING.
-        # This is instantaneous (no blocking operations).
-        # The renderer shows a spinner row on this tick.
-        # Phase B (actual process termination) runs AFTER the render below.
+        #
+        # This transition is instantaneous (no blocking operations).
+        # The renderer will show a spinner row for CLEANUP_PENDING this tick.
+        # The actual process termination (Phase B) runs AFTER the render so
+        # the spinner is visible while cleanup work happens.
+        #
+        # Guards:
+        #   queued != "1" — not already waiting for Phase B
+        #   queued != "2" — not already executed
         if [[ "$mode" != "server" ]]; then
             local _si
             for (( _si=0; _si<STREAM_COUNT; _si++ )); do
@@ -7930,18 +7940,16 @@ run_dashboard() {
         fi
 
         # ── Restore cursor to top of frame ────────────────────────────────
-        # \033[u restores the cursor to the position saved by \033[s above.
-        # This is performed every tick including the first, replacing the
-        # old first_tick guard on \033[NA. It is immune to line-count
-        # changes between ticks.
+        # \033[u jumps to the position saved by \033[s at the end of the
+        # previous tick (or during initialisation for the first tick).
         printf '\033[u'
 
         # ── Render the frame ───────────────────────────────────────────────
-        # After rendering, fixed_lines holds the exact number of lines
-        # that were printed this tick:
-        #   - server: computed by _count_server_frame_lines (static)
-        #   - client: stored in _LAST_FRAME_LINE_COUNT by _render_client_frame
-        #             via the self-counting _rc mechanism
+        # After rendering:
+        #   client: _LAST_FRAME_LINE_COUNT holds the exact lines printed
+        #           (self-measured by _rc counter inside _render_client_frame)
+        #   server: _count_server_frame_lines() returns the exact count
+        #           (server frame is structurally static)
         local fixed_lines
         if [[ "$mode" == "server" ]]; then
             _render_server_frame
@@ -7952,12 +7960,15 @@ run_dashboard() {
         fi
 
         # ── Erase stale content below the current frame ───────────────────
-        # Clears any leftover lines from a previous longer frame (e.g. after
-        # CWND panel disappears or streams finish). Must run BEFORE dynamic
-        # panels are rendered so they appear immediately below the frame.
+        # Clears leftover lines from a previous taller frame (e.g. after the
+        # CWND panel disappears when all streams finish). Must run before the
+        # dynamic panels are rendered so they appear immediately below.
         printf '\033[J'
 
         # ── Dynamic panels (client only) ───────────────────────────────────
+        # Completed, Failed, and CWND panels are rendered below the main
+        # frame. Their line counts are measured AFTER rendering so that
+        # _last_total reflects the actual lines printed this tick.
         local completed_lines=0 failed_lines=0 cwnd_lines=0
         if [[ "$mode" != "server" ]]; then
             completed_lines=$(_count_completed_panel_lines)
@@ -7969,10 +7980,10 @@ run_dashboard() {
         fi
 
         # ── DSCP verify hint (client, non-loopback, CONNECTED streams) ────
-        # Renders a 3-line hint block below the dynamic panels when at least
-        # one non-loopback stream is CONNECTED. The hint_lines count is used
-        # in _last_total so the keypress handler knows where to move the
-        # cursor before launching _dscp_verify_interactive.
+        # Prints a 3-line block below the panels when at least one
+        # non-loopback stream is CONNECTED. The line count is included in
+        # _last_total so the keypress handler knows where to place the cursor
+        # before entering _dscp_verify_interactive.
         local _hint_lines=0
         if [[ "$mode" != "server" ]] && ! _all_streams_loopback; then
             local _any_verifiable=0
@@ -7994,21 +8005,38 @@ run_dashboard() {
             fi
         fi
 
-        # ── Record total rendered lines for DSCP keypress handler ──────────
-        # _last_total = lines printed this tick by the frame + all panels
-        # + hint. Used by the v/p and c keypress handlers to move the cursor
-        # below all rendered content before entering interactive mode.
-        # It is NOT used for cursor-up positioning (that uses \033[u now).
+        # ── Compute total lines printed this tick ──────────────────────────
         local dynamic_lines=$(( completed_lines + failed_lines + cwnd_lines ))
         _last_total=$(( fixed_lines + dynamic_lines + _hint_lines ))
         _PREV_DYNAMIC_LINES=$(( completed_lines + failed_lines ))
 
+        # ── Re-anchor cursor position ──────────────────────────────────────
+        # Move the cursor back up by exactly the number of lines printed
+        # this tick, then save that position.  On the next tick \033[u will
+        # restore directly to the top of the frame with no drift, regardless
+        # of whether the frame grew or shrank compared to last tick.
+        #
+        # This is the key self-correction mechanism:
+        #   - If CWND panel appeared this tick (+12 lines): _last_total is
+        #     larger, cursor moves up further, anchor is correct next tick.
+        #   - If CWND panel disappeared this tick (-12 lines): _last_total
+        #     is smaller, cursor moves up less, anchor is still correct.
+        #   - No accumulated drift ever.
+        if (( _last_total > 0 )); then
+            printf '\033[%dA' "$_last_total"
+        fi
+        printf '\033[s'    # re-save cursor at true top of frame
+
         # ── Stream cleanup state machine — Phase B ─────────────────────────
-        # Execute actual process cleanup AFTER the frame has been painted.
-        # The spinner row was visible this tick. Next tick will show the
-        # CLEANED tombstone row.
-        # _cleanup_stream_procs writes all output to /tmp/iperf3_streams_events.log
-        # so stdout remains uncontaminated.
+        # Execute the actual process termination AFTER the frame has been
+        # painted and the cursor anchor has been re-saved.
+        #
+        # The spinner row was visible this tick (CLEANUP_PENDING state).
+        # Next tick will show the CLEANED tombstone row.
+        #
+        # _cleanup_stream_procs writes all log output to
+        # /tmp/iperf3_streams_events.log — stdout is NOT touched, so the
+        # terminal frame is unaffected.
         if [[ "$mode" != "server" ]]; then
             local _si
             for (( _si=0; _si<STREAM_COUNT; _si++ )); do
@@ -8021,13 +8049,16 @@ run_dashboard() {
         fi
 
         # ── Exit condition (client mode) ───────────────────────────────────
-        # The loop exits only when every stream is in a terminal state:
-        #   CLEANED   — stream finished and processes were stopped
-        #   FAILED    — stream failed to start or connect
+        # The loop exits only when every stream has reached a terminal state:
         #
-        # CLEANUP_PENDING with queued=2 means cleanup ran this tick and
-        # the state will be CLEANED on the next tick. Treat it as finished
-        # so we do not spin for an extra tick after the last stream cleans up.
+        #   CLEANED          — stream finished; processes stopped
+        #   FAILED           — stream failed to start or connect
+        #   CLEANUP_PENDING  — if queued=2, cleanup ran this tick and the
+        #                      stream will be CLEANED next tick; treat as
+        #                      finished so we exit without an extra spin
+        #
+        # Any other state (STARTING, CONNECTING, CONNECTED, DONE) means at
+        # least one stream is still active — keep looping.
         if [[ "$mode" != "server" ]]; then
             local _all_finished=1
             local j
@@ -8035,16 +8066,17 @@ run_dashboard() {
                 local _jst="${S_STATUS_CACHE[$j]:-STARTING}"
                 case "$_jst" in
                     CLEANED|FAILED)
-                        # Terminal states — this stream is finished
+                        # Terminal states — this stream is done
                         ;;
                     CLEANUP_PENDING)
-                        # Cleanup ran this tick (queued=2) — treat as finished.
-                        # Cleanup not yet run (queued=1) — not finished yet.
+                        # Cleanup ran this tick (queued=2): treat as finished.
+                        # Cleanup not yet run (queued=1): still in progress.
                         if [[ "${S_CLEANUP_QUEUED[$j]:-0}" != "2" ]]; then
                             _all_finished=0
                         fi
                         ;;
                     *)
+                        # Active state — at least one stream still running
                         _all_finished=0
                         break
                         ;;
@@ -8052,18 +8084,18 @@ run_dashboard() {
             done
 
             if (( _all_finished == 1 )); then
-                # Perform one final render pass to show CLEANED tombstone rows
-                # before exiting, then stop the loop.
+                # Do one final render pass so CLEANED tombstone rows are
+                # visible before the dashboard exits, then stop the loop.
                 _dashboard_running=0
                 continue
             fi
         fi
 
-        # ── Non-blocking keyboard poll (10 × 0.1 s = ~1 s per tick) ───────
-        # Polls for a single keypress without blocking the render loop.
-        # Each slice sleeps 0.1 s. After 10 slices the tick completes and
-        # the next render runs. CLEANUP_DONE is checked each slice so a
-        # SIGINT/SIGTERM causes the loop to exit within 0.1 s.
+        # ── Non-blocking keyboard poll (~1 s per tick) ─────────────────────
+        # 10 slices × 0.1 s = ~1 s total per tick.
+        # A keypress breaks out of the slice loop immediately.
+        # CLEANUP_DONE is checked each slice so a SIGINT/SIGTERM causes the
+        # loop to exit within 0.1 s rather than waiting for the full second.
         local key_pressed="" key_lower=""
         local tick_slice
         for (( tick_slice=0; tick_slice<10; tick_slice++ )); do
@@ -8079,77 +8111,80 @@ run_dashboard() {
             fi
         done
 
-        # Exit immediately if cleanup was triggered by a signal handler
+        # Exit immediately if a signal handler set CLEANUP_DONE
         if (( CLEANUP_DONE == 1 )); then
             _dashboard_running=0
             continue
         fi
 
-        # ── Handle DSCP verify keypress (client mode, v or p) ─────────────
-        # Moves cursor below all rendered content, runs the interactive DSCP
-        # verification, then re-anchors the frame position for the next tick.
+        # ── Handle DSCP verify keypress (client, v or p) ───────────────────
+        # 1. Show cursor and move below all rendered content.
+        # 2. Run the interactive DSCP verification.
+        # 3. Re-probe stream states.
+        # 4. Re-reserve vertical space and re-establish the frame anchor.
         if [[ "$mode" != "server" ]] && \
            ! _all_streams_loopback && \
            [[ "$key_lower" == "v" || "$key_lower" == "p" ]]; then
 
-            # Show cursor and move below all rendered content
             printf '\033[?25h'
+            # Move cursor below all rendered content (frame + panels + hint)
             printf '\033[%dB' "$_last_total"
 
             _dscp_verify_interactive
 
-            # Re-probe stream states after interactive mode
+            # Re-probe after returning from interactive mode
             local j
             for (( j=0; j<STREAM_COUNT; j++ )); do
                 probe_client_status "$j"
             done
 
-            # Re-calculate pre-reserve size based on current state
+            # Re-calculate pre-reserve size for current state
             local new_pre
             new_pre=$(_count_client_frame_lines_for_state)
             FRAME_LINES=$new_pre
 
-            # Reserve fresh vertical space and re-anchor the saved position
+            # Reserve fresh space and re-establish anchor
             for (( k=0; k<new_pre; k++ )); do printf '\n'; done
             printf '\033[%dA' "$new_pre"
-            printf '\033[s'       # re-save cursor position = new top of frame
+            printf '\033[s'       # save new top-of-frame anchor
             printf '\033[?25l'
 
             _last_total=$new_pre
         fi
 
-        # ── Handle packet capture keypress (server mode, c) ───────────────
+        # ── Handle packet capture keypress (server, c) ─────────────────────
         if [[ "$mode" == "server" ]] && [[ "$key_lower" == "c" ]]; then
 
-            # Show cursor and move below all rendered content
             printf '\033[?25h'
             printf '\033[%dB' "$_last_total"
 
             _dscp_verify_server_interactive
 
-            # Re-calculate server frame size and re-anchor
             local new_pre
             new_pre=$(_count_server_frame_lines)
             FRAME_LINES=$new_pre
 
             for (( k=0; k<new_pre; k++ )); do printf '\n'; done
             printf '\033[%dA' "$new_pre"
-            printf '\033[s'       # re-save cursor position = new top of frame
+            printf '\033[s'       # save new top-of-frame anchor
             printf '\033[?25l'
 
             _last_total=$new_pre
         fi
 
     done
-    # ── End of render loop ─────────────────────────────────────────────────
+    # ═══════════════════════════════════════════════════════════════════════
+    # End of render loop
+    # ═══════════════════════════════════════════════════════════════════════
 
     # Restore cursor visibility
     printf '\033[?25h'
 
-    # ── Display buffered cleanup events after dashboard exits ──────────────
-    # _cleanup_stream_procs and _remove_netem_for_stream write all status
-    # messages to this log file instead of stdout so they cannot corrupt
-    # the TUI. Display them now that the dashboard has exited.
+    # ── Display buffered cleanup events ────────────────────────────────────
+    # _cleanup_stream_procs and _remove_netem_for_stream redirect all their
+    # status messages to this log file instead of stdout so they cannot
+    # corrupt the TUI frame during rendering.  Display them now that the
+    # dashboard has exited cleanly.
     local _log_file="/tmp/iperf3_streams_events.log"
     if [[ -f "$_log_file" ]]; then
         printf '\n'
@@ -8162,6 +8197,7 @@ run_dashboard() {
 
     printf '\n'
 }
+
 # =============================================================================
 # SECTION 13 — FINAL RESULTS
 # =============================================================================
