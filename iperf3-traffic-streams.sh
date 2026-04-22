@@ -564,11 +564,34 @@ SELECTED_VRF=""
 BIDIR_SUPPORTED=0
 _PREV_DYNAMIC_LINES=0
 _LAST_FRAME_LINE_COUNT=0   # set by _render_client_frame after each render
-_rc=0                      # render counter — reset at start of each _render_client_frame call
 
-_rbline()   { bline "${1:--}";      (( _rc++ )); }
-_rbleft()   { bleft "$1" "${2:-1}"; (( _rc++ )); }
-_rbcenter() { bcenter "$1";         (( _rc++ )); }
+# ── Self-counting render primitives ──────────────────────────────────────────
+# Used exclusively inside _render_client_frame to count printed lines.
+# _rc is a global integer reset to 0 at the start of each render call.
+#
+# IMPORTANT: Use arithmetic expansion $((  )) not arithmetic command (( ))
+# for the increment. The arithmetic COMMAND (( expr )) returns exit code 1
+# when the expression evaluates to 0 — which happens on the very first
+# increment when _rc=0. With set -e active this would silently abort the
+# render function after the first line. The arithmetic EXPANSION $(( ))
+# always returns exit code 0 regardless of the result value.
+
+_rc=0
+
+_rbline() {
+    bline "${1:--}"
+    _rc=$(( _rc + 1 ))
+}
+
+_rbleft() {
+    bleft "$1" "${2:-1}"
+    _rc=$(( _rc + 1 ))
+}
+
+_rbcenter() {
+    bcenter "$1"
+    _rc=$(( _rc + 1 ))
+}
 
 _rprintln() {
     # printf with a trailing newline — counts as one line
@@ -7676,18 +7699,23 @@ _render_client_frame() {
     fi
     _rbline '='
 
-    # ── Notification banner (always exactly 1 line) ───────────────────────
+    # ── Notification banner (always exactly 1 line) ──────────────────────
     local _notify_msg
     _notify_msg="$(_assoc_get G_LAST_NOTIFY 0 2>/dev/null)"
-    # Notification banner — always exactly 1 line:
     if [[ -n "$_notify_msg" ]]; then
+        local _max_len=$(( COLS - 4 ))
+        (( ${#_notify_msg} > _max_len )) && \
+            _notify_msg="${_notify_msg:0:${_max_len}}…"
+        local _padded
+        printf -v _padded "%-${COLS}s" "  ${_notify_msg}"
         printf '\033[1;97;42m%s\033[0m\033[K\n' "$_padded"
     else
         printf '\033[K\n'
     fi
-    (( _rc++ ))    # ← count banner line explicitly
+    _rc=$(( _rc + 1 ))    # ← arithmetic expansion, not command
 
-    _LAST_FRAME_LINE_COUNT=$_rc    # ← store final count
+    # ── Store self-measured line count ──────────────────────────────────
+    _LAST_FRAME_LINE_COUNT=$_rc
 }
 
 _render_server_frame() {
