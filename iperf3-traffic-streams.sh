@@ -7229,17 +7229,61 @@ _count_server_frame_lines() {
 # ---------------------------------------------------------------------------
 _count_client_frame_lines_for_state() {
     # Used ONLY for initial vertical space pre-reservation before the
-    # first render. Must be >= actual line count to avoid scroll.
-    # Over-estimation is safe — extra blank lines sit below the frame.
+    # first render. Computes a tight upper bound based on actual stream
+    # configuration so the reserved block is not grossly oversized.
     #
-    # Worst case per stream:
-    #   TX + RX(bidir) + RTT + CWND + bar + separator = 6 rows
-    # Fixed overhead = 11
+    # Fixed structural lines (same as _render_client_frame):
+    #   bline'=' + bcenter + bline'=' + bleft-counters + bline'=' +
+    #   bleft-col-hdr + bline'-' +
+    #   bline'=' + bleft-hint + bline'=' +
+    #   notification-banner = 11
     local total=11
+
     local i
     for (( i=0; i<STREAM_COUNT; i++ )); do
-        (( total += 6 ))   # worst case per stream
+
+        local st="${S_STATUS_CACHE[$i]:-STARTING}"
+
+        # CLEANED / CLEANUP_PENDING: exactly 1 tombstone row
+        if [[ "$st" == "CLEANED" || "$st" == "CLEANUP_PENDING" ]]; then
+            (( total++ ))
+            if (( i < STREAM_COUNT - 1 )); then (( total++ )); fi
+            continue
+        fi
+
+        # TX row — always present
+        (( total++ ))
+
+        # RX row — bidir streams only
+        if [[ "${S_BIDIR[$i]:-0}" == "1" ]]; then
+            (( total++ ))
+        fi
+
+        # RTT row — non-loopback streams only
+        local tgt="${S_TARGET[$i]:-}"
+        if [[ ! "$tgt" =~ ^127\. && "$tgt" != "::1" ]]; then
+            (( total++ ))
+        fi
+
+        # CWND inline row — TCP, non-loopback, only when samples exist.
+        # At pre-reservation time samples are always 0 so this is never
+        # counted here. The self-counting render handles it correctly
+        # from tick 1 onward via _LAST_FRAME_LINE_COUNT.
+        # We do NOT add +1 here for CWND — the pre-reservation intentionally
+        # excludes it since it cannot appear on tick 0. The first tick where
+        # CWND data arrives will update _LAST_FRAME_LINE_COUNT automatically.
+
+        # Progress bar row — fixed-duration non-FAILED streams only
+        if (( S_DURATION[$i] > 0 )) && [[ "$st" != "FAILED" ]]; then
+            (( total++ ))
+        fi
+
+        # Per-stream separator — between streams, not after the last
+        if (( i < STREAM_COUNT - 1 )); then
+            (( total++ ))
+        fi
     done
+
     printf '%d' "$total"
 }
 
@@ -7795,8 +7839,6 @@ run_dashboard() {
     [[ "$mode" == "server" ]] && count=$SERVER_COUNT || count=$STREAM_COUNT
 
     # ── Initialise per-stream cleanup tracking arrays ──────────────────────
-    # S_CLEANUP_QUEUED[$i] = "1" means cleanup has already been triggered
-    # for stream i. Prevents double-cleanup on slow ticks.
     if [[ "$mode" != "server" ]]; then
         local _ci
         for (( _ci=0; _ci<STREAM_COUNT; _ci++ )); do
@@ -7804,7 +7846,7 @@ run_dashboard() {
         done
     fi
 
-    # Probe status BEFORE calculating pre-reserve size
+    # ── Probe status BEFORE calculating pre-reserve size ──────────────────
     if [[ "$mode" != "server" ]]; then
         local j
         for (( j=0; j<STREAM_COUNT; j++ )); do
@@ -7812,7 +7854,15 @@ run_dashboard() {
         done
     fi
 
-    # Calculate exact pre-reserve line count
+    # ── Calculate pre-reserve line count ──────────────────────────────────
+    # This is used ONLY to reserve blank vertical space before the first
+    # render. It must be >= the actual first-tick line count to prevent
+    # the frame from scrolling on tick 1. Over-estimation is safe because
+    # printf '\033[J' erases everything below the rendered frame.
+    #
+    # _count_client_frame_lines_for_state computes a tight upper bound
+    # based on actual stream configuration. It intentionally excludes the
+    # CWND inline row because S_CWND_SAMPLES is always 0 at tick 0.
     local pre_lines
     if [[ "$mode" == "server" ]]; then
         pre_lines=$(_count_server_frame_lines)
@@ -7822,226 +7872,296 @@ run_dashboard() {
 
     FRAME_LINES=$pre_lines
     _PREV_DYNAMIC_LINES=0
+
+    # _last_total tracks the total lines printed last tick (frame +
+    # dynamic panels + hint). Used by the DSCP/capture keypress handler
+    # to move the cursor below the frame before launching interactive mode.
     local _last_total=$pre_lines
 
-    # Reserve vertical space and position cursor at top of reserved block
+    # ── Reserve vertical space and anchor the frame position ──────────────
+    # Print pre_lines blank lines to push the terminal down, then move the
+    # cursor back up to where the frame will start. Save that position with
+    # \033[s so every subsequent tick can return to it with \033[u instead
+    # of using a relative cursor-up calculation.
+    #
+    # Using save/restore (\033[s / \033[u) instead of \033[NA (cursor up N)
+    # makes the dashboard immune to line-count mismatches. Even if the
+    # frame grows by one line (e.g. CWND data appears for the first time),
+    # the cursor always returns to the correct top-of-frame row.
     local k
     for (( k=0; k<pre_lines; k++ )); do printf '\n'; done
     printf '\033[%dA' "$pre_lines"
-    printf '\033[?25l'   # hide cursor
+    printf '\033[s'        # save absolute cursor position = top of frame
+    printf '\033[?25l'     # hide cursor during rendering
 
-    local first_tick=1
     local _dashboard_running=1
 
     # ── Main render loop ───────────────────────────────────────────────────
-while (( _dashboard_running == 1 )); do
+    while (( _dashboard_running == 1 )); do
 
-    # ── Per-tick state probe ───────────────────────────────────────────
-    if (( first_tick == 0 )) && [[ "$mode" != "server" ]]; then
-        local j
-        for (( j=0; j<STREAM_COUNT; j++ )); do
-            probe_client_status "$j"
-        done
-    fi
+        # ── Per-tick state probe ───────────────────────────────────────────
+        # Probe all stream statuses at the start of every tick so the
+        # render sees fresh state. Skip on the very first tick because
+        # probe_client_status was already called above before pre-reservation.
+        if [[ "$mode" != "server" ]]; then
+            local j
+            for (( j=0; j<STREAM_COUNT; j++ )); do
+                probe_client_status "$j"
+            done
+        fi
 
-    # ── Stream cleanup state machine ───────────────────────────────────
-    # Phase A ONLY here: DONE/FAILED → CLEANUP_PENDING
-    # Phase B is executed AFTER the render below.
-    if [[ "$mode" != "server" ]]; then
-        local _si
-        for (( _si=0; _si<STREAM_COUNT; _si++ )); do
-            local _cur_st="${S_STATUS_CACHE[$_si]:-}"
-            if [[ "$_cur_st" == "DONE" || "$_cur_st" == "FAILED" ]]; then
-                if [[ "${S_CLEANUP_QUEUED[$_si]:-0}" != "1" && \
-                      "${S_CLEANUP_QUEUED[$_si]:-0}" != "2" ]]; then
-                    S_CLEANUP_QUEUED[$_si]="1"
-                    S_STATUS_CACHE[$_si]="CLEANUP_PENDING"
+        # ── Stream cleanup state machine — Phase A ─────────────────────────
+        # Transition DONE/FAILED → CLEANUP_PENDING.
+        # This is instantaneous (no blocking operations).
+        # The renderer shows a spinner row on this tick.
+        # Phase B (actual process termination) runs AFTER the render below.
+        if [[ "$mode" != "server" ]]; then
+            local _si
+            for (( _si=0; _si<STREAM_COUNT; _si++ )); do
+                local _cur_st="${S_STATUS_CACHE[$_si]:-}"
+                if [[ "$_cur_st" == "DONE" || "$_cur_st" == "FAILED" ]]; then
+                    if [[ "${S_CLEANUP_QUEUED[$_si]:-0}" != "1" && \
+                          "${S_CLEANUP_QUEUED[$_si]:-0}" != "2" ]]; then
+                        S_CLEANUP_QUEUED[$_si]="1"
+                        S_STATUS_CACHE[$_si]="CLEANUP_PENDING"
+                    fi
                 fi
+            done
+        fi
+
+        # ── Restore cursor to top of frame ────────────────────────────────
+        # \033[u restores the cursor to the position saved by \033[s above.
+        # This is performed every tick including the first, replacing the
+        # old first_tick guard on \033[NA. It is immune to line-count
+        # changes between ticks.
+        printf '\033[u'
+
+        # ── Render the frame ───────────────────────────────────────────────
+        # After rendering, fixed_lines holds the exact number of lines
+        # that were printed this tick:
+        #   - server: computed by _count_server_frame_lines (static)
+        #   - client: stored in _LAST_FRAME_LINE_COUNT by _render_client_frame
+        #             via the self-counting _rc mechanism
+        local fixed_lines
+        if [[ "$mode" == "server" ]]; then
+            _render_server_frame
+            fixed_lines=$(_count_server_frame_lines)
+        else
+            _render_client_frame
+            fixed_lines=$_LAST_FRAME_LINE_COUNT
+        fi
+
+        # ── Erase stale content below the current frame ───────────────────
+        # Clears any leftover lines from a previous longer frame (e.g. after
+        # CWND panel disappears or streams finish). Must run BEFORE dynamic
+        # panels are rendered so they appear immediately below the frame.
+        printf '\033[J'
+
+        # ── Dynamic panels (client only) ───────────────────────────────────
+        local completed_lines=0 failed_lines=0 cwnd_lines=0
+        if [[ "$mode" != "server" ]]; then
+            completed_lines=$(_count_completed_panel_lines)
+            failed_lines=$(_count_failed_panel_lines)
+            cwnd_lines=$(_count_cwnd_panel_lines)
+            (( completed_lines > 0 )) && _render_completed_panel
+            (( failed_lines    > 0 )) && _render_failed_panel
+            (( cwnd_lines      > 0 )) && _render_cwnd_panel
+        fi
+
+        # ── DSCP verify hint (client, non-loopback, CONNECTED streams) ────
+        # Renders a 3-line hint block below the dynamic panels when at least
+        # one non-loopback stream is CONNECTED. The hint_lines count is used
+        # in _last_total so the keypress handler knows where to move the
+        # cursor before launching _dscp_verify_interactive.
+        local _hint_lines=0
+        if [[ "$mode" != "server" ]] && ! _all_streams_loopback; then
+            local _any_verifiable=0
+            local _ji
+            for (( _ji=0; _ji<STREAM_COUNT; _ji++ )); do
+                if [[ "${S_STATUS_CACHE[$_ji]}" == "CONNECTED" ]] && \
+                   [[ ! "${S_TARGET[$_ji]:-}" =~ ^127\. ]] && \
+                   [[ "${S_TARGET[$_ji]:-}" != "::1" ]]; then
+                    _any_verifiable=1
+                    break
+                fi
+            done
+            if (( _any_verifiable == 1 )); then
+                printf '\033[K\n'
+                printf '  %b[v/p]%b  Verify DSCP marking for a stream\033[K\n' \
+                    "$DIM" "$NC"
+                printf '\033[K\n'
+                _hint_lines=3
             fi
-        done
-    fi
+        fi
 
-    # ── Move cursor to top of last rendered block ──────────────────────
-    if (( first_tick == 0 )); then
-        printf '\033[%dA' "$_last_total"
-    fi
-    first_tick=0
+        # ── Record total rendered lines for DSCP keypress handler ──────────
+        # _last_total = lines printed this tick by the frame + all panels
+        # + hint. Used by the v/p and c keypress handlers to move the cursor
+        # below all rendered content before entering interactive mode.
+        # It is NOT used for cursor-up positioning (that uses \033[u now).
+        local dynamic_lines=$(( completed_lines + failed_lines + cwnd_lines ))
+        _last_total=$(( fixed_lines + dynamic_lines + _hint_lines ))
+        _PREV_DYNAMIC_LINES=$(( completed_lines + failed_lines ))
 
-    # ── Render the frame ──────────────────────────────────────────────
-    local fixed_lines
-    if [[ "$mode" == "server" ]]; then
-        _render_server_frame
-        fixed_lines=$(_count_server_frame_lines)
-    else
-        _render_client_frame
-        fixed_lines=$_LAST_FRAME_LINE_COUNT   # ← use self-measured count
-    fi
+        # ── Stream cleanup state machine — Phase B ─────────────────────────
+        # Execute actual process cleanup AFTER the frame has been painted.
+        # The spinner row was visible this tick. Next tick will show the
+        # CLEANED tombstone row.
+        # _cleanup_stream_procs writes all output to /tmp/iperf3_streams_events.log
+        # so stdout remains uncontaminated.
+        if [[ "$mode" != "server" ]]; then
+            local _si
+            for (( _si=0; _si<STREAM_COUNT; _si++ )); do
+                if [[ "${S_STATUS_CACHE[$_si]:-}" == "CLEANUP_PENDING" && \
+                      "${S_CLEANUP_QUEUED[$_si]:-0}" == "1" ]]; then
+                    S_CLEANUP_QUEUED[$_si]="2"
+                    _cleanup_stream_procs "$_si"
+                fi
+            done
+        fi
 
-    printf '\033[J'
+        # ── Exit condition (client mode) ───────────────────────────────────
+        # The loop exits only when every stream is in a terminal state:
+        #   CLEANED   — stream finished and processes were stopped
+        #   FAILED    — stream failed to start or connect
+        #
+        # CLEANUP_PENDING with queued=2 means cleanup ran this tick and
+        # the state will be CLEANED on the next tick. Treat it as finished
+        # so we do not spin for an extra tick after the last stream cleans up.
+        if [[ "$mode" != "server" ]]; then
+            local _all_finished=1
+            local j
+            for (( j=0; j<STREAM_COUNT; j++ )); do
+                local _jst="${S_STATUS_CACHE[$j]:-STARTING}"
+                case "$_jst" in
+                    CLEANED|FAILED)
+                        # Terminal states — this stream is finished
+                        ;;
+                    CLEANUP_PENDING)
+                        # Cleanup ran this tick (queued=2) — treat as finished.
+                        # Cleanup not yet run (queued=1) — not finished yet.
+                        if [[ "${S_CLEANUP_QUEUED[$j]:-0}" != "2" ]]; then
+                            _all_finished=0
+                        fi
+                        ;;
+                    *)
+                        _all_finished=0
+                        break
+                        ;;
+                esac
+            done
 
-    # ── Dynamic panels ─────────────────────────────────────────────────
-    local completed_lines=0 failed_lines=0 cwnd_lines=0
-    if [[ "$mode" != "server" ]]; then
-        completed_lines=$(_count_completed_panel_lines)
-        failed_lines=$(_count_failed_panel_lines)
-        cwnd_lines=$(_count_cwnd_panel_lines)
-        (( completed_lines > 0 )) && _render_completed_panel
-        (( failed_lines    > 0 )) && _render_failed_panel
-        (( cwnd_lines      > 0 )) && _render_cwnd_panel
-    fi
+            if (( _all_finished == 1 )); then
+                # Perform one final render pass to show CLEANED tombstone rows
+                # before exiting, then stop the loop.
+                _dashboard_running=0
+                continue
+            fi
+        fi
 
-    # ── DSCP hint ──────────────────────────────────────────────────────
-    local _hint_lines=0
-    if [[ "$mode" != "server" ]] && ! _all_streams_loopback; then
-        local _any_verifiable=0
-        local _ji
-        for (( _ji=0; _ji<STREAM_COUNT; _ji++ )); do
-            if [[ "${S_STATUS_CACHE[$_ji]}" == "CONNECTED" ]] && \
-               [[ ! "${S_TARGET[$_ji]:-}" =~ ^127\. ]] && \
-               [[ "${S_TARGET[$_ji]:-}" != "::1" ]]; then
-                _any_verifiable=1
+        # ── Non-blocking keyboard poll (10 × 0.1 s = ~1 s per tick) ───────
+        # Polls for a single keypress without blocking the render loop.
+        # Each slice sleeps 0.1 s. After 10 slices the tick completes and
+        # the next render runs. CLEANUP_DONE is checked each slice so a
+        # SIGINT/SIGTERM causes the loop to exit within 0.1 s.
+        local key_pressed="" key_lower=""
+        local tick_slice
+        for (( tick_slice=0; tick_slice<10; tick_slice++ )); do
+            if IFS= read -r -s -n 1 -t 0.1 key_pressed </dev/tty 2>/dev/null; then
+                key_lower=$(printf '%s' "$key_pressed" | tr '[:upper:]' '[:lower:]')
+                break
+            fi
+            key_pressed=""
+            key_lower=""
+            if (( CLEANUP_DONE == 1 )); then
+                _dashboard_running=0
                 break
             fi
         done
-        if (( _any_verifiable == 1 )); then
-            printf '\033[K\n'
-            printf '  %b[v/p]%b  Verify DSCP marking for a stream\033[K\n' \
-                "$DIM" "$NC"
-            printf '\033[K\n'
-            _hint_lines=3
-        fi
-    fi
 
-    # ── Record total rendered lines ────────────────────────────────────
-    local dynamic_lines=$(( completed_lines + failed_lines + cwnd_lines ))
-    _last_total=$(( fixed_lines + dynamic_lines + _hint_lines ))
-    _PREV_DYNAMIC_LINES=$(( completed_lines + failed_lines ))
-
-    # ── Phase B: execute cleanup AFTER frame is painted ───────────────
-    # stdout is safe here because _cleanup_stream_procs now logs to file.
-    # The spinner was visible this tick; next tick will show CLEANED state.
-    if [[ "$mode" != "server" ]]; then
-        local _si
-        for (( _si=0; _si<STREAM_COUNT; _si++ )); do
-            if [[ "${S_STATUS_CACHE[$_si]:-}" == "CLEANUP_PENDING" && \
-                  "${S_CLEANUP_QUEUED[$_si]:-0}" == "1" ]]; then
-                S_CLEANUP_QUEUED[$_si]="2"
-                _cleanup_stream_procs "$_si"
-            fi
-        done
-    fi
-
-    # ── Exit condition ─────────────────────────────────────────────────
-    if [[ "$mode" != "server" ]]; then
-        local _all_finished=1
-        local j
-        for (( j=0; j<STREAM_COUNT; j++ )); do
-            local _jst="${S_STATUS_CACHE[$j]:-STARTING}"
-            case "$_jst" in
-                CLEANED|FAILED) ;;
-                CLEANUP_PENDING)
-                    if [[ "${S_CLEANUP_QUEUED[$j]:-0}" != "2" ]]; then
-                        _all_finished=0
-                    fi
-                    ;;
-                *)
-                    _all_finished=0
-                    break
-                    ;;
-            esac
-        done
-
-        if (( _all_finished == 1 )); then
+        # Exit immediately if cleanup was triggered by a signal handler
+        if (( CLEANUP_DONE == 1 )); then
             _dashboard_running=0
             continue
         fi
-    fi
 
-    # ── Non-blocking keyboard poll ─────────────────────────────────────
-    local key_pressed="" key_lower=""
-    local tick_slice
-    for (( tick_slice=0; tick_slice<10; tick_slice++ )); do
-        if IFS= read -r -s -n 1 -t 0.1 key_pressed </dev/tty 2>/dev/null; then
-            key_lower=$(printf '%s' "$key_pressed" | tr '[:upper:]' '[:lower:]')
-            break
+        # ── Handle DSCP verify keypress (client mode, v or p) ─────────────
+        # Moves cursor below all rendered content, runs the interactive DSCP
+        # verification, then re-anchors the frame position for the next tick.
+        if [[ "$mode" != "server" ]] && \
+           ! _all_streams_loopback && \
+           [[ "$key_lower" == "v" || "$key_lower" == "p" ]]; then
+
+            # Show cursor and move below all rendered content
+            printf '\033[?25h'
+            printf '\033[%dB' "$_last_total"
+
+            _dscp_verify_interactive
+
+            # Re-probe stream states after interactive mode
+            local j
+            for (( j=0; j<STREAM_COUNT; j++ )); do
+                probe_client_status "$j"
+            done
+
+            # Re-calculate pre-reserve size based on current state
+            local new_pre
+            new_pre=$(_count_client_frame_lines_for_state)
+            FRAME_LINES=$new_pre
+
+            # Reserve fresh vertical space and re-anchor the saved position
+            for (( k=0; k<new_pre; k++ )); do printf '\n'; done
+            printf '\033[%dA' "$new_pre"
+            printf '\033[s'       # re-save cursor position = new top of frame
+            printf '\033[?25l'
+
+            _last_total=$new_pre
         fi
-        key_pressed=""
-        key_lower=""
-        if (( CLEANUP_DONE == 1 )); then
-            _dashboard_running=0
-            break
+
+        # ── Handle packet capture keypress (server mode, c) ───────────────
+        if [[ "$mode" == "server" ]] && [[ "$key_lower" == "c" ]]; then
+
+            # Show cursor and move below all rendered content
+            printf '\033[?25h'
+            printf '\033[%dB' "$_last_total"
+
+            _dscp_verify_server_interactive
+
+            # Re-calculate server frame size and re-anchor
+            local new_pre
+            new_pre=$(_count_server_frame_lines)
+            FRAME_LINES=$new_pre
+
+            for (( k=0; k<new_pre; k++ )); do printf '\n'; done
+            printf '\033[%dA' "$new_pre"
+            printf '\033[s'       # re-save cursor position = new top of frame
+            printf '\033[?25l'
+
+            _last_total=$new_pre
         fi
+
     done
+    # ── End of render loop ─────────────────────────────────────────────────
 
-    if (( CLEANUP_DONE == 1 )); then
-        _dashboard_running=0
-        continue
+    # Restore cursor visibility
+    printf '\033[?25h'
+
+    # ── Display buffered cleanup events after dashboard exits ──────────────
+    # _cleanup_stream_procs and _remove_netem_for_stream write all status
+    # messages to this log file instead of stdout so they cannot corrupt
+    # the TUI. Display them now that the dashboard has exited.
+    local _log_file="/tmp/iperf3_streams_events.log"
+    if [[ -f "$_log_file" ]]; then
+        printf '\n'
+        while IFS= read -r _log_line; do
+            printf '  %s\n' "$_log_line"
+        done < "$_log_file"
+        rm -f "$_log_file"
+        printf '\n'
     fi
 
-    # ── Handle DSCP verify keypress ────────────────────────────────────
-    if [[ "$mode" != "server" ]] && \
-       ! _all_streams_loopback && \
-       [[ "$key_lower" == "v" || "$key_lower" == "p" ]]; then
-
-        printf '\033[?25h'
-        printf '\033[%dB' "$_last_total"
-        _dscp_verify_interactive
-
-        local j
-        for (( j=0; j<STREAM_COUNT; j++ )); do
-            probe_client_status "$j"
-        done
-
-        local new_pre
-        new_pre=$(_count_client_frame_lines_for_state)
-        FRAME_LINES=$new_pre
-
-        for (( k=0; k<new_pre; k++ )); do printf '\n'; done
-        printf '\033[%dA' "$new_pre"
-        printf '\033[?25l'
-
-        _last_total=$new_pre
-        first_tick=1
-    fi
-
-    # ── Handle packet capture keypress — server mode ───────────────────
-    if [[ "$mode" == "server" ]] && [[ "$key_lower" == "c" ]]; then
-
-        printf '\033[?25h'
-        printf '\033[%dB' "$_last_total"
-        _dscp_verify_server_interactive
-
-        local new_pre
-        new_pre=$(_count_server_frame_lines)
-        FRAME_LINES=$new_pre
-
-        for (( k=0; k<new_pre; k++ )); do printf '\n'; done
-        printf '\033[%dA' "$new_pre"
-        printf '\033[?25l'
-
-        _last_total=$new_pre
-        first_tick=1
-    fi
-
-done
-# ── End of render loop ─────────────────────────────────────────────────
-
-printf '\033[?25h'
-
-# ── Display any buffered cleanup events after dashboard exits ──────────
-local _log_file="/tmp/iperf3_streams_events.log"
-if [[ -f "$_log_file" ]]; then
     printf '\n'
-    while IFS= read -r _log_line; do
-        printf '  %s\n' "$_log_line"
-    done < "$_log_file"
-    rm -f "$_log_file"
-    printf '\n'
-fi
-
-printf '\n'
 }
-
 # =============================================================================
 # SECTION 13 — FINAL RESULTS
 # =============================================================================
