@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
 # iperf3-traffic-streams.sh — Enterprise-grade iperf3 multi-stream traffic manager
-# Version: 8.2.5
+# Version: 8.2.6
 # Author : Waqas Daar (waqasdaar@gmail.com)
 # =============================================================================
 
@@ -620,9 +620,20 @@ declare -a S_RTT_JITTER=()       # jitter ms (mdev/stddev from ping summary)
 declare -a S_RTT_LOSS=()         # packet loss percentage string  e.g. "0%"
 declare -a S_RTT_SAMPLES=()      # number of RTT samples collected so far
 
+# Live CWND fields (updated every dashboard tick from stream log)
+# cwnd values are in KBytes as reported by iperf3 TCP verbose output.
+# Format: [  5]  0.00-1.00  sec  128 KBytes  1.05 Mbits/sec  0  90.5 KBytes
+#                                                              ^   ^^^^^^^^^
+#                                                           retr    cwnd
+declare -a S_CWND_CURRENT=()    # most recent cwnd value in KBytes (float string)
+declare -a S_CWND_MIN=()        # minimum cwnd seen during stream
+declare -a S_CWND_MAX=()        # maximum cwnd seen during stream
+declare -a S_CWND_FINAL=()      # last cwnd value at stream end
+declare -a S_CWND_SAMPLES=()    # number of cwnd samples collected
+declare -a S_CWND_HISTORY=()    # colon-separated ring buffer of last 10 cwnd values
 
 # =============================================================================
-# SECTION 9 — SPARKLINE ENGINE  ★ NEW IN v8.2.2 ★
+# SECTION 9 — SPARKLINE ENGINE
 # =============================================================================
 #
 # Each stream (client) and each server listener maintains an independent
@@ -1489,6 +1500,22 @@ _capture_final_bw() {
 
     S_FINAL_SENDER_BW[$idx]="${sbw:-N/A}"
     S_FINAL_RECEIVER_BW[$idx]="${rbw:-N/A}"
+
+    # Capture final cwnd from the last interval line
+    if [[ "${S_PROTO[$idx]:-TCP}" == "TCP" && -f "$lf" && -s "$lf" ]]; then
+        local final_cwnd_line
+        final_cwnd_line=$(grep -E '[0-9.]+-[0-9.]+[[:space:]]+sec' "$lf" 2>/dev/null \
+            | grep -vE '[[:space:]](sender|receiver)[[:space:]]*$' \
+            | grep -E '[[:space:]][0-9]+(\.[0-9]+)?[[:space:]]+KBytes[[:space:]]*$' \
+            | tail -1)
+        if [[ -n "$final_cwnd_line" ]]; then
+            local final_cwnd_val
+            final_cwnd_val=$(printf '%s\n' "$final_cwnd_line" | awk '
+                { if ($NF == "KBytes") printf "%.1f", $(NF-1)+0 }')
+            [[ -n "$final_cwnd_val" && "$final_cwnd_val" != "0.0" ]] && \
+                S_CWND_FINAL[$idx]="$final_cwnd_val"
+        fi
+    fi
 }
 
 # =============================================================================
@@ -1550,7 +1577,7 @@ cleanup() {
         done
     fi
 
-    # ── ★ NEW IN v8.2.4 ★ — Terminate bidirectional reverse processes ────
+    # ──— Terminate bidirectional reverse processes ────
     if (( ${#BIDIR_PIDS[@]} > 0 )); then
         tty_echo ""; tty_echo "${BOLD}  Bidirectional RX Processes:${NC}"
         local i
@@ -2650,7 +2677,7 @@ configure_client_streams() {
         fi
         S_NOFQ+=("$nofq")
 
-        # ── Bidirectional simultaneous test  ★ NEW IN v8.2.5 ★ ───────────
+        # ── Bidirectional simultaneous test ───────────
         local bidir=0
         echo ""
         printf '%b\n' "${CYAN}  -- Bidirectional Test --${NC}"
@@ -2979,7 +3006,7 @@ show_stream_summary() {
 }
 
 # =============================================================================
-# SECTION 9b — RTT & LATENCY ENGINE  ★ NEW IN v8.2.3 ★
+# SECTION 9b — RTT & LATENCY ENGINE
 # =============================================================================
 #
 # Design:
@@ -3186,6 +3213,634 @@ _rtt_parse() {
     S_RTT_JITTER[$idx]="${rtt_jitter:-???}"
     S_RTT_LOSS[$idx]="${rtt_loss:-???}"
     S_RTT_SAMPLES[$idx]="${rtt_count:-0}"
+}
+
+# ---------------------------------------------------------------------------
+# _cwnd_parse  <stream_idx>
+#
+# Parses the congestion window (cwnd) from the iperf3 TCP stream log.
+#
+# iperf3 TCP verbose output format (per-interval line):
+#   [  5]   0.00-1.00   sec   128 KBytes  1.05 Mbits/sec    0   90.5 KBytes
+#                                                            ^    ^^^^^^^^^
+#                                                         retr      cwnd
+#
+# The cwnd field is the LAST field on TCP interval lines. It is reported in
+# KBytes and always followed by "KBytes" as the unit. UDP lines do not have
+# a cwnd field and are safely ignored by the pattern match.
+#
+# For --bidir streams the [TX-C] tagged lines carry the cwnd for the TX
+# direction. [RX-C] lines do not carry cwnd.
+#
+# Algorithm:
+#   1. Read the last 10 non-summary TCP interval lines from the log.
+#   2. Extract cwnd from the final field pair (number + KBytes).
+#   3. Update current/min/max/history in the caller's shell (no subshell).
+#
+# Called once per dashboard tick for each CONNECTED TCP stream.
+# ---------------------------------------------------------------------------
+_cwnd_parse() {
+    local idx="$1"
+    local logfile="${S_LOGFILE[$idx]:-}"
+
+    [[ -z "$logfile" || ! -f "$logfile" || ! -s "$logfile" ]] && return
+
+    # Only meaningful for TCP streams
+    [[ "${S_PROTO[$idx]:-TCP}" != "TCP" ]] && return
+
+    # Extract the last 10 interval lines that have a cwnd field.
+    # cwnd lines end with: <number> KBytes
+    # We match both plain and --bidir [TX-C] tagged lines.
+    # Pattern: last two fields are "NNN KBytes" (the cwnd)
+    local raw_lines
+    raw_lines=$(grep -E '[0-9.]+-[0-9.]+[[:space:]]+sec' "$logfile" 2>/dev/null \
+        | grep -vE '[[:space:]](sender|receiver)[[:space:]]*$' \
+        | grep -E '[[:space:]][0-9]+(\.[0-9]+)?[[:space:]]+KBytes[[:space:]]*$' \
+        | tail -10)
+
+    [[ -z "$raw_lines" ]] && return
+
+    # Parse all cwnd values in a single awk pass
+    local result
+    result=$(printf '%s\n' "$raw_lines" | awk '
+    BEGIN {
+        count  = 0
+        sum    = 0
+        min_v  = -1
+        max_v  = 0
+        hist   = ""
+    }
+    {
+        # The cwnd is the second-to-last field (NF-1) when the last field is "KBytes"
+        # Guard: last field must be "KBytes"
+        if ($NF != "KBytes") next
+
+        cwnd = $(NF-1) + 0
+        if (cwnd <= 0) next
+
+        count++
+        sum += cwnd
+        if (min_v < 0 || cwnd < min_v) min_v = cwnd
+        if (cwnd > max_v) max_v = cwnd
+
+        # Build colon-separated history (most recent last)
+        if (hist == "") hist = cwnd
+        else            hist = hist ":" cwnd
+    }
+    END {
+        if (count == 0) {
+            print "0:0:0:0:0"
+            exit
+        }
+        # Trim history to last 10 entries
+        n = split(hist, a, ":")
+        start = (n > 10) ? n - 9 : 1
+        out = ""
+        for (i = start; i <= n; i++) {
+            out = (out == "") ? a[i] : out ":" a[i]
+        }
+        # Format: current:min:max:final:count:history
+        printf "%.1f:%.1f:%.1f:%.1f:%d:%s",
+            a[n], min_v, max_v, a[n], count, out
+    }')
+
+    [[ -z "$result" ]] && return
+
+    # Split result into fields
+    local cwnd_cur cwnd_min cwnd_max cwnd_final cwnd_count cwnd_hist
+    IFS=':' read -r cwnd_cur cwnd_min cwnd_max cwnd_final cwnd_count cwnd_hist \
+        <<< "$result"
+
+    # Only update if we got valid data
+    [[ "$cwnd_count" == "0" || -z "$cwnd_cur" ]] && return
+
+    S_CWND_CURRENT[$idx]="${cwnd_cur:-0}"
+    S_CWND_SAMPLES[$idx]="${cwnd_count:-0}"
+    S_CWND_HISTORY[$idx]="${cwnd_hist:-}"
+
+    # Update min — only replace if better (and not unset)
+    local existing_min="${S_CWND_MIN[$idx]:-}"
+    if [[ -z "$existing_min" || "$existing_min" == "---" ]]; then
+        S_CWND_MIN[$idx]="${cwnd_min:-0}"
+    else
+        # Compare using awk for float comparison
+        local new_min
+        new_min=$(awk -v a="$existing_min" -v b="$cwnd_min" \
+            'BEGIN { printf "%.1f", (b < a) ? b : a }')
+        S_CWND_MIN[$idx]="$new_min"
+    fi
+
+    # Update max — only replace if better
+    local existing_max="${S_CWND_MAX[$idx]:-0}"
+    local new_max
+    new_max=$(awk -v a="$existing_max" -v b="$cwnd_max" \
+        'BEGIN { printf "%.1f", (b > a) ? b : a }')
+    S_CWND_MAX[$idx]="$new_max"
+
+    # Always update final to the most recent value
+    S_CWND_FINAL[$idx]="${cwnd_final:-0}"
+}
+
+# ---------------------------------------------------------------------------
+# _cwnd_sparkline  <stream_idx>
+#
+# Renders a 10-character filled-area sparkline of cwnd evolution.
+# Uses the same block character set as the bandwidth sparkline engine
+# but reads from S_CWND_HISTORY[$idx] directly.
+#
+# Returns exactly _SPARK_WIDTH printable characters.
+# ---------------------------------------------------------------------------
+_cwnd_sparkline() {
+    local idx="$1"
+    local buf="${S_CWND_HISTORY[$idx]:-}"
+
+    if [[ -z "$buf" ]]; then
+        local d="" k
+        for (( k=0; k<_SPARK_WIDTH; k++ )); do d+='·'; done
+        printf '%s' "$d"
+        return
+    fi
+
+    printf '%s' "$buf" | awk \
+        -v width="$_SPARK_WIDTH" \
+        'BEGIN {
+            FS = ":"
+            blocks[1] = "\342\226\201"
+            blocks[2] = "\342\226\202"
+            blocks[3] = "\342\226\203"
+            blocks[4] = "\342\226\204"
+            blocks[5] = "\342\226\205"
+            blocks[6] = "\342\226\206"
+            blocks[7] = "\342\226\207"
+            blocks[8] = "\342\226\210"
+        }
+        {
+            n = split($0, vals, ":")
+            min_v = vals[1] + 0
+            max_v = vals[1] + 0
+            for (i = 2; i <= n; i++) {
+                v = vals[i] + 0
+                if (v < min_v) min_v = v
+                if (v > max_v) max_v = v
+            }
+            range = max_v - min_v
+            area = ""
+            for (i = 1; i <= n; i++) {
+                v = vals[i] + 0
+                if (range == 0) {
+                    lvl = (max_v > 0) ? 4 : 1
+                } else {
+                    lvl = int((v - min_v) / range * 7 + 0.5) + 1
+                    if (lvl < 1) lvl = 1
+                    if (lvl > 8) lvl = 8
+                }
+                area = area blocks[lvl]
+            }
+            dots_needed = width - n
+            dots = ""
+            for (i = 1; i <= dots_needed; i++) dots = dots "·"
+            printf "%s%s", dots, area
+        }'
+}
+
+# ---------------------------------------------------------------------------
+# _cwnd_display  <stream_idx>
+#
+# Returns a formatted CWND statistics string for the dashboard.
+# Format:  cwnd  cur:NNN KB  min:NNN KB  max:NNN KB  [sparkline]
+#
+# Colour coding:
+#   Green   cwnd growing or stable at high value  (> 200 KB)
+#   Cyan    moderate cwnd                          (50–200 KB)
+#   Yellow  low cwnd                              (10–50 KB)
+#   Red     very low cwnd                         (< 10 KB) — likely congested
+# ---------------------------------------------------------------------------
+_cwnd_display() {
+    local idx="$1"
+    local cwnd_cur="${S_CWND_CURRENT[$idx]:-}"
+    local cwnd_min="${S_CWND_MIN[$idx]:-}"
+    local cwnd_max="${S_CWND_MAX[$idx]:-}"
+    local cwnd_count="${S_CWND_SAMPLES[$idx]:-0}"
+
+    # No data yet
+    if [[ -z "$cwnd_cur" || "$cwnd_cur" == "0" || "$cwnd_count" == "0" ]]; then
+        printf '%s' "${DIM}  cwnd  Waiting for TCP data...${NC}"
+        return
+    fi
+
+    # Colour based on current cwnd value
+    local cwnd_col="$GREEN"
+    local cwnd_int
+    cwnd_int=$(printf '%.0f' "$cwnd_cur" 2>/dev/null || printf '0')
+    if   (( cwnd_int < 10  )); then cwnd_col="$RED"
+    elif (( cwnd_int < 50  )); then cwnd_col="$YELLOW"
+    elif (( cwnd_int < 200 )); then cwnd_col="$CYAN"
+    fi
+
+    # Format fields to fixed widths
+    local f_cur f_min f_max
+    f_cur=$(printf '%7.1f' "$cwnd_cur" 2>/dev/null || printf '%7s' "$cwnd_cur")
+    f_min=$(printf '%7.1f' "$cwnd_min" 2>/dev/null || printf '%7s' "$cwnd_min")
+    f_max=$(printf '%7.1f' "$cwnd_max" 2>/dev/null || printf '%7s' "$cwnd_max")
+
+    local spark
+    spark=$(_cwnd_sparkline "$idx")
+
+    printf '%s' \
+        "  ${DIM}cwnd${NC}" \
+        "  ${DIM}cur${NC} ${cwnd_col}${f_cur}${NC}${DIM}KB${NC}" \
+        "  ${DIM}min${NC} ${CYAN}${f_min}${NC}${DIM}KB${NC}" \
+        "  ${DIM}max${NC} ${YELLOW}${f_max}${NC}${DIM}KB${NC}" \
+        "  ${DIM}trend${NC} ${cwnd_col}${spark}${NC}"
+}
+
+# ---------------------------------------------------------------------------
+# _cwnd_detect_phase  <stream_idx>
+#
+# Analyses the cwnd history to determine the current TCP congestion control
+# phase. Uses heuristics based on cwnd growth rate and recent behaviour.
+#
+# Phases:
+#   SLOW_START       — cwnd growing rapidly (doubles each RTT)
+#   CONG_AVOID       — cwnd growing linearly (steady state)
+#   FAST_RECOVERY    — cwnd dropped sharply then recovering
+#   SSTHRESH         — cwnd near ssthresh, transitioning phase
+#   IDLE             — no recent data
+#
+# Returns a short phase string and a one-line description.
+# Format:  PHASE_CODE|Display Name|Description
+# ---------------------------------------------------------------------------
+_cwnd_detect_phase() {
+    local idx="$1"
+    local hist="${S_CWND_HISTORY[$idx]:-}"
+    local cur="${S_CWND_CURRENT[$idx]:-0}"
+    local samples="${S_CWND_SAMPLES[$idx]:-0}"
+
+    if [[ -z "$hist" || "$samples" == "0" || "$cur" == "0" ]]; then
+        printf '%s' "IDLE|Idle|No TCP congestion window data available"
+        return
+    fi
+
+    # Need at least 3 samples to detect phase
+    local n_fields
+    n_fields=$(printf '%s' "$hist" | tr ':' '\n' | wc -l | tr -d ' ')
+    if (( n_fields < 3 )); then
+        printf '%s' "INIT|Initialising|Collecting initial cwnd samples"
+        return
+    fi
+
+    local result
+    result=$(printf '%s\n' "$hist" | awk -F: '
+    {
+        n = NF
+        if (n < 3) { print "INIT|Initialising|Collecting initial cwnd samples"; exit }
+
+        # Extract recent window — last 5 samples or all if fewer
+        start = (n >= 5) ? n - 4 : 1
+        count = 0
+        prev  = 0
+        drops = 0
+        grows = 0
+        total = 0
+
+        for (i = start; i <= n; i++) {
+            v = $(i) + 0
+            total += v
+            count++
+            if (prev > 0) {
+                change = v - prev
+                if (change > prev * 0.4) grows++          # rapid growth >40%
+                if (v < prev * 0.5)      drops++          # sharp drop >50%
+            }
+            prev = v
+        }
+
+        avg = total / count
+        first_val = $(start) + 0
+        last_val  = $n + 0
+        overall_change = (first_val > 0) ? (last_val - first_val) / first_val : 0
+
+        if (drops >= 1) {
+            # Detected a sharp cwnd drop — fast recovery or timeout
+            if (last_val > first_val * 0.8) {
+                print "FAST_RECOVERY|Fast Recovery|cwnd dropped and is recovering — packet loss detected"
+            } else {
+                print "TIMEOUT|Timeout/Loss|cwnd reduced by loss event — re-entering slow start"
+            }
+        } else if (grows >= 2) {
+            # Rapid growth — slow start phase
+            print "SLOW_START|Slow Start|cwnd doubling rapidly — exponential growth phase"
+        } else if (overall_change > 0.05 && overall_change < 0.4) {
+            # Moderate linear growth — congestion avoidance
+            print "CONG_AVOID|Congestion Avoidance|cwnd growing linearly — stable throughput phase"
+        } else if (overall_change >= 0.4) {
+            # Still fast growth but not quite doubling
+            print "SSTHRESH|Near ssthresh|cwnd approaching ssthresh — transitioning to CA"
+        } else {
+            # Flat or very slow change
+            print "STEADY|Steady State|cwnd stable — network not congested"
+        }
+    }')
+
+    printf '%s' "${result:-STEADY|Steady State|cwnd stable}"
+}
+
+
+# ---------------------------------------------------------------------------
+# _render_cwnd_reference_table  <inner_width>
+#
+# Renders a compact reference table explaining TCP congestion control phases.
+# Printed once at the bottom of the CWND panel so the operator always has
+# context for what they are seeing in the live chart above.
+# ---------------------------------------------------------------------------
+_render_cwnd_reference_table() {
+    local inner="$1"
+
+    # Column layout: Phase(18) | Symbol(6) | Meaning(rest)
+    local C_PHASE=20 C_SYM=8
+    local C_MEANING=$(( inner - C_PHASE - C_SYM - 8 ))
+    (( C_MEANING < 20 )) && C_MEANING=20
+
+    printf '+%s+\n' "$(rpt '-' $inner)"
+
+    # Header
+    local hdr
+    printf -v hdr '%-*s  %-*s  %-*s' \
+        $C_PHASE 'TCP CC Phase' \
+        $C_SYM   'Indicator' \
+        $C_MEANING 'What it means for your test'
+    local hlen=${#hdr}
+    local hrp=$(( inner - 2 - hlen - 1 ))
+    (( hrp < 0 )) && hrp=0
+    printf '|  %s%s|\n' "$hdr" "$(rpt ' ' $hrp)"
+    printf '+%s+\n' "$(rpt '-' $inner)"
+
+    # Row helper — all plain text for exact column alignment
+    _ref_row() {
+        local phase="$1" sym="$2" meaning="$3"
+        local row
+        printf -v row '%-*s  %-*s  %-*s' \
+            $C_PHASE "$phase" \
+            $C_SYM   "$sym" \
+            $C_MEANING "$meaning"
+        local rlen=${#row}
+        local rrp=$(( inner - 2 - rlen - 1 ))
+        (( rrp < 0 )) && rrp=0
+        printf '|  %s%s|\n' "$row" "$(rpt ' ' $rrp)"
+    }
+
+    _ref_row "Slow Start"          "▁▂▄█"   "cwnd doubles each RTT — fills pipe as fast as possible"
+    _ref_row "Congestion Avoidance" "▄▅▆▇"   "cwnd +1 MSS/RTT — linear growth, stable throughput"
+    _ref_row "Fast Recovery"        "█▄▅▆"   "cwnd halved on loss, recovering — brief throughput dip"
+    _ref_row "Timeout / Loss"       "█▁▂▃"   "cwnd reset to ~1 MSS — severe loss, re-entering slow start"
+    _ref_row "Near ssthresh"        "▅▆▆▇"   "cwnd approaching threshold — switching from SS to CA"
+    _ref_row "Steady State"         "▆▆▇▇"   "cwnd stable — no congestion, network is not the bottleneck"
+
+    printf '+%s+\n' "$(rpt '-' $inner)"
+
+    # Legend line
+    local legend="  cwnd = TCP Congestion Window (KBytes)   ssthresh = Slow Start Threshold"
+    local llen=${#legend}
+    local lrp=$(( inner - llen - 1 ))
+    (( lrp < 0 )) && lrp=0
+    printf '|%s%s|\n' "$legend" "$(rpt ' ' $lrp)"
+
+    printf '+%s+\n' "$(rpt '=' $inner)"
+}
+
+
+# ---------------------------------------------------------------------------
+# _render_cwnd_panel
+#
+# Renders the dedicated real-time TCP Congestion Window tracking panel.
+# Called from run_dashboard() when at least one TCP stream is CONNECTED.
+#
+# Layout:
+#   ╔═══════════════════════════════════════════╗
+#   ║   TCP Congestion Window — Live Tracking   ║
+#   ╠═══════════════════════════════════════════╣
+#   ║  Stream 1  192.168.114.200:5201           ║
+#   ║  Phase: Congestion Avoidance              ║
+#   ║                                           ║
+#   ║  cwnd (KBytes)                            ║
+#   ║  128 │▁▂▄▅▆▇██▇█████▇█████████████████  ║
+#   ║    0 └─────────────────────── (30 smpl)   ║
+#   ║                                           ║
+#   ║  cur: 128.0 KB   min: 12.3 KB             ║
+#   ║  max: 256.0 KB   avg: 98.4 KB             ║
+#   ╠═══════════════════════════════════════════╣
+#   ║  TCP CC Phase   Symbol   What it means    ║
+#   ║  Slow Start     ▁▂▄█     cwnd doubles...  ║
+#   ╚═══════════════════════════════════════════╝
+# ---------------------------------------------------------------------------
+_render_cwnd_panel() {
+    local inner=$(( COLS - 2 ))
+
+    # ── Check if any TCP streams have cwnd data ────────────────────────────
+    local has_tcp_cwnd=0
+    local i
+    for (( i=0; i<STREAM_COUNT; i++ )); do
+        local st="${S_STATUS_CACHE[$i]:-}"
+        case "$st" in CONNECTED|DONE|CLEANED) ;;  *) continue ;; esac
+        [[ "${S_PROTO[$i]:-TCP}" != "TCP" ]] && continue
+        [[ "${S_CWND_SAMPLES[$i]:-0}" == "0" ]] && continue
+        has_tcp_cwnd=1
+        break
+    done
+
+    (( has_tcp_cwnd == 0 )) && return
+
+    # ── Panel header ───────────────────────────────────────────────────────
+    printf '+%s+\033[K\n' "$(rpt '=' $inner)"
+    bcenter "${BOLD}${CYAN}TCP Congestion Window — Live Tracking${NC}"
+    printf '+%s+\033[K\n' "$(rpt '=' $inner)"
+
+    # ── Per-stream CWND block ──────────────────────────────────────────────
+    for (( i=0; i<STREAM_COUNT; i++ )); do
+        local st="${S_STATUS_CACHE[$i]:-}"
+        case "$st" in CONNECTED|DONE|CLEANED) ;;  *) continue ;; esac
+        [[ "${S_PROTO[$i]:-TCP}" != "TCP" ]] && continue
+        [[ "${S_CWND_SAMPLES[$i]:-0}" == "0" ]] && continue
+
+        local sn=$(( i + 1 ))
+        local tgt="${S_TARGET[$i]:-?}"
+        local port="${S_PORT[$i]:-?}"
+        local cwnd_cur="${S_CWND_CURRENT[$i]:-0}"
+        local cwnd_min="${S_CWND_MIN[$i]:-0}"
+        local cwnd_max="${S_CWND_MAX[$i]:-0}"
+        local cwnd_final="${S_CWND_FINAL[$i]:-0}"
+        local cwnd_samples="${S_CWND_SAMPLES[$i]:-0}"
+        local cwnd_hist="${S_CWND_HISTORY[$i]:-}"
+
+        # ── Stream identity line ───────────────────────────────────────────
+        local stream_line="Stream ${sn}   ${tgt}:${port}   ${S_DSCP_NAME[$i]:+DSCP: ${S_DSCP_NAME[$i]}}"
+        local slen=${#stream_line}
+        local srp=$(( inner - 2 - slen - 1 ))
+        (( srp < 0 )) && srp=0
+        printf '|  %b%s%b%s|\033[K\n' "${BOLD}" "$stream_line" "${NC}" "$(rpt ' ' $srp)"
+
+        # ── Phase detection ────────────────────────────────────────────────
+        local phase_raw
+        phase_raw=$(_cwnd_detect_phase "$i")
+        local phase_code phase_name phase_desc
+        IFS='|' read -r phase_code phase_name phase_desc <<< "$phase_raw"
+
+        # Phase colour
+        local phase_col
+        case "$phase_code" in
+            SLOW_START)    phase_col="$GREEN"  ;;
+            CONG_AVOID)    phase_col="$CYAN"   ;;
+            FAST_RECOVERY) phase_col="$YELLOW" ;;
+            TIMEOUT)       phase_col="$RED"    ;;
+            SSTHRESH)      phase_col="$YELLOW" ;;
+            STEADY)        phase_col="$GREEN"  ;;
+            *)             phase_col="$DIM"    ;;
+        esac
+
+        local phase_line="Phase: ${phase_name}   ${phase_desc}"
+        local plen=${#phase_line}
+        # Account for ANSI in the colour — use plain text length for padding
+        local p_plain_len=$(( ${#phase_name} + ${#phase_desc} + 9 ))
+        local prp=$(( inner - 2 - p_plain_len - 1 ))
+        (( prp < 0 )) && prp=0
+        printf '|  %b' "$phase_col"
+        printf 'Phase: %s%b   %b%s%b%s|\033[K\n' \
+            "$phase_name" "$NC" \
+            "$DIM" "$phase_desc" "$NC" \
+            "$(rpt ' ' $prp)"
+
+        printf '+%s+\033[K\n' "$(rpt '-' $inner)"
+
+        # ── ASCII bar chart ────────────────────────────────────────────────
+        # Renders a full-width bar chart of cwnd history.
+        # Each sample maps to one column of the chart using block characters.
+        # Y-axis shows max value at top and 0 at bottom.
+        # Chart height: 5 lines. Width: inner - 10 (for Y-axis labels).
+
+        local chart_w=$(( inner - 12 ))
+        (( chart_w < 20 )) && chart_w=20
+        local chart_h=5
+
+        # Format Y-axis labels
+        local y_max_label y_mid_label y_zero_label
+        y_max_label=$(printf '%6.0f' "${cwnd_max:-0}" 2>/dev/null || printf '%6s' "${cwnd_max}")
+        y_mid_label=$(printf '%6.0f' "$(awk -v m="${cwnd_max:-0}" 'BEGIN{printf "%.0f",m/2}')" 2>/dev/null || printf '%6s' "")
+        y_zero_label=$(printf '%6s' "0")
+
+        # Build the bar chart using awk
+        local chart_lines
+        chart_lines=$(printf '%s\n' "${cwnd_hist:-0}" | awk \
+            -v w="$chart_w" \
+            -v h="$chart_h" \
+            -v maxv="${cwnd_max:-1}" \
+            'BEGIN {
+                FS = ":"
+                full  = "\342\226\210"   # U+2588 full block
+                upper = "\342\226\204"   # U+2584 upper half
+                lower = "\342\226\201"   # U+2581 lower eighth
+                empty = " "
+            }
+            {
+                n = split($0, vals, ":")
+                # Build array of normalised heights [0..h]
+                for (j = 1; j <= n && j <= w; j++) {
+                    v = vals[j] + 0
+                    if (maxv <= 0) maxv = 1
+                    ht[j] = int((v / maxv) * h + 0.5)
+                    if (ht[j] > h) ht[j] = h
+                    if (ht[j] < 0) ht[j] = 0
+                }
+                total_cols = (n < w) ? n : w
+
+                # Print chart from top row (h) down to row 1
+                for (row = h; row >= 1; row--) {
+                    line = ""
+                    for (col = 1; col <= total_cols; col++) {
+                        if (ht[col] >= row) {
+                            line = line full
+                        } else if (ht[col] == row - 1 && row > 1) {
+                            line = line lower
+                        } else {
+                            line = line empty
+                        }
+                    }
+                    # Pad to chart width
+                    for (col = total_cols + 1; col <= w; col++) {
+                        line = line empty
+                    }
+                    print line
+                }
+            }')
+
+        # Render the chart with Y-axis labels
+        local line_num=0
+        while IFS= read -r chart_line; do
+            local y_label=""
+            case $line_num in
+                0) y_label="$y_max_label KB" ;;
+                2) y_label="$y_mid_label KB" ;;
+                4) y_label="$y_zero_label KB" ;;
+                *) y_label="         " ;;
+            esac
+            local row_content="${y_label} │${chart_line}"
+            local rclen=${#row_content}
+            # Strip block chars from length count — each is 3 bytes but 1 visible char
+            # Approximate: each visible char in chart_line is 1 column wide
+            local visible_len=$(( ${#y_label} + 3 + chart_w ))
+            local row_rp=$(( inner - 2 - visible_len - 1 ))
+            (( row_rp < 0 )) && row_rp=0
+            printf '|  %s%s|\033[K\n' "$row_content" "$(rpt ' ' $row_rp)"
+            (( line_num++ ))
+        done <<< "$chart_lines"
+
+        # X-axis baseline
+        local xaxis="         └$(rpt '─' $chart_w)  (${cwnd_samples} smpl)"
+        local xlen=${#xaxis}
+        local xrp=$(( inner - 2 - xlen - 1 ))
+        (( xrp < 0 )) && xrp=0
+        printf '|  %s%s|\033[K\n' "$xaxis" "$(rpt ' ' $xrp)"
+
+        printf '+%s+\033[K\n' "$(rpt '-' $inner)"
+
+        # ── Statistics row ─────────────────────────────────────────────────
+        # Two columns: current/min on left, max/final on right
+        local f_cur f_min f_max f_final f_avg
+        f_cur=$(printf '%.1f' "$cwnd_cur" 2>/dev/null || printf '%s' "$cwnd_cur")
+        f_min=$(printf '%.1f' "$cwnd_min" 2>/dev/null || printf '%s' "$cwnd_min")
+        f_max=$(printf '%.1f' "$cwnd_max" 2>/dev/null || printf '%s' "$cwnd_max")
+        f_final=$(printf '%.1f' "${cwnd_final:-0}" 2>/dev/null || printf '%s' "${cwnd_final:-N/A}")
+
+        # Compute average from history
+        local f_avg_raw
+        f_avg_raw=$(printf '%s\n' "${cwnd_hist:-0}" | awk -F: '
+            { s=0; for(i=1;i<=NF;i++) s+=$i+0; printf "%.1f", s/NF }')
+
+        # Colour for current value
+        local c_col="$GREEN"
+        local c_int; c_int=$(printf '%.0f' "$cwnd_cur" 2>/dev/null || printf '0')
+        if   (( c_int < 10  )); then c_col="$RED"
+        elif (( c_int < 50  )); then c_col="$YELLOW"
+        elif (( c_int < 200 )); then c_col="$CYAN"
+        fi
+
+        # Build stats line — plain text for padding, then print with colour
+        local stat_plain="  Current: ${f_cur} KB    Min: ${f_min} KB    Max: ${f_max} KB    Avg: ${f_avg_raw} KB    Final: ${f_final} KB"
+        local spl=${#stat_plain}
+        local sprp=$(( inner - spl - 1 ))
+        (( sprp < 0 )) && sprp=0
+
+        printf '|  '
+        printf '%bCurrent:%b %b%s%b KB    ' "$DIM" "$NC" "$c_col" "$f_cur" "$NC"
+        printf '%bMin:%b %b%s%b KB    '     "$DIM" "$NC" "$CYAN"  "$f_min" "$NC"
+        printf '%bMax:%b %b%s%b KB    '     "$DIM" "$NC" "$YELLOW" "$f_max" "$NC"
+        printf '%bAvg:%b %b%s%b KB    '     "$DIM" "$NC" "$NC"   "$f_avg_raw" "$NC"
+        printf '%bFinal:%b %b%s%b KB'       "$DIM" "$NC" "$c_col" "$f_final" "$NC"
+        printf '%s|\033[K\n' "$(rpt ' ' $sprp)"
+
+    done
+
+    # ── Reference table ────────────────────────────────────────────────────
+    _render_cwnd_reference_table "$inner"
 }
 
 # ---------------------------------------------------------------------------
@@ -3450,7 +4105,7 @@ _rtt_display() {
 }
 
 # =============================================================================
-# SECTION 9c — BIDIRECTIONAL ENGINE  ★ NEW IN v8.2.4 ★
+# SECTION 9c — BIDIRECTIONAL ENGINE
 # =============================================================================
 #
 # For each stream marked S_BIDIR[$i]=1 a second iperf3 client process is
@@ -3796,7 +4451,7 @@ build_client_command() {
     fi
     (( FORCEFLUSH_SUPPORTED )) && cmd+=" --forceflush"
 
-    # ── ★ v8.2.4 ★ Bidirectional via --bidir flag ──────────────────────
+    # ────── Bidirectional via --bidir flag ──────────────────────
     # When bidir is enabled AND iperf3 supports --bidir, add the flag to
     # the forward stream command.  No separate reverse process is launched.
     # When BIDIR_SUPPORTED=0 the reverse process is handled by _bidir_launch.
@@ -3884,7 +4539,7 @@ launch_clients() {
     PING_PIDS=()
     PING_LOGFILES=()
 
-    # ★ NEW IN v8.2.4 ★ — initialise bidir tracking arrays
+    #— initialise bidir tracking arrays
     BIDIR_PIDS=()
     BIDIR_LOGFILES=()
 
@@ -3950,12 +4605,21 @@ launch_clients() {
             printf '%b\n' "${RED}  [ERROR] Cannot write script for stream ${sn}.${NC}"
             STREAM_PIDS+=(0); S_LOGFILE[$i]="$lf"
             S_STATUS_CACHE[$i]="FAILED"; S_ERROR_MSG[$i]="Script creation failed"
-            # ★ NEW IN v8.2.3 ★ — placeholder so array indices stay aligned
+            # — placeholder so array indices stay aligned
             PING_PIDS+=(0); PING_LOGFILES+=("")
             continue
         fi
         S_SCRIPT[$i]="$sf"; S_LOGFILE[$i]="$lf"
         S_START_TS[$i]=$(date +%s); S_STATUS_CACHE[$i]="STARTING"; S_ERROR_MSG[$i]=""
+
+        # Initialise CWND tracking arrays for this stream
+        S_CWND_CURRENT[$i]=""
+        S_CWND_MIN[$i]=""
+        S_CWND_MAX[$i]="0"
+        S_CWND_FINAL[$i]=""
+        S_CWND_SAMPLES[$i]="0"
+        S_CWND_HISTORY[$i]=""
+
         bash "$sf" > "$lf" 2>&1 &
         local pid=$!; STREAM_PIDS+=("$pid")
         printf '%b[STARTED]%b  stream %d  PID %-6d  %s -> %s:%s\n' \
@@ -3967,7 +4631,7 @@ launch_clients() {
             printf '%b[PING   ]%b  stream %d  PID %-6d  rtt → %s\n' \
                 "$CYAN" "$NC" "$sn" "${PING_PIDS[$i]}" "${S_TARGET[$i]}"
         fi
-        # ── ★ NEW IN v8.2.4 ★ — launch reverse (RX) process for bidir ───
+        # ──— launch reverse (RX) process for bidir ───
         _bidir_launch "$i"
     done
 }
@@ -6316,7 +6980,11 @@ _count_client_frame_lines() {
 _count_completed_panel_lines() {
     local done_count=0 i
     for (( i=0; i<STREAM_COUNT; i++ )); do
-        [[ "${S_STATUS_CACHE[$i]}" == "DONE" ]] && (( done_count++ ))
+        # Count both DONE and post-cleanup states so the panel
+        # remains visible while cleanup runs and after it completes.
+        case "${S_STATUS_CACHE[$i]}" in
+            DONE|CLEANED|CLEANUP_PENDING) (( done_count++ )) ;;
+        esac
     done
     (( done_count == 0 )) && { printf '%d' 0; return; }
     printf '%d' $(( 6 + done_count ))
@@ -6331,23 +6999,58 @@ _count_failed_panel_lines() {
     printf '%d' $(( 6 + fail_count ))
 }
 
+# ---------------------------------------------------------------------------
+# _count_cwnd_panel_lines
+#
+# Returns the exact number of lines _render_cwnd_panel will print.
+# Called by run_dashboard() to track _last_total for cursor positioning.
+#
+# Anatomy per TCP stream with cwnd data:
+#   1  stream identity line
+#   1  phase line
+#   1  separator
+#   5  chart rows
+#   1  x-axis baseline
+#   1  separator
+#   1  statistics row
+#   Total per stream: 11
+#
+# Fixed overhead:
+#   1  panel header (bcenter)
+#   2  panel borders (top + bottom via reference table)
+#   6  reference table rows + header + legend = 9 lines
+#   Total fixed: 12
+# ---------------------------------------------------------------------------
+_count_cwnd_panel_lines() {
+    local tcp_count=0 i
+    for (( i=0; i<STREAM_COUNT; i++ )); do
+        local st="${S_STATUS_CACHE[$i]:-}"
+        case "$st" in CONNECTED|DONE|CLEANED) ;;  *) continue ;; esac
+        [[ "${S_PROTO[$i]:-TCP}" != "TCP" ]] && continue
+        [[ "${S_CWND_SAMPLES[$i]:-0}" == "0" ]] && continue
+        (( tcp_count++ ))
+    done
+    (( tcp_count == 0 )) && { printf '%d' 0; return; }
+    # 3 header lines + 11 per stream + 10 reference table lines
+    printf '%d' $(( 3 + tcp_count * 11 + 10 ))
+}
+
 _render_completed_panel() {
     local done_count=0 i
     for (( i=0; i<STREAM_COUNT; i++ )); do
-        [[ "${S_STATUS_CACHE[$i]}" == "DONE" ]] && (( done_count++ ))
+        case "${S_STATUS_CACHE[$i]}" in
+            DONE|CLEANED|CLEANUP_PENDING) (( done_count++ )) ;;
+        esac
     done
     (( done_count == 0 )) && return
 
     # ── Dynamic target column width ───────────────────────────────────────
-    # Same calculation as _render_client_frame so columns are consistent.
-    # Panel layout:
-    #   " " + sn(3) + "  " + proto(5) + "  " + target(W) + "  " +
-    #   port(5) + "  " + sender(14) + "  " + receiver(14)
-    #   = 1+3+2+5+2+W+2+5+2+14+2+14 = 52+W  must fit in COLS-2 (78)
-    #   → W <= 26  (generous — use same cap as live dashboard for consistency)
     local _tgt_col_w=14
     for (( i=0; i<STREAM_COUNT; i++ )); do
-        [[ "${S_STATUS_CACHE[$i]}" != "DONE" ]] && continue
+        case "${S_STATUS_CACHE[$i]}" in
+            DONE|CLEANED|CLEANUP_PENDING) ;;
+            *) continue ;;
+        esac
         local _tlen=${#S_TARGET[$i]}
         (( _tlen > _tgt_col_w )) && _tgt_col_w=$_tlen
     done
@@ -6364,7 +7067,14 @@ _render_completed_panel() {
     printf '+%s+\033[K\n' "$(rpt '-' $(( COLS - 2 )))"
 
     for (( i=0; i<STREAM_COUNT; i++ )); do
-        [[ "${S_STATUS_CACHE[$i]}" != "DONE" ]] && continue
+        # Render rows for DONE, CLEANED, and CLEANUP_PENDING.
+        # By the time this panel renders, successful streams have typically
+        # already advanced from DONE to CLEANED via _cleanup_stream_procs().
+        # Excluding CLEANED causes the panel to show headers with no data rows.
+        case "${S_STATUS_CACHE[$i]}" in
+            DONE|CLEANED|CLEANUP_PENDING) ;;
+            *) continue ;;
+        esac
         local sn=$(( i + 1 ))
         local tgt="${S_TARGET[$i]:-?}"
         if (( ${#tgt} > _tgt_col_w )); then
@@ -6509,6 +7219,16 @@ _count_client_frame_lines_for_state() {
             (( total++ ))
         fi
 
+        # CWND row — TCP streams, non-loopback, when CONNECTED or has data
+        if [[ "${S_PROTO[$i]:-TCP}" == "TCP" && \
+              ! "$tgt" =~ ^127\. && "$tgt" != "::1" ]]; then
+            case "$st" in
+                CONNECTED|STARTING|CONNECTING|DONE)
+                    (( total++ ))
+                    ;;
+            esac
+        fi
+
         # Progress bar row — fixed-duration non-FAILED streams only
         if (( S_DURATION[$i] > 0 )) && [[ "$st" != "FAILED" ]]; then
             (( total++ ))
@@ -6587,6 +7307,7 @@ _render_progress_bar() {
 }
 
 _render_client_frame() {
+
     local now; now=$(date +%s)
     local i
 
@@ -6605,6 +7326,8 @@ _render_client_frame() {
             *)
                 _rtt_parse "$i"
                 _bidir_parse_bw "$i"
+                # Parse cwnd only for TCP streams
+                [[ "${S_PROTO[$i]:-TCP}" == "TCP" ]] && _cwnd_parse "$i"
                 ;;
         esac
     done
@@ -6692,15 +7415,85 @@ _render_client_frame() {
             continue
         fi
 
-       # ── TX bandwidth (forward direction) ──────────────────────────────
+       ## ── TX bandwidth (forward direction) ──────────────────────────────
         local bw_tx="---"
         if [[ "$st" == "CONNECTED" ]]; then
             if [[ "${S_BIDIR[$i]:-0}" == "1" && \
                   (( BIDIR_SUPPORTED == 1 )) ]]; then
-                # For --bidir streams _parse_bidir_bw_from_log handles all
-                # formats including compound [ N][TX-C] lines (priority 2)
-                # and plain stream-ID lines as a final fallback (priority 6).
-                bw_tx=$(_parse_bidir_bw_from_log "$lf" "tx")
+                # ── Direct extraction for --bidir TX lines ─────────────────
+                # Reads the most recent [TX-C] interval line directly from
+                # the log and extracts bandwidth without relying on any
+                # helper function chain. This is the most reliable approach
+                # because it eliminates all intermediate failure points.
+                #
+                # Line format (TCP):
+                #   [  5][TX-C]   0.00-1.00   sec   128 KBytes  1.05 Mbits/sec    5   2.63 KBytes
+                # Line format (UDP):
+                #   [  5][TX-C]   0.00-1.00   sec   128 KBytes  1.05 Mbits/sec  0.022 ms
+                #
+                if [[ -f "$lf" && -s "$lf" ]]; then
+                    bw_tx=$(grep -E '\]\[TX-C\]' "$lf" 2>/dev/null \
+                        | grep -E '[0-9.]+-[0-9.]+[[:space:]]+sec' \
+                        | grep -vE '[[:space:]](sender|receiver)[[:space:]]*$' \
+                        | tail -1 \
+                        | awk '
+                        {
+                            for (i = 1; i <= NF; i++) {
+                                if ($i == "bits/sec"  ||
+                                    $i == "Kbits/sec" || $i == "kbits/sec" ||
+                                    $i == "Mbits/sec" || $i == "mbits/sec" ||
+                                    $i == "Gbits/sec" || $i == "gbits/sec") {
+                                    if (i > 1 && $(i-1)+0 > 0) {
+                                        val = $(i-1) + 0
+                                        unit = $i
+                                        if (unit ~ /[Gg]/) bps = val * 1e9
+                                        else if (unit ~ /[Mm]/) bps = val * 1e6
+                                        else if (unit ~ /[Kk]/) bps = val * 1e3
+                                        else bps = val
+                                        if (bps >= 1e9) printf "%.2f Gbps", bps/1e9
+                                        else if (bps >= 1e6) printf "%.2f Mbps", bps/1e6
+                                        else if (bps >= 1e3) printf "%.2f Kbps", bps/1e3
+                                        else printf "%.0f bps", bps
+                                        exit
+                                    }
+                                }
+                            }
+                        }')
+                    [[ -z "$bw_tx" ]] && bw_tx="---"
+                fi
+
+                # Fallback: if no [TX-C] lines found, try plain interval lines.
+                # This handles older iperf3 builds that do not emit role tags.
+                if [[ "$bw_tx" == "---" && -f "$lf" && -s "$lf" ]]; then
+                    bw_tx=$(grep -E '^\[[[:space:]]*[0-9]+\][[:space:]]+[0-9.]+-[0-9.]+[[:space:]]+sec' \
+                        "$lf" 2>/dev/null \
+                        | grep -vE '[[:space:]](sender|receiver)[[:space:]]*$' \
+                        | tail -1 \
+                        | awk '
+                        {
+                            for (i = 1; i <= NF; i++) {
+                                if ($i == "bits/sec"  ||
+                                    $i == "Kbits/sec" || $i == "kbits/sec" ||
+                                    $i == "Mbits/sec" || $i == "mbits/sec" ||
+                                    $i == "Gbits/sec" || $i == "gbits/sec") {
+                                    if (i > 1 && $(i-1)+0 > 0) {
+                                        val = $(i-1) + 0
+                                        unit = $i
+                                        if (unit ~ /[Gg]/) bps = val * 1e9
+                                        else if (unit ~ /[Mm]/) bps = val * 1e6
+                                        else if (unit ~ /[Kk]/) bps = val * 1e3
+                                        else bps = val
+                                        if (bps >= 1e9) printf "%.2f Gbps", bps/1e9
+                                        else if (bps >= 1e6) printf "%.2f Mbps", bps/1e6
+                                        else if (bps >= 1e3) printf "%.2f Kbps", bps/1e3
+                                        else printf "%.0f bps", bps
+                                        exit
+                                    }
+                                }
+                            }
+                        }')
+                    [[ -z "$bw_tx" ]] && bw_tx="---"
+                fi
             else
                 bw_tx=$(parse_live_bandwidth_from_log "$lf")
             fi
@@ -6850,13 +7643,46 @@ _render_client_frame() {
         fi
 
         # ── RTT row ────────────────────────────────────────────────────────
+
         local stream_tgt="${S_TARGET[$i]:-}"
         if [[ ! "$stream_tgt" =~ ^127\. && "$stream_tgt" != "::1" ]]; then
             local rtt_str; rtt_str=$(_rtt_display "$i")
             bleft "$rtt_str"
         fi
 
+        # ── CWND row (TCP streams only, non-loopback) ──────────────────────
+        # Only shown when TCP and CWND data is available.
+        # UDP streams do not report cwnd so this row is suppressed for them.
+
+        # ── CWND inline (TCP only, single line, non-loopback) ─────────────
+        # Shows current cwnd and phase indicator — full detail is in the
+        # dedicated CWND panel rendered below the main dashboard.
+        if [[ "${S_PROTO[$i]:-TCP}" == "TCP" && \
+              ! "$stream_tgt" =~ ^127\. && "$stream_tgt" != "::1" && \
+              "${S_CWND_SAMPLES[$i]:-0}" != "0" ]]; then
+            local cwnd_inline_cur="${S_CWND_CURRENT[$i]:-0}"
+            local cwnd_inline_max="${S_CWND_MAX[$i]:-0}"
+            local cwnd_inline_spark; cwnd_inline_spark=$(_cwnd_sparkline "$i")
+            local phase_inline
+            phase_inline=$(_cwnd_detect_phase "$i")
+            local phase_name_inline
+            IFS='|' read -r _ phase_name_inline _ <<< "$phase_inline"
+
+            local ci_col="$GREEN"
+            local ci_int; ci_int=$(printf '%.0f' "$cwnd_inline_cur" 2>/dev/null || printf '0')
+            if   (( ci_int < 10  )); then ci_col="$RED"
+            elif (( ci_int < 50  )); then ci_col="$YELLOW"
+            elif (( ci_int < 200 )); then ci_col="$CYAN"
+            fi
+
+            local f_ci_cur; f_ci_cur=$(printf '%.0f' "$cwnd_inline_cur" 2>/dev/null || printf '%s' "$cwnd_inline_cur")
+            local f_ci_max; f_ci_max=$(printf '%.0f' "$cwnd_inline_max"  2>/dev/null || printf '%s' "$cwnd_inline_max")
+
+            bleft "  ${DIM}cwnd${NC}  ${ci_col}${BOLD}${f_ci_cur}${NC}${DIM}KB${NC}  ${DIM}max${NC} ${f_ci_max}${DIM}KB${NC}  ${cwnd_inline_spark}  ${DIM}[${phase_name_inline}]${NC}"
+        fi
+
         # ── Progress bar row ───────────────────────────────────────────────
+
         if (( show_bar && has_fixed_dur )); then
             local bar_str; bar_str=$(_render_progress_bar "$stream_elapsed" "$dur")
             local bar_indent=$(( C_SN + 1 + C_PROTO + 1 + C_TARGET + 1 + C_PORT + 1 ))
@@ -7087,40 +7913,36 @@ run_dashboard() {
         fi
 
         # ── Stream cleanup state machine ───────────────────────────────────
-        # Runs in client mode only. For each stream that has just finished
-        # (DONE or FAILED) and has not yet been cleaned up, transition to
-        # CLEANUP_PENDING and immediately execute _cleanup_stream().
+        # Two-phase approach to avoid blocking the render loop:
         #
-        # The S_CLEANUP_QUEUED guard ensures this fires exactly once per
-        # stream regardless of how many ticks the state lingers.
+        # Phase A (this tick): transition DONE/FAILED → CLEANUP_PENDING.
+        #   This makes the renderer show the spinner row immediately.
+        #   No blocking operations happen here.
+        #
+        # Phase B (next tick): transition CLEANUP_PENDING → CLEANED.
+        #   _cleanup_stream_procs() is called after the render so the
+        #   spinner is visible while cleanup runs. Any slow operations
+        #   (fuser, lsof, tc) happen after the frame is already painted.
         if [[ "$mode" != "server" ]]; then
             local _si
             for (( _si=0; _si<STREAM_COUNT; _si++ )); do
                 local _cur_st="${S_STATUS_CACHE[$_si]:-}"
 
-                # Only act on terminal states that have not been cleaned yet
+                # Phase A: queue for cleanup — instantaneous, no blocking
                 if [[ "$_cur_st" == "DONE" || "$_cur_st" == "FAILED" ]]; then
                     if [[ "${S_CLEANUP_QUEUED[$_si]:-0}" != "1" ]]; then
-
-                        # Mark as queued immediately to prevent re-entry
                         S_CLEANUP_QUEUED[$_si]="1"
-
-                        # Transition to CLEANUP_PENDING so the renderer
-                        # shows the spinner row on this tick
                         S_STATUS_CACHE[$_si]="CLEANUP_PENDING"
-
-                        # Execute cleanup synchronously.
-                        # _cleanup_stream() will:
-                        #   - SIGTERM/SIGKILL the iperf3 PID (if still alive)
-                        #   - SIGTERM/SIGKILL the RTT ping PID
-                        #   - SIGTERM/SIGKILL the bidir reverse PID
-                        #   - Remove log files for this stream
-                        #   - Clear sparkline ring buffer keys
-                        #   - Set S_STATUS_CACHE[$_si] = "CLEANED"
-                        #   - Write a timestamped message to G_LAST_NOTIFY
-                        _cleanup_stream_procs "$_si"
-                        # State is now CLEANED (set inside _cleanup_stream_procs)
                     fi
+                fi
+
+                # Phase B: execute cleanup after previous render showed spinner
+                if [[ "${S_STATUS_CACHE[$_si]:-}" == "CLEANUP_PENDING" && \
+                      "${S_CLEANUP_QUEUED[$_si]:-0}" == "1" ]]; then
+                    # Only run cleanup once — mark as executing
+                    S_CLEANUP_QUEUED[$_si]="2"
+                    _cleanup_stream_procs "$_si"
+                    # State is now CLEANED (set inside _cleanup_stream_procs)
                 fi
             done
         fi
@@ -7144,13 +7966,15 @@ run_dashboard() {
         # Erase stale content below current frame
         printf '\033[J'
 
-        # ── Dynamic panels (client only) ───────────────────────────────────
-        local completed_lines=0 failed_lines=0
+        # ── Dynamic panels (client only) ──────────────────────────────────
+        local completed_lines=0 failed_lines=0 cwnd_lines=0
         if [[ "$mode" != "server" ]]; then
             completed_lines=$(_count_completed_panel_lines)
             failed_lines=$(_count_failed_panel_lines)
+            cwnd_lines=$(_count_cwnd_panel_lines)
             (( completed_lines > 0 )) && _render_completed_panel
             (( failed_lines    > 0 )) && _render_failed_panel
+            (( cwnd_lines      > 0 )) && _render_cwnd_panel
         fi
 
         # ── DSCP hint (client, non-loopback, CONNECTED streams only) ──────
@@ -7176,17 +8000,11 @@ run_dashboard() {
         fi
 
         # ── Record total rendered lines for next tick cursor positioning ───
-        local dynamic_lines=$(( completed_lines + failed_lines ))
+        local dynamic_lines=$(( completed_lines + failed_lines + cwnd_lines ))
         _last_total=$(( fixed_lines + dynamic_lines + _hint_lines ))
-        _PREV_DYNAMIC_LINES=$dynamic_lines
+        _PREV_DYNAMIC_LINES=$(( completed_lines + failed_lines ))
 
         # ── Exit condition: client mode ────────────────────────────────────
-        # Exit when every stream is either CLEANED or FAILED (all finished
-        # and all resources have been released by _cleanup_stream).
-        # CLEANED is the terminal state set by _cleanup_stream after a
-        # DONE or FAILED stream has been fully torn down.
-        #
-        # Server mode: NEVER exits automatically. Runs until Ctrl+C.
         if [[ "$mode" != "server" ]]; then
             local _all_finished=1
             local j
@@ -7194,11 +8012,17 @@ run_dashboard() {
                 local _jst="${S_STATUS_CACHE[$j]:-STARTING}"
                 case "$_jst" in
                     CLEANED|FAILED)
-                        # Terminal states — this stream is finished
+                        # Terminal states — finished
+                        ;;
+                    CLEANUP_PENDING)
+                        # Transient — cleanup is in progress this tick.
+                        # If queued=2 cleanup already ran, treat as finished.
+                        # If queued=1 cleanup has not run yet, not finished.
+                        if [[ "${S_CLEANUP_QUEUED[$j]:-0}" != "2" ]]; then
+                            _all_finished=0
+                        fi
                         ;;
                     *)
-                        # Any other state means at least one stream is
-                        # still running or pending cleanup
                         _all_finished=0
                         break
                         ;;
@@ -7206,6 +8030,8 @@ run_dashboard() {
             done
 
             if (( _all_finished == 1 )); then
+                # Do a final render pass to show CLEANED tombstone rows
+                # before exiting, then stop the loop.
                 _dashboard_running=0
                 continue
             fi
@@ -7431,7 +8257,7 @@ display_results_table() {
                 fi
             fi
 
-            # ── ★ NEW IN v8.2.4 ★ — TX row ───────────────────────────────
+            # ──— TX row ───────────────────────────────
             local tx_pfx=""
             [[ "${S_BIDIR[$i]:-0}" == "1" ]] && tx_pfx="${GREEN}→ TX${NC}  "
 
@@ -7445,7 +8271,7 @@ display_results_table() {
                 "$C_EXTRA" "$extra" \
                 "$rtt_col" "$C_RTT"   "$rtt_sum"  "$NC"
 
-            # ── ★ NEW IN v8.2.4 ★ — RX row (bidirectional only) ──────────
+            # ──— RX row (bidirectional only) ──────────
             if [[ "${S_BIDIR[$i]:-0}" == "1" ]]; then
                 local rx_final; rx_final=$(_bidir_final_bw "$i")
                 printf '  %b%-*s%b  %-*s  %-*s  %*s  %b%-*s%b  %-*s  %-*s  %-*s\n' \
@@ -7462,6 +8288,57 @@ display_results_table() {
 
         # ── MTU annotation ────────────────────────────────────────────────
         _pmtu_annotate_stream_summary "$i"
+
+        # ── CWND summary sub-row (TCP streams only) ────────────────────────
+        if [[ "${S_PROTO[$i]:-TCP}" == "TCP" && \
+              ! "${S_TARGET[$i]:-}" =~ ^127\. && \
+              "${S_TARGET[$i]:-}" != "::1" ]]; then
+            local cwnd_min_r="${S_CWND_MIN[$i]:-}"
+            local cwnd_max_r="${S_CWND_MAX[$i]:-}"
+            local cwnd_final_r="${S_CWND_FINAL[$i]:-}"
+            local cwnd_samples_r="${S_CWND_SAMPLES[$i]:-0}"
+
+            if [[ -n "$cwnd_min_r" && "$cwnd_min_r" != "0" && \
+                  "$cwnd_samples_r" != "0" ]]; then
+
+                # Format cwnd values
+                local f_cwnd_min f_cwnd_max f_cwnd_final
+                f_cwnd_min=$(printf '%6.1f' "$cwnd_min_r" 2>/dev/null \
+                    || printf '%6s' "$cwnd_min_r")
+                f_cwnd_max=$(printf '%6.1f' "$cwnd_max_r" 2>/dev/null \
+                    || printf '%6s' "$cwnd_max_r")
+                f_cwnd_final=$(printf '%6.1f' "$cwnd_final_r" 2>/dev/null \
+                    || printf '%6s' "${cwnd_final_r:-N/A}")
+
+                # Colour final cwnd
+                local cwnd_final_col="$GREEN"
+                local cwnd_final_int
+                cwnd_final_int=$(printf '%.0f' "${cwnd_final_r:-0}" 2>/dev/null \
+                    || printf '0')
+                if   (( cwnd_final_int < 10  )); then cwnd_final_col="$RED"
+                elif (( cwnd_final_int < 50  )); then cwnd_final_col="$YELLOW"
+                elif (( cwnd_final_int < 200 )); then cwnd_final_col="$CYAN"
+                fi
+
+                # Render the sparkline for the results table
+                local cwnd_spark_r
+                cwnd_spark_r=$(_cwnd_sparkline "$i")
+
+                # Fixed-width detail line aligned under the main row
+                printf '  %*s  ' "$C_SN" ''
+                printf '%b' "$DIM"
+                printf '%-*s  ' "$C_PROTO" ''
+                printf '%-*s  ' "$C_TGT"   ''
+                printf '%*s  '  "$C_PORT"  ''
+                printf '%b' "$NC"
+                printf '%b' "${BOLD}${CYAN}cwnd${NC}  "
+                printf '%b' "${DIM}min${NC} ${CYAN}${f_cwnd_min}${NC}${DIM}KB${NC}  "
+                printf '%b' "${DIM}max${NC} ${YELLOW}${f_cwnd_max}${NC}${DIM}KB${NC}  "
+                printf '%b' "${DIM}final${NC} ${cwnd_final_col}${f_cwnd_final}${NC}${DIM}KB${NC}  "
+                printf '%b' "${DIM}trend${NC} ${cwnd_final_col}${cwnd_spark_r}${NC}"
+                printf '  %b(%s smpl)%b\n' "$DIM" "$cwnd_samples_r" "$NC"
+            fi
+        fi
 
         # ── RTT detail sub-row ────────────────────────────────────────────
         local stream_tgt="${S_TARGET[$i]:-}"
@@ -8378,7 +9255,7 @@ show_main_menu() {
 
     # ── Header ────────────────────────────────────────────────────────────
     printf '+%s+\n' "$(rpt '=' $inner)"
-    bcenter "${BOLD}iperf3 Traffic Streams${NC}  v8.2.5"
+    bcenter "${BOLD}iperf3 Traffic Streams${NC}  v8.2.6"
     printf '+%s+\n' "$(rpt '=' $inner)"
 
     # ── System info: plain text only so bleft padding is exact ────────────
@@ -8503,6 +9380,8 @@ main_menu() {
                 PING_PIDS=();  PING_LOGFILES=()
                 S_RTT_MIN=();  S_RTT_AVG=();  S_RTT_MAX=()
                 S_RTT_JITTER=(); S_RTT_LOSS=(); S_RTT_SAMPLES=()
+                S_CWND_CURRENT=(); S_CWND_MIN=(); S_CWND_MAX=()
+                S_CWND_FINAL=(); S_CWND_SAMPLES=(); S_CWND_HISTORY=()
                 if (( BASH_MAJOR >= 4 )); then
                     PMTU_RESULTS=(); PMTU_STATUS=(); PMTU_RECOMMEND=()
                 fi
@@ -8529,6 +9408,8 @@ main_menu() {
                 PING_PIDS=();   PING_LOGFILES=()
                 S_RTT_MIN=();   S_RTT_AVG=();  S_RTT_MAX=()
                 S_RTT_JITTER=(); S_RTT_LOSS=(); S_RTT_SAMPLES=()
+                S_CWND_CURRENT=(); S_CWND_MIN=(); S_CWND_MAX=()
+                S_CWND_FINAL=(); S_CWND_SAMPLES=(); S_CWND_HISTORY=()
                 ;;
             5)
                 echo ""; show_dscp_table
