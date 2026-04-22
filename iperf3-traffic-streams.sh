@@ -565,40 +565,6 @@ BIDIR_SUPPORTED=0
 _PREV_DYNAMIC_LINES=0
 _LAST_FRAME_LINE_COUNT=0   # set by _render_client_frame after each render
 
-# ── Self-counting render primitives ───────────────────────────────────────────
-# _rc is a global integer reset at the start of each _render_client_frame call.
-#
-# CRITICAL: Use arithmetic EXPANSION $(( )) not arithmetic COMMAND (( )) for
-# the increment. The arithmetic command returns exit code 1 when the expression
-# evaluates to 0 — which happens on the very first call when _rc=0. With
-# set -e active this silently aborts _render_client_frame after the 7th line
-# (the column header separator), making the frame appear to have no stream rows.
-# The arithmetic expansion always returns exit code 0 regardless of value.
-
-_rc=0
-
-_rbline() {
-    bline "${1:--}"
-    _rc=$(( _rc + 1 ))
-}
-
-_rbleft() {
-    bleft "$1" "${2:-1}"
-    _rc=$(( _rc + 1 ))
-}
-
-_rbcenter() {
-    bcenter "$1"
-    _rc=$(( _rc + 1 ))
-}
-
-_rprintln() {
-    # printf with a trailing newline — counts as one line
-    printf '%b\n' "$1"
-    _rc=$(( _rc + 1 ))
-}
-
-
 # =============================================================================
 # COLOUR THEME ENGINE
 # =============================================================================
@@ -7463,7 +7429,15 @@ _render_progress_bar() {
 
 
 _render_client_frame() {
-    _rc=0   # reset self-counter
+
+    # ── Disable errexit for the entire render function ────────────────────
+    # set -e triggers on (( expr )) when expr==0, and on other commands
+    # that return non-zero in normal operation. The render function is
+    # purely presentational and must never exit early due to a non-zero
+    # return code from any sub-expression.
+    local _old_errexit=0
+    [[ $- == *e* ]] && _old_errexit=1
+    set +e
 
     local now; now=$(date +%s)
     local i
@@ -7486,16 +7460,17 @@ _render_client_frame() {
     local nc=0 ni=0 ns=0 nd=0 nf=0 n_cleaned=0
     for (( i=0; i<STREAM_COUNT; i++ )); do
         case "${S_STATUS_CACHE[$i]}" in
-            CONNECTED)       (( nc++        )) ;;
-            CONNECTING)      (( ni++        )) ;;
-            STARTING)        (( ns++        )) ;;
-            DONE)            (( nd++        )) ;;
-            FAILED)          (( nf++        )) ;;
+            CONNECTED)               (( nc++       )) ;;
+            CONNECTING)              (( ni++       )) ;;
+            STARTING)                (( ns++       )) ;;
+            DONE)                    (( nd++       )) ;;
+            FAILED)                  (( nf++       )) ;;
             CLEANED|CLEANUP_PENDING) (( n_cleaned++ )) ;;
         esac
     done
     local act=$(( nc + ni + ns ))
-    local fts="${S_START_TS[0]:-0}"; (( fts == 0 )) && fts="$now"
+    local fts="${S_START_TS[0]:-0}"
+    (( fts == 0 )) && fts="$now"
     local efmt; efmt=$(format_seconds $(( now - fts )))
 
     # ── Column widths ──────────────────────────────────────────────────────
@@ -7506,22 +7481,22 @@ _render_client_frame() {
 
     local has_fixed_dur=0
     for (( i=0; i<STREAM_COUNT; i++ )); do
-        (( S_DURATION[$i] > 0 )) && has_fixed_dur=1 && break
+        (( S_DURATION[$i] > 0 )) && { has_fixed_dur=1; break; }
     done
 
     # ── Header ────────────────────────────────────────────────────────────
-    _rbline '='
-    _rbcenter "${BOLD}${CYAN}iperf3 Traffic Streams -- Live Dashboard${NC}"
-    _rbline '='
-    _rbleft "$(printf \
+    bline '='
+    bcenter "${BOLD}${CYAN}iperf3 Traffic Streams -- Live Dashboard${NC}"
+    bline '='
+    bleft "$(printf \
         '  Active:%-3d  Connected:%-3d  Done:%-3d  Failed:%-3d  Elapsed:%s' \
         "$act" "$nc" "$nd" "$nf" "$efmt")"
-    _rbline '='
+    bline '='
     # shellcheck disable=SC2059
-    _rbleft "${BOLD}$(printf "$ROW_FMT" \
+    bleft "${BOLD}$(printf "$ROW_FMT" \
         '#' 'Proto' 'Target' 'Port' 'Bandwidth' 'Last 10s' \
         'Time' 'DSCP' 'Status')${NC}"
-    _rbline '-'
+    bline '-'
 
     # ── Per-stream rows ────────────────────────────────────────────────────
     for (( i=0; i<STREAM_COUNT; i++ )); do
@@ -7539,23 +7514,23 @@ _render_client_frame() {
                     "%-${C_SN}s %-${C_PROTO}s %-${C_TARGET}s %${C_PORT}s %-${C_BW}s %-${C_SPARK}s %${C_TIME}s %${C_DSCP}s " \
                     "$sn" "${S_PROTO[$i]}" "$tgt_c" "${S_PORT[$i]}" \
                     "---" "··········" "--:--" "---")
-                _rbleft "${YELLOW}${plain_pending}$(printf '%-*s' "$C_STAT" "CLEANING…")${NC}"
+                bleft "${YELLOW}${plain_pending}$(printf '%-*s' "$C_STAT" "CLEANING…")${NC}"
             else
                 local plain_cleaned
                 plain_cleaned=$(printf \
                     "%-${C_SN}s %-${C_PROTO}s %-${C_TARGET}s %${C_PORT}s %-${C_BW}s %-${C_SPARK}s %${C_TIME}s %${C_DSCP}s " \
                     "$sn" "${S_PROTO[$i]}" "$tgt_c" "${S_PORT[$i]}" \
                     "---" "··········" "------" "---")
-                _rbleft "${DIM}${plain_cleaned}$(printf '%-*s' "$C_STAT" "── DONE ──")${NC}"
+                bleft "${DIM}${plain_cleaned}$(printf '%-*s' "$C_STAT" "── DONE ──")${NC}"
             fi
-            if (( i < STREAM_COUNT - 1 )); then _rbline '-'; fi
+            if (( i < STREAM_COUNT - 1 )); then bline '-'; fi
             continue
         fi
 
         # ── TX bandwidth ──────────────────────────────────────────────────
         local bw_tx="---"
         if [[ "$st" == "CONNECTED" ]]; then
-            if [[ "${S_BIDIR[$i]:-0}" == "1" && (( BIDIR_SUPPORTED == 1 )) ]]; then
+            if [[ "${S_BIDIR[$i]:-0}" == "1" ]] && (( BIDIR_SUPPORTED == 1 )); then
                 if [[ -f "$lf" && -s "$lf" ]]; then
                     bw_tx=$(grep -E '\]\[TX-C\]' "$lf" 2>/dev/null \
                         | grep -E '[0-9.]+-[0-9.]+[[:space:]]+sec' \
@@ -7632,7 +7607,8 @@ _render_client_frame() {
 
         # ── Time remaining ────────────────────────────────────────────────
         local td="--:--"
-        local sts="${S_START_TS[$i]:-0}"; (( sts == 0 )) && sts="$now"
+        local sts="${S_START_TS[$i]:-0}"
+        if (( sts == 0 )); then sts="$now"; fi
         local dur="${S_DURATION[$i]:-10}"
         local stream_elapsed=$(( now - sts ))
         local show_bar=0
@@ -7640,28 +7616,36 @@ _render_client_frame() {
         case "$st" in
             CONNECTED|STARTING|CONNECTING)
                 if (( dur == 0 )); then
-                    td="inf"; show_bar=0
+                    td="inf"
+                    show_bar=0
                 else
                     local rem=$(( dur - stream_elapsed ))
-                    (( rem < 0 )) && rem=0
+                    if (( rem < 0 )); then rem=0; fi
                     td=$(format_seconds "$rem")
                     show_bar=1
                 fi
                 ;;
             DONE)
                 td="  done"
-                (( dur > 0 )) && { show_bar=1; stream_elapsed=$dur; }
+                if (( dur > 0 )); then
+                    show_bar=1
+                    stream_elapsed=$dur
+                fi
                 ;;
             FAILED)
-                td="failed"; show_bar=0
+                td="failed"
+                show_bar=0
                 ;;
         esac
 
         # ── DSCP display ──────────────────────────────────────────────────
         local dscp_disp="---"
         [[ -n "${S_DSCP_NAME[$i]}" ]] && dscp_disp="${S_DSCP_NAME[$i]}"
-        [[ "$dscp_disp" == "---" && -n "${S_DSCP_VAL[$i]}" ]] && \
-            (( S_DSCP_VAL[$i] >= 0 )) && dscp_disp="${S_DSCP_VAL[$i]}"
+        if [[ "$dscp_disp" == "---" && -n "${S_DSCP_VAL[$i]}" ]]; then
+            if (( S_DSCP_VAL[$i] >= 0 )); then
+                dscp_disp="${S_DSCP_VAL[$i]}"
+            fi
+        fi
 
         # ── Status colour ─────────────────────────────────────────────────
         local sb sc
@@ -7677,9 +7661,9 @@ _render_client_frame() {
         # ── Field truncation ──────────────────────────────────────────────
         local tgt="${S_TARGET[$i]:-?}"
         local bw_tx_disp="$bw_tx"
-        (( ${#tgt}        > C_TARGET )) && tgt="${tgt:0:$(( C_TARGET-1 ))}~"
-        (( ${#bw_tx_disp} > C_BW     )) && bw_tx_disp="${bw_tx_disp:0:$(( C_BW-1 ))}~"
-        (( ${#dscp_disp}  > C_DSCP   )) && dscp_disp="${dscp_disp:0:$(( C_DSCP-1 ))}~"
+        if (( ${#tgt}        > C_TARGET )); then tgt="${tgt:0:$(( C_TARGET-1 ))}~"; fi
+        if (( ${#bw_tx_disp} > C_BW     )); then bw_tx_disp="${bw_tx_disp:0:$(( C_BW-1 ))}~"; fi
+        if (( ${#dscp_disp}  > C_DSCP   )); then dscp_disp="${dscp_disp:0:$(( C_DSCP-1 ))}~"; fi
 
         # ── TX row ────────────────────────────────────────────────────────
         local tx_label=""
@@ -7691,13 +7675,14 @@ _render_client_frame() {
             "%-${C_SN}s %-${C_PROTO}s %-${C_TARGET}s %${C_PORT}s %-${C_BW}s %-${C_SPARK}s %${C_TIME}s %${C_DSCP}s " \
             "$sn" "${S_PROTO[$i]}" "$tgt" "${S_PORT[$i]}" \
             "$bw_tx_disp" "$spark_tx" "$td" "$dscp_disp")
-        _rbleft "${tx_label}${plain_tx}${sc}$(printf '%-*s' "$C_STAT" "$sb")${NC}"
+        bleft "${tx_label}${plain_tx}${sc}$(printf '%-*s' "$C_STAT" "$sb")${NC}"
 
         # ── RX row (bidir only) ───────────────────────────────────────────
         if [[ "${S_BIDIR[$i]:-0}" == "1" ]]; then
             local bw_rx_disp="$bw_rx"
-            (( ${#bw_rx_disp} > C_BW )) && \
+            if (( ${#bw_rx_disp} > C_BW )); then
                 bw_rx_disp="${bw_rx_disp:0:$(( C_BW-1 ))}~"
+            fi
 
             local rx_st="STARTING"
             local rx_lf="${BIDIR_LOGFILES[$i]:-}"
@@ -7731,20 +7716,20 @@ _render_client_frame() {
             plain_rx=$(printf \
                 "%-${C_SN}s %-${C_PROTO}s %-${C_TARGET}s %${C_PORT}s %-${C_BW}s %-${C_SPARK}s %${C_TIME}s %${C_DSCP}s " \
                 "" "" "" "" "$bw_rx_disp" "$spark_rx" "" "")
-            _rbleft "${CYAN}↓ RX${NC} ${plain_rx}${rx_sc}$(printf '%-*s' "$C_STAT" "$rx_st")${NC}"
+            bleft "${CYAN}↓ RX${NC} ${plain_rx}${rx_sc}$(printf '%-*s' "$C_STAT" "$rx_st")${NC}"
         fi
 
         # ── RTT row ───────────────────────────────────────────────────────
         local stream_tgt="${S_TARGET[$i]:-}"
         if [[ ! "$stream_tgt" =~ ^127\. && "$stream_tgt" != "::1" ]]; then
             local rtt_str; rtt_str=$(_rtt_display "$i")
-            _rbleft "$rtt_str"
+            bleft "$rtt_str"
         fi
 
         # ── CWND inline row (TCP, non-loopback, has samples) ──────────────
-        if [[ "${S_PROTO[$i]:-TCP}" == "TCP" && \
-              ! "$stream_tgt" =~ ^127\. && "$stream_tgt" != "::1" && \
-              "${S_CWND_SAMPLES[$i]:-0}" != "0" ]]; then
+        if [[ "${S_PROTO[$i]:-TCP}" == "TCP" ]] && \
+           [[ ! "$stream_tgt" =~ ^127\. && "$stream_tgt" != "::1" ]] && \
+           [[ "${S_CWND_SAMPLES[$i]:-0}" != "0" ]]; then
             local cwnd_inline_cur="${S_CWND_CURRENT[$i]:-0}"
             local cwnd_inline_max="${S_CWND_MAX[$i]:-0}"
             local cwnd_inline_spark; cwnd_inline_spark=$(_cwnd_sparkline "$i")
@@ -7762,74 +7747,68 @@ _render_client_frame() {
             local f_ci_cur; f_ci_cur=$(printf '%.0f' "$cwnd_inline_cur" 2>/dev/null || printf '%s' "$cwnd_inline_cur")
             local f_ci_max; f_ci_max=$(printf '%.0f' "$cwnd_inline_max"  2>/dev/null || printf '%s' "$cwnd_inline_max")
 
-            _rbleft "  ${DIM}cwnd${NC}  ${ci_col}${BOLD}${f_ci_cur}${NC}${DIM}KB${NC}  ${DIM}max${NC} ${f_ci_max}${DIM}KB${NC}  ${cwnd_inline_spark}  ${DIM}[${phase_name_inline}]${NC}"
+            bleft "  ${DIM}cwnd${NC}  ${ci_col}${BOLD}${f_ci_cur}${NC}${DIM}KB${NC}  ${DIM}max${NC} ${f_ci_max}${DIM}KB${NC}  ${cwnd_inline_spark}  ${DIM}[${phase_name_inline}]${NC}"
         fi
 
         # ── Progress bar row ──────────────────────────────────────────────
-        if (( show_bar && has_fixed_dur )); then
+        if (( show_bar == 1 )) && (( has_fixed_dur == 1 )); then
             local bar_str; bar_str=$(_render_progress_bar "$stream_elapsed" "$dur")
             local bar_indent=$(( C_SN + 1 + C_PROTO + 1 + C_TARGET + 1 + C_PORT + 1 ))
-            _rbleft "$(printf '%*s' "$bar_indent" '')${bar_str}"
+            bleft "$(printf '%*s' "$bar_indent" '')${bar_str}"
         fi
 
         # ── Per-stream separator ──────────────────────────────────────────
         if (( i < STREAM_COUNT - 1 )); then
-            _rbline '-'
+            bline '-'
         fi
     done
 
     # ── Footer ────────────────────────────────────────────────────────────
-    _rbline '='
+    bline '='
     if _all_streams_loopback; then
-        _rbleft "  ${YELLOW}Ctrl+C${NC} to stop all streams"
+        bleft "  ${YELLOW}Ctrl+C${NC} to stop all streams"
     else
-        _rbleft "  ${YELLOW}Ctrl+C${NC} to stop all streams  ${DIM}|${NC}  ${CYAN}[v/p]${NC} DSCP verify"
+        bleft "  ${YELLOW}Ctrl+C${NC} to stop all streams  ${DIM}|${NC}  ${CYAN}[v/p]${NC} DSCP verify"
     fi
-    _rbline '='
+    bline '='
 
-    # ── Notification banner (always exactly 1 line) ──────────────────────
+    # ── Notification banner (always exactly 1 line) ───────────────────────
     local _notify_msg
     _notify_msg="$(_assoc_get G_LAST_NOTIFY 0 2>/dev/null)"
     if [[ -n "$_notify_msg" ]]; then
         local _max_len=$(( COLS - 4 ))
-        (( ${#_notify_msg} > _max_len )) && \
+        if (( ${#_notify_msg} > _max_len )); then
             _notify_msg="${_notify_msg:0:${_max_len}}…"
+        fi
         local _padded
         printf -v _padded "%-${COLS}s" "  ${_notify_msg}"
         printf '\033[1;97;42m%s\033[0m\033[K\n' "$_padded"
     else
         printf '\033[K\n'
     fi
-    _rc=$(( _rc + 1 ))
 
-    # ── Store self-measured line count ────────────────────────────────────
-    # Dual-track: take the larger of _rc (self-counted) and _expected
-    # (state-based calculation). If _rc is corrupted to a small value,
-    # _expected provides the correct count and prevents frame drift.
-    local _expected_lines
-    _expected_lines=$(_count_client_frame_lines_for_state)
+    # ── Restore errexit if it was active before entering this function ────
+    if (( _old_errexit == 1 )); then set -e; fi
 
-    # Add CWND inline rows that were actually rendered this tick.
-    # _count_client_frame_lines_for_state intentionally excludes CWND
-    # from pre-reservation, so we add them back here after rendering.
-    local _ci _cwnd_rendered=0
+    # ── Calculate line count based on what was rendered ───────────────────
+    # Uses _count_client_frame_lines_for_state (accurate state-based model)
+    # plus CWND inline rows that were rendered this tick.
+    # This replaces the _rc counter which was vulnerable to set -e exits.
+    local _base_lines
+    _base_lines=$(_count_client_frame_lines_for_state)
+
+    local _ci _cwnd_extra=0
     for (( _ci=0; _ci<STREAM_COUNT; _ci++ )); do
         local _cst="${S_STATUS_CACHE[$_ci]:-}"
         case "$_cst" in CLEANED|CLEANUP_PENDING|FAILED) continue ;; esac
-        [[ "${S_PROTO[$_ci]:-TCP}" != "TCP" ]] && continue
+        if [[ "${S_PROTO[$_ci]:-TCP}" != "TCP" ]]; then continue; fi
         local _ctgt="${S_TARGET[$_ci]:-}"
-        [[ "$_ctgt" =~ ^127\. || "$_ctgt" == "::1" ]] && continue
-        [[ "${S_CWND_SAMPLES[$_ci]:-0}" == "0" ]] && continue
-        _cwnd_rendered=$(( _cwnd_rendered + 1 ))
+        if [[ "$_ctgt" =~ ^127\. || "$_ctgt" == "::1" ]]; then continue; fi
+        if [[ "${S_CWND_SAMPLES[$_ci]:-0}" == "0" ]]; then continue; fi
+        _cwnd_extra=$(( _cwnd_extra + 1 ))
     done
-    _expected_lines=$(( _expected_lines + _cwnd_rendered ))
 
-    # Use whichever count is larger
-    if (( _rc >= _expected_lines )); then
-        _LAST_FRAME_LINE_COUNT=$_rc
-    else
-        _LAST_FRAME_LINE_COUNT=$_expected_lines
-    fi
+    _LAST_FRAME_LINE_COUNT=$(( _base_lines + _cwnd_extra ))
 }
 
 _render_server_frame() {
