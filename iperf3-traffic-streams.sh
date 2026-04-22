@@ -3641,13 +3641,14 @@ _render_cwnd_panel() {
     printf '+%s+\033[K\n' "$(rpt '=' $inner)"
 
     # ── Per-stream CWND block ──────────────────────────────────────────────
-    # Each stream contributes exactly 5 lines:
+    # Each stream contributes exactly 4 lines:
     #   1  stream identity line
     #   1  phase line
     #   1  separator (+---+)
     #   1  statistics row
-    #   1  separator (+---+)
-    # Total per stream: 5
+    # No trailing separator — _render_cwnd_reference_table starts with
+    # +---+ which acts as the visual separator after the last stream.
+    # Total per stream: 4
     for (( i=0; i<STREAM_COUNT; i++ )); do
         local st="${S_STATUS_CACHE[$i]:-}"
         case "$st" in CONNECTED|DONE|CLEANED) ;; *) continue ;; esac
@@ -3661,7 +3662,6 @@ _render_cwnd_panel() {
         local cwnd_min="${S_CWND_MIN[$i]:-0}"
         local cwnd_max="${S_CWND_MAX[$i]:-0}"
         local cwnd_final="${S_CWND_FINAL[$i]:-0}"
-        local cwnd_samples="${S_CWND_SAMPLES[$i]:-0}"
         local cwnd_hist="${S_CWND_HISTORY[$i]:-}"
 
         # ── Line 1: stream identity ────────────────────────────────────────
@@ -3669,7 +3669,8 @@ _render_cwnd_panel() {
         local slen=${#stream_line}
         local srp=$(( inner - 2 - slen - 1 ))
         (( srp < 0 )) && srp=0
-        printf '|  %b%s%b%s|\033[K\n' "${BOLD}" "$stream_line" "${NC}" "$(rpt ' ' $srp)"
+        printf '|  %b%s%b%s|\033[K\n' \
+            "${BOLD}" "$stream_line" "${NC}" "$(rpt ' ' $srp)"
 
         # ── Line 2: phase line ─────────────────────────────────────────────
         local phase_raw
@@ -3702,26 +3703,28 @@ _render_cwnd_panel() {
 
         # ── Line 4: statistics row ─────────────────────────────────────────
         local f_cur f_min f_max f_final f_avg_raw
-        f_cur=$(printf '%.1f' "$cwnd_cur"         2>/dev/null || printf '%s' "$cwnd_cur")
-        f_min=$(printf '%.1f' "$cwnd_min"         2>/dev/null || printf '%s' "$cwnd_min")
-        f_max=$(printf '%.1f' "$cwnd_max"         2>/dev/null || printf '%s' "$cwnd_max")
-        f_final=$(printf '%.1f' "${cwnd_final:-0}" 2>/dev/null || printf '%s' "${cwnd_final:-N/A}")
+        f_cur=$(printf '%.1f' "$cwnd_cur"         2>/dev/null \
+            || printf '%s' "$cwnd_cur")
+        f_min=$(printf '%.1f' "$cwnd_min"         2>/dev/null \
+            || printf '%s' "$cwnd_min")
+        f_max=$(printf '%.1f' "$cwnd_max"         2>/dev/null \
+            || printf '%s' "$cwnd_max")
+        f_final=$(printf '%.1f' "${cwnd_final:-0}" 2>/dev/null \
+            || printf '%s' "${cwnd_final:-N/A}")
 
         f_avg_raw=$(printf '%s\n' "${cwnd_hist:-0}" | awk -F: '
             { s=0; for(i=1;i<=NF;i++) s+=$i+0; printf "%.1f", s/NF }')
 
-        local cwnd_spark
-        cwnd_spark=$(_cwnd_sparkline "$i")
-
         local c_col="$GREEN"
-        local c_int; c_int=$(printf '%.0f' "$cwnd_cur" 2>/dev/null || printf '0')
+        local c_int
+        c_int=$(printf '%.0f' "$cwnd_cur" 2>/dev/null || printf '0')
         if   (( c_int < 10  )); then c_col="$RED"
         elif (( c_int < 50  )); then c_col="$YELLOW"
         elif (( c_int < 200 )); then c_col="$CYAN"
         fi
 
-        # Build stats line — plain text for padding calculation
-        local stat_plain="  Current: ${f_cur} KB    Min: ${f_min} KB    Max: ${f_max} KB    Avg: ${f_avg_raw} KB    Final: ${f_final} KB"
+        local stat_plain
+        stat_plain="  Current: ${f_cur} KB    Min: ${f_min} KB    Max: ${f_max} KB    Avg: ${f_avg_raw} KB    Final: ${f_final} KB"
         local sprp=$(( inner - ${#stat_plain} - 1 ))
         (( sprp < 0 )) && sprp=0
 
@@ -3733,21 +3736,21 @@ _render_cwnd_panel() {
         printf '%bFinal:%b %b%s%b KB'       "$DIM" "$NC" "$c_col"    "$f_final"   "$NC"
         printf '%s|\033[K\n' "$(rpt ' ' $sprp)"
 
-        # ── Line 5: separator ─────────────────────────────────────────────
-        printf '+%s+\033[K\n' "$(rpt '-' $inner)"
+        # No trailing +---+ separator here.
+        # _render_cwnd_reference_table opens with +---+ which serves
+        # as the separator between the last stream's stats and the table.
 
     done
 
     # ── Reference table ────────────────────────────────────────────────────
-    # _render_cwnd_reference_table prints exactly 12 lines:
-    #   1  +---+ separator
+    # Prints exactly 12 lines:
+    #   1  +---+ separator  (also acts as post-stats separator)
     #   1  header row
     #   1  +---+ separator
-    #   6  data rows (one per CC phase)
+    #   6  data rows
     #   1  +---+ separator
     #   1  legend line
     #   1  +===+ bottom border
-    # Total: 12
     _render_cwnd_reference_table "$inner"
 }
 
@@ -7909,29 +7912,52 @@ run_dashboard() {
             _render_client_frame
 
             # ── Calculate line count AFTER rendering ───────────────────────
-            # _count_client_frame_lines_for_state returns the base count
-            # (all rows except CWND inline which is excluded from
-            # pre-reservation). We add CWND inline rows that were actually
-            # rendered this tick by checking which streams have cwnd data.
+            # Compute directly without a subshell to avoid any set -e
+            # interference from subshell process state.
             #
-            # This calculation runs in the main shell context (not inside
-            # _render_client_frame) so it is never affected by the
-            # set +e / set -e toggle inside the render function.
-            local _base_fc
-            _base_fc=$(_count_client_frame_lines_for_state)
-
-            local _cwnd_fc=0 _fci
+            # This mirrors _count_client_frame_lines_for_state exactly,
+            # then adds CWND inline rows that were actually rendered.
+            local _fc_total=11  # fixed structural lines + notification banner
+            local _fci
             for (( _fci=0; _fci<STREAM_COUNT; _fci++ )); do
-                local _fcst="${S_STATUS_CACHE[$_fci]:-}"
-                case "$_fcst" in CLEANED|CLEANUP_PENDING|FAILED) continue ;; esac
-                [[ "${S_PROTO[$_fci]:-TCP}" != "TCP" ]] && continue
+                local _fcst="${S_STATUS_CACHE[$_fci]:-STARTING}"
+
+                if [[ "$_fcst" == "CLEANED" || "$_fcst" == "CLEANUP_PENDING" ]]; then
+                    _fc_total=$(( _fc_total + 1 ))
+                    if (( _fci < STREAM_COUNT - 1 )); then
+                        _fc_total=$(( _fc_total + 1 ))
+                    fi
+                    continue
+                fi
+
+                _fc_total=$(( _fc_total + 1 ))  # TX row
+
+                if [[ "${S_BIDIR[$_fci]:-0}" == "1" ]]; then
+                    _fc_total=$(( _fc_total + 1 ))  # RX row
+                fi
+
                 local _fctgt="${S_TARGET[$_fci]:-}"
-                [[ "$_fctgt" =~ ^127\. || "$_fctgt" == "::1" ]] && continue
-                [[ "${S_CWND_SAMPLES[$_fci]:-0}" == "0" ]] && continue
-                _cwnd_fc=$(( _cwnd_fc + 1 ))
+                if [[ ! "$_fctgt" =~ ^127\. && "$_fctgt" != "::1" ]]; then
+                    _fc_total=$(( _fc_total + 1 ))  # RTT row
+                fi
+
+                # CWND inline row — only when samples exist
+                if [[ "${S_PROTO[$_fci]:-TCP}" == "TCP" ]] && \
+                   [[ ! "$_fctgt" =~ ^127\. && "$_fctgt" != "::1" ]] && \
+                   [[ "${S_CWND_SAMPLES[$_fci]:-0}" != "0" ]]; then
+                    _fc_total=$(( _fc_total + 1 ))  # CWND inline row
+                fi
+
+                if (( S_DURATION[$_fci] > 0 )) && [[ "$_fcst" != "FAILED" ]]; then
+                    _fc_total=$(( _fc_total + 1 ))  # progress bar row
+                fi
+
+                if (( _fci < STREAM_COUNT - 1 )); then
+                    _fc_total=$(( _fc_total + 1 ))  # per-stream separator
+                fi
             done
 
-            fixed_lines=$(( _base_fc + _cwnd_fc ))
+            fixed_lines=$_fc_total
             _LAST_FRAME_LINE_COUNT=$fixed_lines
         fi
 
