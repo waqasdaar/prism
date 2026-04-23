@@ -7928,16 +7928,19 @@ run_dashboard() {
         else
             _render_client_frame
 
-            # ── Calculate line count inline — no subshell, no set -e risk ──
-            # Replicate _count_client_frame_lines_for_state logic directly
-            # plus CWND inline rows, using $(( )) expansion throughout
-            # so exit codes are always 0 regardless of expression value.
+            # ── Calculate line count inline ────────────────────────────────
+            # IMPORTANT: All variables used inside the loop are declared
+            # BEFORE the loop. Re-declaring with 'local' inside a bash loop
+            # body resets the variable to empty on the second iteration in
+            # some bash versions, causing the RTT/CWND/separator rows for
+            # streams after stream 0 to be miscounted.
             local _fc=11
-            local _fci
+            local _fci _fcst _fctgt
             for (( _fci=0; _fci<STREAM_COUNT; _fci++ )); do
-                local _fcst="${S_STATUS_CACHE[$_fci]:-STARTING}"
+                _fcst="${S_STATUS_CACHE[$_fci]:-STARTING}"
 
-                if [[ "$_fcst" == "CLEANED" || "$_fcst" == "CLEANUP_PENDING" ]]; then
+                if [[ "$_fcst" == "CLEANED" || \
+                      "$_fcst" == "CLEANUP_PENDING" ]]; then
                     _fc=$(( _fc + 1 ))
                     if (( _fci < STREAM_COUNT - 1 )); then
                         _fc=$(( _fc + 1 ))
@@ -7951,13 +7954,15 @@ run_dashboard() {
                     _fc=$(( _fc + 1 ))   # RX row
                 fi
 
-                local _fctgt="${S_TARGET[$_fci]:-}"
-                if [[ ! "$_fctgt" =~ ^127\. && "$_fctgt" != "::1" ]]; then
+                _fctgt="${S_TARGET[$_fci]:-}"
+                if [[ ! "$_fctgt" =~ ^127\. && \
+                      "$_fctgt" != "::1" ]]; then
                     _fc=$(( _fc + 1 ))   # RTT row
                 fi
 
                 if [[ "${S_PROTO[$_fci]:-TCP}" == "TCP" ]] && \
-                   [[ ! "$_fctgt" =~ ^127\. && "$_fctgt" != "::1" ]] && \
+                   [[ ! "$_fctgt" =~ ^127\. && \
+                      "$_fctgt" != "::1" ]] && \
                    [[ "${S_CWND_SAMPLES[$_fci]:-0}" != "0" ]]; then
                     _fc=$(( _fc + 1 ))   # CWND inline row
                 fi
@@ -7975,7 +7980,6 @@ run_dashboard() {
             fixed_lines=$_fc
             _LAST_FRAME_LINE_COUNT=$_fc
         fi
-
         # ── Erase stale content below the current frame ───────────────────
         printf '\033[J'
 
