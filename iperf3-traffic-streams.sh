@@ -8793,6 +8793,9 @@ _mtp_define_custom_mix() {
 # For each class in MTP_CLASSES, prompts for target IP and port.
 # Stores results in MTP_TARGETS and MTP_PORTS parallel arrays.
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# _mtp_configure_targets  (updated)
+# ---------------------------------------------------------------------------
 _mtp_configure_targets() {
     local inner=$(( COLS - 2 ))
     MTP_TARGETS=()
@@ -8806,10 +8809,11 @@ _mtp_configure_targets() {
     printf '+%s+\n' "$(rpt '=' $inner)"
     echo ""
 
-    # Global duration
+    # ── Global duration ────────────────────────────────────────────────────
     local duration
     while true; do
-        read -r -p "  Test duration in seconds (0=unlimited) [60]: " duration </dev/tty
+        read -r -p "  Test duration in seconds (0=unlimited) [60]: " \
+            duration </dev/tty
         duration="${duration:-60}"
         validate_duration "$duration" && break
         printf '%b  Enter a non-negative integer.%b\n' "$RED" "$NC"
@@ -8817,17 +8821,169 @@ _mtp_configure_targets() {
     local dur_val=0
     [[ "$duration" != "0" ]] && dur_val=$(( 10#$duration ))
 
-    # Global bind IP (optional)
+    # ── Global bind IP — full interface-selection wizard ───────────────────
     echo ""
-    printf '%b  -- Source Bind IP (optional, Enter to skip) --%b\n' "$CYAN" "$NC"
+    printf '+%s+\n' "$(rpt '-' $inner)"
+    bcenter "${BOLD}Source Bind Interface / IP${NC}"
+    printf '+%s+\n' "$(rpt '-' $inner)"
+    bleft "  Select a source interface for all streams, enter an IP directly,"
+    bleft "  type ${BOLD}list${NC} to refresh the table, or ${BOLD}0${NC} / Enter for auto (no bind)."
+    printf '+%s+\n' "$(rpt '-' $inner)"
+    echo ""
+
+    # Refresh interface list and display the table
+    get_interface_list
+    show_interface_table
+    echo ""
+
     local global_bind=""
-    read -r -p "  Bind source IP or Enter for auto: " global_bind </dev/tty
-    if [[ -n "$global_bind" ]] && ! validate_ip "$global_bind"; then
-        printf '%b  Invalid IP — using auto.%b\n' "$YELLOW" "$NC"
-        global_bind=""
-    fi
+    local global_vrf=""
+    local bind_from_grt=0
+
+    while true; do
+        local _bind_raw
+        read -r -p \
+            "  Bind source (0=auto, #=interface, IP, 'list', Enter=auto): " \
+            _bind_raw </dev/tty
+        _bind_raw="${_bind_raw:-}"
+
+        # ── Enter / 0 → auto ──────────────────────────────────────────────
+        if [[ -z "$_bind_raw" || "$_bind_raw" == "0" ]]; then
+            global_bind=""
+            global_vrf=""
+            bind_from_grt=0
+            printf '%b  Auto source address — no bind IP applied.%b\n' \
+                "$CYAN" "$NC"
+            break
+        fi
+
+        # ── 'list' → refresh table ─────────────────────────────────────────
+        local _bind_lower
+        _bind_lower=$(printf '%s' "$_bind_raw" | tr '[:upper:]' '[:lower:]')
+        if [[ "$_bind_lower" == "list" ]]; then
+            echo ""
+            get_interface_list
+            show_interface_table
+            echo ""
+            continue
+        fi
+
+        # ── Numeric → select interface by table row ────────────────────────
+        if [[ "$_bind_raw" =~ ^[0-9]+$ ]]; then
+            local _sel_num=$(( 10#$_bind_raw ))
+            local _total_ifaces=${#IFACE_NAMES[@]}
+
+            if (( _sel_num < 1 || _sel_num > _total_ifaces )); then
+                printf '%b  Invalid number. Enter 0 or 1-%d.%b\n' \
+                    "$RED" "$_total_ifaces" "$NC"
+                continue
+            fi
+
+            local _sel_idx=$(( _sel_num - 1 ))
+            local _sel_ip="${IFACE_IPS[$_sel_idx]}"
+            local _sel_iface="${IFACE_NAMES[$_sel_idx]}"
+            local _sel_state="${IFACE_STATES[$_sel_idx]}"
+            local _sel_vrf="${IFACE_VRFS[$_sel_idx]}"
+
+            if [[ "$_sel_ip" == "N/A" || -z "$_sel_ip" ]]; then
+                printf '%b  %s has no IPv4 address. Choose another.%b\n' \
+                    "$RED" "$_sel_iface" "$NC"
+                continue
+            fi
+
+            if [[ "$_sel_state" != "up" ]]; then
+                printf '%b  WARNING: %s state="%s". Proceeding.%b\n' \
+                    "$YELLOW" "$_sel_iface" "$_sel_state" "$NC"
+            fi
+
+            printf '%b  Bound to: %s → %s%b\n' \
+                "$GREEN" "$_sel_iface" "$_sel_ip" "$NC"
+            global_bind="$_sel_ip"
+
+            if [[ "$OS_TYPE" == "linux" ]]; then
+                if [[ "$_sel_vrf" == "GRT" || -z "$_sel_vrf" ]]; then
+                    global_vrf=""
+                    bind_from_grt=1
+                    printf '%b  Interface is in GRT — no VRF exec applied.%b\n' \
+                        "$CYAN" "$NC"
+                else
+                    global_vrf="$_sel_vrf"
+                    bind_from_grt=0
+                    printf '%b  Auto-detected VRF: %s%b\n' \
+                        "$GREEN" "$global_vrf" "$NC"
+
+                    # Allow operator to override the auto-detected VRF
+                    local vrf_override
+                    read -r -p \
+                        "  VRF [${global_vrf}] (Enter to confirm, or type new): " \
+                        vrf_override </dev/tty
+                    vrf_override="${vrf_override:-$global_vrf}"
+                    if [[ -z "$vrf_override" ]]; then
+                        printf '%b  VRF cleared — using GRT.%b\n' \
+                            "$YELLOW" "$NC"
+                        global_vrf=""
+                        bind_from_grt=1
+                    else
+                        global_vrf="$vrf_override"
+                        printf '%b  Streams will use VRF: %s%b\n' \
+                            "$CYAN" "$global_vrf" "$NC"
+                    fi
+                fi
+            fi
+            break
+        fi
+
+        # ── Direct IP entry ────────────────────────────────────────────────
+        if validate_ip "$_bind_raw"; then
+            global_bind="$_bind_raw"
+            printf '%b  Bind IP set to: %s%b\n' "$GREEN" "$global_bind" "$NC"
+
+            # For Linux: prompt for VRF when a raw IP is entered directly
+            if [[ "$OS_TYPE" == "linux" ]]; then
+                # Try to auto-detect VRF from the entered IP
+                local _auto_vrf=""
+                local _ki
+                for (( _ki=0; _ki<${#IFACE_IPS[@]}; _ki++ )); do
+                    if [[ "${IFACE_IPS[$_ki]}" == "$global_bind" ]]; then
+                        _auto_vrf="${IFACE_VRFS[$_ki]:-GRT}"
+                        break
+                    fi
+                done
+
+                if [[ "$_auto_vrf" == "GRT" || -z "$_auto_vrf" ]]; then
+                    global_vrf=""
+                    bind_from_grt=1
+                    printf '%b  IP belongs to GRT — no VRF exec applied.%b\n' \
+                        "$CYAN" "$NC"
+                elif [[ -n "$_auto_vrf" ]]; then
+                    global_vrf="$_auto_vrf"
+                    bind_from_grt=0
+                    printf '%b  Auto-detected VRF: %s%b\n' \
+                        "$GREEN" "$global_vrf" "$NC"
+                    local vrf_raw
+                    read -r -p \
+                        "  VRF [${global_vrf}] (Enter to confirm): " \
+                        vrf_raw </dev/tty
+                    vrf_raw="${vrf_raw:-$global_vrf}"
+                    [[ -z "$vrf_raw" ]] && global_vrf="" || global_vrf="$vrf_raw"
+                else
+                    read -r -p \
+                        "  VRF (Enter for GRT/none): " \
+                        global_vrf </dev/tty
+                    global_vrf="${global_vrf:-}"
+                fi
+            fi
+            break
+        fi
+
+        printf '%b  Unrecognised input "%s".%b\n' "$RED" "$_bind_raw" "$NC"
+        printf '%b  Enter: number | IP address | list | 0 or Enter for auto%b\n' \
+            "$RED" "$NC"
+    done
 
     echo ""
+
+    # ── Per-class target IP and port ───────────────────────────────────────
     local last_target="" last_port=5200
 
     local ci
@@ -8866,11 +9022,32 @@ _mtp_configure_targets() {
         done
         last_port=$port
 
+        # Validate bind IP against VRF for this specific target
+        # If bind_from_grt=1 and target routes via a VRF, warn the operator.
+        if [[ "$OS_TYPE" == "linux" && -n "$global_bind" && \
+              (( bind_from_grt == 0 )) && -n "$global_vrf" ]]; then
+            # Check that the bind IP belongs to the configured VRF
+            local _vrf_match=0 _vki
+            for (( _vki=0; _vki<${#IFACE_IPS[@]}; _vki++ )); do
+                if [[ "${IFACE_IPS[$_vki]}" == "$global_bind" && \
+                      "${IFACE_VRFS[$_vki]}" == "$global_vrf" ]]; then
+                    _vrf_match=1
+                    break
+                fi
+            done
+            if (( _vrf_match == 0 )); then
+                printf '%b  WARNING: bind IP %s not found in VRF %s.%b\n' \
+                    "$YELLOW" "$global_bind" "$global_vrf" "$NC"
+                printf '%b           Stream may fail — verify VRF membership.%b\n' \
+                    "$YELLOW" "$NC"
+            fi
+        fi
+
         MTP_TARGETS+=("$tgt")
         MTP_PORTS+=("$port")
         MTP_DURATIONS+=("$dur_val")
         MTP_BINDS+=("$global_bind")
-        MTP_VRFS+=("")
+        MTP_VRFS+=("$global_vrf")
         echo ""
     done
 }
@@ -8885,6 +9062,20 @@ _mtp_configure_targets() {
 # Uses a largest-remainder method to distribute streams so they sum exactly
 # to the requested total without rounding errors.
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# _mtp_calculate_streams  <total_streams>
+#
+# Given MTP_CLASSES and a total stream count, calculates per-class stream
+# counts using the largest-remainder method so they sum exactly to the
+# requested total without rounding errors.
+#
+# Populates all S_* stream configuration arrays that the launch machinery
+# (launch_clients, run_dashboard, parse_final_results) expects.
+#
+# VRF/bind consistency is validated per-class using the same logic as
+# build_client_command so traffic is routed correctly whether the interface
+# belongs to GRT or a named VRF.
+# ---------------------------------------------------------------------------
 _mtp_calculate_streams() {
     local total_streams="$1"
     local inner=$(( COLS - 2 ))
@@ -8892,6 +9083,8 @@ _mtp_calculate_streams() {
     local n_classes=${#MTP_CLASSES[@]}
 
     # ── Step 1: Calculate raw (fractional) stream counts ──────────────────
+    # Scale by 1000 to preserve three decimal places of precision while
+    # staying in integer arithmetic throughout.
     local -a raw_counts=()
     local -a floor_counts=()
     local -a remainders=()
@@ -8902,30 +9095,37 @@ _mtp_calculate_streams() {
         local cpct
         IFS=':' read -r _ cpct _ _ _ <<< "$class"
 
-        # raw = total_streams * pct / 100  (scaled by 1000 for integer math)
         local raw=$(( total_streams * cpct * 1000 / 100 ))
         local floor=$(( raw / 1000 ))
         local remainder=$(( raw % 1000 ))
 
-        (( floor < 1 )) && floor=1   # every class gets at least 1 stream
+        # Every class must contribute at least 1 stream
+        if (( floor < 1 )); then
+            floor=1
+        fi
+
         raw_counts+=("$raw")
         floor_counts+=("$floor")
         remainders+=("$remainder")
     done
 
-    # ── Step 2: Largest-remainder method to hit exactly total_streams ──────
+    # ── Step 2: Largest-remainder method ──────────────────────────────────
+    # Compute how many extra streams remain after flooring, then assign
+    # them one-by-one to the classes with the largest fractional remainders.
     local floor_sum=0
+    local f
     for f in "${floor_counts[@]}"; do
         floor_sum=$(( floor_sum + f ))
     done
     local deficit=$(( total_streams - floor_sum ))
 
-    # Sort class indices by remainder descending to assign extra streams
+    # Build a sorted index array (descending by remainder).
+    # Bubble sort is sufficient — n_classes is always ≤ 5.
     local -a sorted_indices=()
     for (( ci=0; ci<n_classes; ci++ )); do
         sorted_indices+=("$ci")
     done
-    # Bubble sort by remainder descending (n_classes is always ≤ 5)
+
     local swapped=1
     while (( swapped )); do
         swapped=0
@@ -8933,7 +9133,7 @@ _mtp_calculate_streams() {
         for (( si=0; si<${#sorted_indices[@]}-1; si++ )); do
             local a="${sorted_indices[$si]}"
             local b="${sorted_indices[$(( si+1 ))]}"
-            if (( remainders[$a] < remainders[$b] )); then
+            if (( remainders[a] < remainders[b] )); then
                 sorted_indices[$si]=$b
                 sorted_indices[$(( si+1 ))]=$a
                 swapped=1
@@ -8950,15 +9150,19 @@ _mtp_calculate_streams() {
         final_counts[$idx]=$(( final_counts[$idx] + 1 ))
     done
 
-    # ── Step 3: Display the calculated allocation ──────────────────────────
+    # ── Step 3: Display the calculated allocation table ───────────────────
     printf '+%s+\n' "$(rpt '=' $inner)"
     bcenter "${BOLD}${CYAN}Traffic Mix — Stream Allocation${NC}"
     printf '+%s+\n' "$(rpt '=' $inner)"
 
     local C_CL=3 C_LB=28 C_PR=5 C_PC=5 C_SC=7 C_BW=12
     bleft "${BOLD}$(printf '%-*s  %-*s  %-*s  %-*s  %-*s  %-*s' \
-        $C_CL '#' $C_LB 'Class' $C_PR 'Proto' $C_PC 'Pct' \
-        $C_SC 'Streams' $C_BW 'BW/Stream')${NC}"
+        $C_CL '#' \
+        $C_LB 'Class' \
+        $C_PR 'Proto' \
+        $C_PC 'Pct' \
+        $C_SC 'Streams' \
+        $C_BW 'BW/Stream')${NC}"
     printf '+%s+\n' "$(rpt '-' $inner)"
 
     local total_check=0
@@ -8966,10 +9170,12 @@ _mtp_calculate_streams() {
         local class="${MTP_CLASSES[$ci]}"
         local cproto cpct cdscp cbw clabel
         IFS=':' read -r cproto cpct cdscp cbw clabel <<< "$class"
+
         local sc="${final_counts[$ci]}"
         total_check=$(( total_check + sc ))
+
         local bw_disp="${cbw:-unlimited}"
-        [[ "$bw_disp" == "0" ]] && bw_disp="unlimited"
+        [[ "$bw_disp" == "0" || -z "$bw_disp" ]] && bw_disp="unlimited"
 
         local row
         printf -v row '%-*s  %-*s  %-*s  %-*s  %-*s  %-*s' \
@@ -8990,8 +9196,7 @@ _mtp_calculate_streams() {
     printf '+%s+\n' "$(rpt '=' $inner)"
     echo ""
 
-    # ── Step 4: Populate stream configuration arrays ───────────────────────
-    # Reset all stream arrays
+    # ── Step 4: Reset all stream configuration arrays ─────────────────────
     S_PROTO=();    S_TARGET=();    S_PORT=();      S_BW=()
     S_DURATION=(); S_DSCP_NAME=(); S_DSCP_VAL=();  S_PARALLEL=()
     S_REVERSE=();  S_CCA=();       S_WINDOW=();     S_MSS=()
@@ -9001,7 +9206,9 @@ _mtp_calculate_streams() {
     S_FINAL_SENDER_BW=(); S_FINAL_RECEIVER_BW=()
     S_BIDIR=()
 
+    # ── Step 5: Populate stream arrays from class definitions ──────────────
     local stream_idx=0
+
     for (( ci=0; ci<n_classes; ci++ )); do
         local class="${MTP_CLASSES[$ci]}"
         local cproto cpct cdscp cbw clabel
@@ -9012,25 +9219,91 @@ _mtp_calculate_streams() {
         local port="${MTP_PORTS[$ci]:-5201}"
         local dur="${MTP_DURATIONS[$ci]:-60}"
         local bind="${MTP_BINDS[$ci]:-}"
+        local class_vrf="${MTP_VRFS[$ci]:-}"
 
-        # Resolve DSCP value
+        # ── Resolve DSCP value ─────────────────────────────────────────────
         local dscp_val=-1
+        local dscp_name="$cdscp"
         if [[ -n "$cdscp" ]]; then
             dscp_val=$(dscp_name_to_value "$cdscp")
-            [[ "$dscp_val" == "-1" ]] && { cdscp=""; dscp_val=-1; }
+            if [[ "$dscp_val" == "-1" ]]; then
+                dscp_name=""
+                dscp_val=-1
+            fi
         fi
 
-        # Per-stream bandwidth
+        # ── Per-stream bandwidth ───────────────────────────────────────────
+        # UDP streams must always have a bandwidth target.
+        # TCP streams default to unlimited (empty string).
         local bw_str=""
         if [[ "$cbw" != "0" && -n "$cbw" ]]; then
             bw_str="$cbw"
         elif [[ "$cproto" == "UDP" ]]; then
-            bw_str="1M"   # safe default for UDP
+            # Safe default for UDP so iperf3 does not try to saturate the link
+            bw_str="1M"
         fi
 
+        # ── VRF / bind consistency resolution ─────────────────────────────
+        # Mirrors the logic in build_client_command and the pre-launch
+        # validation in launch_clients. Ensures the correct VRF is applied
+        # (or cleared) based on which interface actually owns the bind IP.
+        local stream_vrf="$class_vrf"
+
+        if [[ "$OS_TYPE" == "linux" && -n "$bind" && \
+              "$bind" != "0.0.0.0" ]]; then
+
+            # Find the VRF that actually owns the bind IP
+            local _actual_vrf="GRT"
+            local _vki
+            for (( _vki=0; _vki<${#IFACE_IPS[@]}; _vki++ )); do
+                if [[ "${IFACE_IPS[$_vki]}" == "$bind" ]]; then
+                    _actual_vrf="${IFACE_VRFS[$_vki]:-GRT}"
+                    break
+                fi
+            done
+
+            if [[ -n "$stream_vrf" ]]; then
+                # Case 1: VRF was configured but bind IP is in GRT
+                #         → clear VRF to avoid "bad file descriptor"
+                if [[ "$_actual_vrf" == "GRT" ]]; then
+                    printf '%b  [MTP] Class %d: bind IP %s is in GRT — ' \
+                        "$YELLOW" "$(( ci+1 ))" "$bind"
+                    printf 'clearing VRF "%s".%b\n' "$stream_vrf" "$NC"
+                    stream_vrf=""
+
+                # Case 2: bind IP is in a different VRF than configured
+                #         → correct to the actual VRF
+                elif [[ "$_actual_vrf" != "$stream_vrf" ]]; then
+                    printf '%b  [MTP] Class %d: bind IP %s belongs to VRF "%s", ' \
+                        "$YELLOW" "$(( ci+1 ))" "$bind" "$_actual_vrf"
+                    printf 'not "%s" — correcting.%b\n' "$stream_vrf" "$NC"
+                    stream_vrf="$_actual_vrf"
+                    [[ "$stream_vrf" == "GRT" ]] && stream_vrf=""
+                fi
+
+            else
+                # Case 3: no VRF was configured but bind IP lives in a VRF
+                #         → auto-apply the correct VRF
+                if [[ "$_actual_vrf" != "GRT" && -n "$_actual_vrf" ]]; then
+                    printf '%b  [MTP] Class %d: bind IP %s is in VRF "%s" — ' \
+                        "$CYAN" "$(( ci+1 ))" "$bind" "$_actual_vrf"
+                    printf 'auto-applying.%b\n' "$NC"
+                    stream_vrf="$_actual_vrf"
+                fi
+            fi
+
+            # Warn if root is required for ip vrf exec
+            if [[ -n "$stream_vrf" ]] && (( IS_ROOT == 0 )); then
+                printf '%b  [MTP] Class %d: VRF "%s" requires root (ip vrf exec).%b\n' \
+                    "$YELLOW" "$(( ci+1 ))" "$stream_vrf" "$NC"
+            fi
+        fi
+
+        # ── Generate one stream entry per allocated stream ─────────────────
+        # Ports are incremented within a class to avoid collisions when
+        # multiple streams target the same server IP.
         local si
         for (( si=0; si<sc; si++ )); do
-            # Increment port for each stream within the same class
             local stream_port=$(( port + si ))
 
             S_PROTO+=("$cproto")
@@ -9038,7 +9311,7 @@ _mtp_calculate_streams() {
             S_PORT+=("$stream_port")
             S_BW+=("$bw_str")
             S_DURATION+=("$dur")
-            S_DSCP_NAME+=("$cdscp")
+            S_DSCP_NAME+=("$dscp_name")
             S_DSCP_VAL+=("$dscp_val")
             S_PARALLEL+=(1)
             S_REVERSE+=(0)
@@ -9046,7 +9319,7 @@ _mtp_calculate_streams() {
             S_WINDOW+=("")
             S_MSS+=("")
             S_BIND+=("$bind")
-            S_VRF+=("")
+            S_VRF+=("$stream_vrf")
             S_DELAY+=("")
             S_JITTER+=("")
             S_LOSS+=("")
@@ -9059,6 +9332,7 @@ _mtp_calculate_streams() {
             S_FINAL_SENDER_BW+=("")
             S_FINAL_RECEIVER_BW+=("")
             S_BIDIR+=(0)
+
             (( stream_idx++ ))
         done
     done
