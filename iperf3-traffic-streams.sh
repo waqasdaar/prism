@@ -9725,6 +9725,7 @@ run_loopback_mode() {
 _dscp_verify_server_get_iface() {
     local idx="$1"
     local bind_ip="${SRV_BIND[$idx]:-}"
+    local vrf="${SRV_VRF[$idx]:-}"
 
     # bind is 0.0.0.0 or unset — cannot resolve a single interface
     [[ -z "$bind_ip" || "$bind_ip" == "0.0.0.0" ]] && {
@@ -9732,28 +9733,18 @@ _dscp_verify_server_get_iface() {
         return 1
     }
 
-    # ── Linux: find which interface owns the bind IP ──────────────────────
-    # This is the authoritative method for server-side capture because:
-    #   - Incoming packets arrive on the interface that HAS the IP
-    #   - ip route get of a local address returns the VRF master device,
-    #     not the member interface — so route lookup is wrong here
-    #   - ip addr show always returns the actual member interface
     if [[ "$OS_TYPE" == "linux" ]]; then
+
+        # ── Primary: find which interface owns the bind IP ─────────────────
         local oif=""
         oif=$(ip -4 addr show 2>/dev/null \
             | awk -v ip="$bind_ip" '
                 /^[0-9]+:/ {
-                    # Extract interface name, strip trailing colon
                     iface = $2
                     gsub(/:$/, "", iface)
-                    # Skip VRF master devices (type vrf) — they are not
-                    # real capture interfaces. We want the member interface.
-                    # VRF masters appear in "ip addr show" but have no
-                    # real traffic — skip names that match VRF master list.
                     current_iface = iface
                 }
                 /inet / {
-                    # Extract IP without prefix length (e.g. "192.168.1.1/24" → "192.168.1.1")
                     split($2, a, "/")
                     if (a[1] == ip) {
                         print current_iface
@@ -9763,50 +9754,119 @@ _dscp_verify_server_get_iface() {
             ')
 
         if [[ -n "$oif" ]]; then
-            # Verify the resolved interface is not a VRF master device.
-            # A VRF master can appear in "ip addr show" with an IP only
-            # when the VRF itself has an IP (unusual but possible).
-            # Check: if the interface is of type "vrf" in ip-link, reject it.
-            local is_vrf_master=0
-            if ip -d link show dev "$oif" 2>/dev/null | grep -q ' vrf '; then
-                is_vrf_master=1
+            # ── Loopback sub-interface guard ───────────────────────────────
+            # If the IP is assigned to a loopback sub-interface (lo, lo0,
+            # lo101, lo.*, etc.) the actual traffic arrives on a different
+            # physical or virtual interface. Loopback sub-interfaces are
+            # used for VRF route-leaking, router-ID assignment, and
+            # management — they do not carry real data-plane traffic.
+            #
+            # In this case: find the actual traffic-bearing interface by
+            # doing a route lookup for the bind IP inside the VRF.
+            local _is_loopback=0
+            if [[ "$oif" =~ ^lo ]] || [[ "$oif" == "lo" ]]; then
+                _is_loopback=1
             fi
 
-            if (( is_vrf_master == 0 )); then
-                printf '%s' "$oif"
-                return 0
-            fi
+            if (( _is_loopback == 0 )); then
+                # Check if it is a VRF master device — reject if so
+                local is_vrf_master=0
+                if ip -d link show dev "$oif" 2>/dev/null | grep -q ' vrf '; then
+                    is_vrf_master=1
+                fi
 
-            # Interface is a VRF master — find the member interface that
-            # owns this IP inside the VRF
-            local vrf="${SRV_VRF[$idx]:-}"
-            if [[ -n "$vrf" ]]; then
-                local member_iface=""
-                member_iface=$(ip link show master "${vrf}" 2>/dev/null \
-                    | awk '/^[0-9]+:/ {
-                        iface = $2; gsub(/:$/, "", iface); print iface
-                    }' \
-                    | while read -r candidate; do
-                        # Check if this member interface has the bind IP
-                        if ip -4 addr show dev "$candidate" 2>/dev/null \
-                           | grep -q "${bind_ip}/"; then
-                            printf '%s' "$candidate"
-                            break
-                        fi
-                    done)
-                if [[ -n "$member_iface" ]]; then
-                    printf '%s' "$member_iface"
+                if (( is_vrf_master == 0 )); then
+                    printf '%s' "$oif"
                     return 0
                 fi
             fi
+
+            # The resolved interface is either loopback or a VRF master.
+            # Fall through to route-based lookup to find the real
+            # traffic-bearing interface.
         fi
 
-        # addr show found nothing — this bind IP is not locally assigned
+        # ── Fallback: route-based lookup for traffic-bearing interface ─────
+        # Use the routing table to find the egress interface for the
+        # bind IP. This correctly identifies physical/virtual interfaces
+        # that carry real iperf3 data traffic, even when the bind IP is
+        # also assigned to a loopback sub-interface for routing purposes.
+        local _awk_dev
+        _awk_dev='{ for (i=1; i<=NF; i++) if ($i=="dev" && i+1<=NF) { print $(i+1); exit } }'
+
+        local route_oif=""
+
+        if [[ -n "$vrf" ]]; then
+            # Route lookup inside the VRF
+            local route_out
+            route_out=$(ip route get vrf "${vrf}" "${bind_ip}" 2>/dev/null)
+            route_oif=$(printf '%s' "$route_out" | awk "$_awk_dev")
+
+            if [[ -z "$route_oif" ]]; then
+                # Fallback for older kernels
+                route_out=$(ip vrf exec "${vrf}" \
+                    ip route get "${bind_ip}" 2>/dev/null)
+                route_oif=$(printf '%s' "$route_out" | awk "$_awk_dev")
+            fi
+        else
+            # GRT route lookup
+            local route_out
+            route_out=$(ip route get "${bind_ip}" 2>/dev/null)
+            route_oif=$(printf '%s' "$route_out" | awk "$_awk_dev")
+        fi
+
+        # If the route lookup also returns a loopback interface, try
+        # finding physical VRF member interfaces directly.
+        if [[ -n "$route_oif" && ! "$route_oif" =~ ^lo ]]; then
+            # Verify it is not a VRF master
+            local _rm=0
+            ip -d link show dev "$route_oif" 2>/dev/null | grep -q ' vrf ' \
+                && _rm=1
+            if (( _rm == 0 )); then
+                printf '%s' "$route_oif"
+                return 0
+            fi
+        fi
+
+        # ── Last resort: enumerate physical VRF member interfaces ──────────
+        # When both the addr-show and route methods return loopback or VRF
+        # master interfaces, enumerate the physical member interfaces of
+        # the VRF and pick the first one that is operationally up.
+        if [[ -n "$vrf" ]]; then
+            local member_iface=""
+            local candidate
+            while IFS= read -r candidate; do
+                [[ -z "$candidate" ]] && continue
+                # Skip loopback members
+                [[ "$candidate" =~ ^lo ]] && continue
+                # Check operational state
+                local op_state
+                op_state=$(ip link show dev "$candidate" 2>/dev/null \
+                    | grep -oE '<[^>]+>' | head -1)
+                if [[ "$op_state" == *"LOWER_UP"* || \
+                      "$op_state" == *"UP"* ]]; then
+                    member_iface="$candidate"
+                    break
+                fi
+            done < <(ip link show master "${vrf}" 2>/dev/null \
+                | awk '/^[0-9]+:/ {
+                    iface = $2
+                    gsub(/:$/, "", iface)
+                    print iface
+                }')
+
+            if [[ -n "$member_iface" ]]; then
+                printf '%s' "$member_iface"
+                return 0
+            fi
+        fi
+
+        # All resolution methods failed
         printf '%s' ""
         return 1
     fi
 
-    # ── macOS: find which interface owns the bind IP ──────────────────────
+    # ── macOS ──────────────────────────────────────────────────────────────
     if [[ "$OS_TYPE" == "macos" ]]; then
         local oif=""
         oif=$(ifconfig 2>/dev/null \
@@ -9875,7 +9935,23 @@ _dscp_verify_server_run() {
         bleft "  Bind IP  : ${BOLD}0.0.0.0 (all interfaces)${NC}"
         bleft "  ${DIM}Interface selected manually (bind is 0.0.0.0)${NC}"
     fi
+
     bleft "  Interface: ${BOLD}${iface}${NC}"
+
+    # Show resolution method — helps operator understand why a particular
+    # interface was selected, especially when loopback fallback occurred
+    if [[ -n "$bind_ip" && "$bind_ip" != "0.0.0.0" ]]; then
+        if [[ "$iface" =~ ^lo ]]; then
+            bleft "  ${DIM}Interface resolved via: ip -4 addr show (loopback — traffic may arrive on VRF member)${NC}"
+        elif [[ -n "$vrf" ]]; then
+            bleft "  ${DIM}Interface resolved via: ip route get vrf ${vrf} ${bind_ip} (VRF member interface)${NC}"
+        else
+            bleft "  ${DIM}Interface resolved via: ip -4 addr show (interface owning ${bind_ip})${NC}"
+        fi
+    else
+        bleft "  ${DIM}Interface selected manually (bind is 0.0.0.0)${NC}"
+    fi
+
     printf '+%s+\n' "$(rpt '-' "$inner")"
 
     # ── Check tcpdump ─────────────────────────────────────────────────────
