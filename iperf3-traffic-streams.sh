@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
 # iperf3-traffic-streams.sh — Enterprise-grade iperf3 multi-stream traffic manager
-# Version: 8.3.0
+# Version: 8.3.1
 # Author : Waqas Daar (waqasdaar@gmail.com)
 # =============================================================================
 
@@ -3892,7 +3892,6 @@ _cleanup_stream_procs() {
         fi
         BIDIR_PIDS[$idx]=0
     fi
-
 
     # ── 4. Remove tc netem for this stream ────────────────────────────────
     # Lifts network impairment on the stream's egress interface immediately
@@ -10723,7 +10722,7 @@ show_main_menu() {
 
     # ── Header ────────────────────────────────────────────────────────────
     printf '+%s+\n' "$(rpt '=' $inner)"
-    bcenter "${BOLD}iperf3 Traffic Streams${NC}  v8.3.0"
+    bcenter "${BOLD}iperf3 Traffic Streams${NC}  v8.3.1"
     printf '+%s+\n' "$(rpt '=' $inner)"
 
     # ── System info: plain text only so bleft padding is exact ────────────
