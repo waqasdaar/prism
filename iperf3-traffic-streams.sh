@@ -563,6 +563,8 @@ declare -a MTP_VRFS=()       # per-class VRFs
 MTP_BASE_PORT=5201
 MTP_PORT_MODE="auto"
 
+_mtp_total_streams=0
+
 STREAM_COUNT=0
 SERVER_COUNT=0
 FRAME_LINES=0
@@ -8901,12 +8903,6 @@ _mtp_define_custom_mix() {
 # ---------------------------------------------------------------------------
 # _mtp_configure_targets
 #
-# For each class in MTP_CLASSES, prompts for target IP and port.
-# Stores results in MTP_TARGETS and MTP_PORTS parallel arrays.
-# ---------------------------------------------------------------------------
-# ---------------------------------------------------------------------------
-# _mtp_configure_targets
-#
 # Collects target IPs, duration, bind interface, and port configuration
 # for each traffic class.
 #
@@ -9238,24 +9234,41 @@ _mtp_configure_targets() {
                 ;;
 
             custom)
-                # Operator enters a specific base port for this class.
-                # Default suggestion is next available port.
+                # ── Compute an accurate default by pre-calculating how many
+                # streams the previous class allocated and advancing past them.
+                # This ensures the suggested default never collides with ports
+                # already used by earlier classes.
+                #
+                # We replicate the largest-remainder calculation here using
+                # the total stream count the operator already entered.
+                # If that value is not yet known we fall back to +1.
+
+                local _suggested=$suggested_port
+
                 local cp
                 while true; do
-                    printf "  Base port for this class [%d]: " \
-                        "$suggested_port"
+                    printf "  Base port for this class [%d]: " "$_suggested"
                     read -r cp </dev/tty
-                    cp="${cp:-$suggested_port}"
+                    cp="${cp:-$_suggested}"
                     validate_port "$cp" && {
                         class_port=$(( 10#$cp ))
                         break
                     }
-                    printf '%b  Invalid port.%b\n' "$RED" "$NC"
+                    printf '%b  Invalid port. Enter 1-65535.%b\n' \
+                        "$RED" "$NC"
                 done
-                # Advance suggestion so next class default avoids overlap.
-                # We advance by 1 here; _mtp_calculate_streams will handle
-                # the exact per-stream increment.
-                suggested_port=$(( class_port + 1 ))
+
+                # Advance suggested_port for the NEXT class.
+                # Use a pre-estimate of this class's stream count so the
+                # next default skips past all ports this class will use.
+                # Pre-estimate: round(total * pct / 100), minimum 1.
+                local _pre_sc=1
+                if [[ -n "${_mtp_total_streams:-}" ]] && \
+                   (( _mtp_total_streams > 0 )); then
+                    _pre_sc=$(( _mtp_total_streams * cpct / 100 ))
+                    (( _pre_sc < 1 )) && _pre_sc=1
+                fi
+                suggested_port=$(( class_port + _pre_sc ))
                 ;;
 
             single)
@@ -9420,9 +9433,32 @@ _mtp_calculate_streams() {
     S_FINAL_SENDER_BW=(); S_FINAL_RECEIVER_BW=()
     S_BIDIR=()
 
-    # ── Step 5: Populate stream arrays ────────────────────────────────────
+ # ── Step 5: Populate stream arrays ────────────────────────────────────
     local stream_idx=0
-    local next_port="${MTP_BASE_PORT:-5201}"  # running counter for auto mode
+    local next_port="${MTP_BASE_PORT:-5201}"   # running counter for auto mode
+
+    # Collision guard: track every port allocated so far across ALL classes.
+    # In custom mode the operator may enter a base port that overlaps with
+    # a port already used by a previous class. We detect and auto-advance.
+    local -a _allocated_ports=()
+
+    _port_is_allocated() {
+        local p="$1"
+        local ap
+        for ap in "${_allocated_ports[@]}"; do
+            [[ "$ap" == "$p" ]] && return 0
+        done
+        return 1
+    }
+
+    _next_free_port() {
+        # Return the smallest port >= $1 that is not in _allocated_ports
+        local p="$1"
+        while _port_is_allocated "$p"; do
+            p=$(( p + 1 ))
+        done
+        printf '%d' "$p"
+    }
 
     for (( ci=0; ci<n_classes; ci++ )); do
         local class="${MTP_CLASSES[$ci]}"
@@ -9437,41 +9473,39 @@ _mtp_calculate_streams() {
         local stored_port="${MTP_PORTS[$ci]:-0}"
 
         # ── Determine base port for this class ─────────────────────────────
-        #
-        #   auto   — base port = next_port (global sequential counter)
-        #            After this class: next_port += sc  (no overlap ever)
-        #
-        #   custom — base port = stored_port (operator entered per-class)
-        #            Within the class, streams still increment: +0, +1, ...
-        #            next_port updated to stored_port + sc so the allocation
-        #            table display is accurate.
-        #
-        #   single — base port = MTP_BASE_PORT for every class and stream.
-        #            si is NOT added — all streams literally use the same port.
-
         local class_base_port
 
         case "${MTP_PORT_MODE:-auto}" in
 
             auto)
+                # Auto: use the global sequential counter — guaranteed clean
                 class_base_port=$next_port
-                next_port=$(( class_base_port + sc ))
                 ;;
 
             custom)
+                # Custom: operator specified a base port.
+                # Check it does not collide with already-allocated ports.
                 if (( stored_port > 0 )); then
-                    class_base_port=$stored_port
+                    local _clean_port
+                    _clean_port=$(_next_free_port "$stored_port")
+                    if (( _clean_port != stored_port )); then
+                        printf '%b  [MTP] Class %d (%s): port %d already ' \
+                            "$YELLOW" "$(( ci+1 ))" "$clabel" "$stored_port"
+                        printf 'allocated — advancing to %d.%b\n' \
+                            "$_clean_port" "$NC"
+                    fi
+                    class_base_port=$_clean_port
                 else
-                    # Fallback: stored_port was 0 (shouldn't happen in custom
-                    # mode, but guard against it)
-                    class_base_port=$next_port
+                    # Stored port was 0 (placeholder) — fall back to auto
+                    local _clean_port
+                    _clean_port=$(_next_free_port "$next_port")
+                    class_base_port=$_clean_port
                 fi
-                next_port=$(( class_base_port + sc ))
                 ;;
 
             single)
+                # Single: all streams share one port — no increment
                 class_base_port=$MTP_BASE_PORT
-                # next_port unchanged — all classes share the same port
                 ;;
 
         esac
@@ -9525,8 +9559,9 @@ _mtp_calculate_streams() {
                 fi
             else
                 if [[ "$_actual_vrf" != "GRT" && -n "$_actual_vrf" ]]; then
-                    printf '%b  [MTP] Class %d: bind %s auto-applying VRF "%s".%b\n' \
-                        "$CYAN" "$(( ci+1 ))" "$bind" "$_actual_vrf" "$NC"
+                    printf '%b  [MTP] Class %d: bind %s — ' \
+                        "$CYAN" "$(( ci+1 ))" "$bind"
+                    printf 'auto-applying VRF "%s".%b\n' "$_actual_vrf" "$NC"
                     stream_vrf="$_actual_vrf"
                 fi
             fi
@@ -9541,12 +9576,27 @@ _mtp_calculate_streams() {
         local si
         for (( si=0; si<sc; si++ )); do
 
-            # Port per stream
             local stream_port
             case "${MTP_PORT_MODE:-auto}" in
-                single) stream_port=$MTP_BASE_PORT ;;
-                *)      stream_port=$(( class_base_port + si )) ;;
+                single)
+                    stream_port=$MTP_BASE_PORT
+                    ;;
+                *)
+                    # For both auto and custom: within a class, streams
+                    # increment from class_base_port. Each port is checked
+                    # for collision and advanced if necessary.
+                    local _candidate=$(( class_base_port + si ))
+                    if [[ "${MTP_PORT_MODE:-auto}" == "custom" ]]; then
+                        _candidate=$(_next_free_port "$_candidate")
+                    fi
+                    stream_port=$_candidate
+                    ;;
             esac
+
+            # Register this port as allocated
+            if [[ "${MTP_PORT_MODE:-auto}" != "single" ]]; then
+                _allocated_ports+=("$stream_port")
+            fi
 
             S_PROTO+=("$cproto")
             S_TARGET+=("$tgt")
@@ -9577,6 +9627,18 @@ _mtp_calculate_streams() {
 
             (( stream_idx++ ))
         done
+
+        # Advance the global next_port counter past all ports used by
+        # this class so auto mode and fallback paths stay clean.
+        case "${MTP_PORT_MODE:-auto}" in
+            single) ;;   # no change — all classes share one port
+            *)
+                local _last_used=$(( class_base_port + sc - 1 ))
+                if (( _last_used >= next_port )); then
+                    next_port=$(( _last_used + 1 ))
+                fi
+                ;;
+        esac
     done
 
     STREAM_COUNT=$stream_idx
@@ -9714,6 +9776,8 @@ run_mixed_traffic_mode() {
     echo ""
 
     # ── Step 3: Configure targets ──────────────────────────────────────────
+    _mtp_total_streams=$total_streams   # used by _mtp_configure_targets
+                                        # to compute accurate port defaults
     _mtp_configure_targets
 
     echo ""
