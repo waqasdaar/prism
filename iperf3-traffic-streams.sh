@@ -3557,50 +3557,45 @@ _cwnd_detect_phase() {
 _render_cwnd_reference_table() {
     local inner="$1"
 
-    # Column layout: Phase(18) | Symbol(6) | Meaning(rest)
-    local C_PHASE=20 C_SYM=8
-    local C_MEANING=$(( inner - C_PHASE - C_SYM - 8 ))
-    (( C_MEANING < 20 )) && C_MEANING=20
-
+    # Opening separator (also acts as post-stats separator)
     printf '+%s+\n' "$(rpt '-' $inner)"
 
-    # Header
+    # ── Header row — WITH right border ────────────────────────────────────
+    # Two columns: Phase name and Description.
+    # C_PHASE = 22 (fixed), description fills the remainder.
+    local C_PHASE=22
+    local C_DESC=$(( inner - 3 - C_PHASE - 2 ))
+    (( C_DESC < 20 )) && C_DESC=20
+
     local hdr
-    printf -v hdr '%-*s  %-*s  %-*s' \
+    printf -v hdr '%-*s  %-*s' \
         $C_PHASE 'TCP CC Phase' \
-        $C_SYM   'Indicator' \
-        $C_MEANING 'What it means for your test'
+        $C_DESC  'Description'
     local hlen=${#hdr}
     local hrp=$(( inner - 2 - hlen - 1 ))
     (( hrp < 0 )) && hrp=0
     printf '|  %s%s|\n' "$hdr" "$(rpt ' ' $hrp)"
     printf '+%s+\n' "$(rpt '-' $inner)"
 
-    # Row helper — all plain text for exact column alignment
+    # ── Data rows — NO right border, full description text ─────────────────
+    # Left border and indent are kept. Right border is omitted so
+    # descriptions are never truncated.
     _ref_row() {
-        local phase="$1" sym="$2" meaning="$3"
-        local row
-        printf -v row '%-*s  %-*s  %-*s' \
-            $C_PHASE "$phase" \
-            $C_SYM   "$sym" \
-            $C_MEANING "$meaning"
-        local rlen=${#row}
-        local rrp=$(( inner - 2 - rlen - 1 ))
-        (( rrp < 0 )) && rrp=0
-        printf '|  %s%s|\n' "$row" "$(rpt ' ' $rrp)"
+        local phase="$1" meaning="$2"
+        printf '|  %-*s  %s\n' $C_PHASE "$phase" "$meaning"
     }
 
-    _ref_row "Slow Start"          "▁▂▄█"   "cwnd doubles each RTT — fills pipe as fast as possible"
-    _ref_row "Congestion Avoidance" "▄▅▆▇"   "cwnd +1 MSS/RTT — linear growth, stable throughput"
-    _ref_row "Fast Recovery"        "█▄▅▆"   "cwnd halved on loss, recovering — brief throughput dip"
-    _ref_row "Timeout / Loss"       "█▁▂▃"   "cwnd reset to ~1 MSS — severe loss, re-entering slow start"
-    _ref_row "Near ssthresh"        "▅▆▆▇"   "cwnd approaching threshold — switching from SS to CA"
-    _ref_row "Steady State"         "▆▆▇▇"   "cwnd stable — no congestion, network is not the bottleneck"
+    _ref_row "Slow Start"           "cwnd doubles each RTT — exponential growth, fills pipe as fast as possible"
+    _ref_row "Congestion Avoidance" "cwnd grows by +1 MSS per RTT — linear growth, stable throughput phase"
+    _ref_row "Fast Recovery"        "cwnd halved on packet loss, recovering — brief throughput dip expected"
+    _ref_row "Timeout / Loss"       "cwnd reset to ~1 MSS — severe loss detected, re-entering slow start"
+    _ref_row "Near ssthresh"        "cwnd approaching slow-start threshold — transitioning from SS to CA"
+    _ref_row "Steady State"         "cwnd stable — no congestion detected, network is not the bottleneck"
 
     printf '+%s+\n' "$(rpt '-' $inner)"
 
-    # Legend line
-    local legend="  cwnd = TCP Congestion Window (KBytes)   ssthresh = Slow Start Threshold"
+    # ── Legend line — WITH right border ────────────────────────────────────
+    local legend="  cwnd = Congestion Window (KBytes)   ssthresh = Slow Start Threshold"
     local llen=${#legend}
     local lrp=$(( inner - llen - 1 ))
     (( lrp < 0 )) && lrp=0
