@@ -1,4 +1,4 @@
-# iperf3 Multi-Stream Traffic Tool
+# PRISM — Performance Real-time iPerf3 Stream Manager
 
 <div align="center">
 
@@ -46,7 +46,7 @@ DSCP/QoS marking, TCP tuning, and network impairment injection.*
 
 ## Introduction
 
-`iperf3-traffic-flows.sh` is a production-grade terminal application that wraps
+`PRISM — Performance Real-time iPerf3 Stream Manager` is a production-grade terminal application that wraps
 `iperf3` in a fully interactive menu-driven interface. It was built to
 solve the real operational challenges that network engineers face when using
 raw `iperf3` commands in enterprise and carrier environments.
