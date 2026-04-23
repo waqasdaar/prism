@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
-# iperf3-traffic-streams.sh — Enterprise-grade iperf3 multi-stream traffic manager
+# PRISM — Performance Real-time iPerf3 Stream Manager
+# Enterprise-grade multi-stream traffic orchestration with live QoS dashboard
 # Version: 8.3.1
 # Author : Waqas Daar (waqasdaar@gmail.com)
 # =============================================================================
@@ -595,7 +596,7 @@ _LAST_FRAME_LINE_COUNT=0   # set by run_dashboard after each render
 # without modification.
 
 THEME_CURRENT=""                          # active theme name
-THEME_PREFS_DIR="${HOME}/.config/iperf3-streams"
+THEME_PREFS_DIR="${HOME}/.config/prism"
 THEME_PREFS_FILE="${THEME_PREFS_DIR}/theme"
 
 # When a stream is configured for bidirectional simultaneous testing, a second
@@ -1106,7 +1107,7 @@ bempty() {
 }
 
 print_header() {
-    local t="${1:-iperf3 Traffic Streams}"
+    local t="${1:-PRISM}"
     bline '='; bempty; bcenter "${BOLD}${CYAN}${t}${NC}"; bempty; bline '='
 }
 
@@ -1544,7 +1545,7 @@ cleanup() {
     printf '\033[?25h' >/dev/tty 2>/dev/null; printf '\n' >/dev/tty 2>/dev/null
     local sep; sep=$(rpt '=' $(( COLS - 2 )))
     tty_echo "${BOLD}${CYAN}+${sep}+${NC}"
-    tty_echo "${BOLD}${CYAN}  iperf3 Traffic Streams -- Cleanup  [signal: ${sn}]${NC}"
+    tty_echo "${BOLD}${CYAN}  PRISM — Cleanup  [signal: ${sn}]${NC}"
     tty_echo "${BOLD}${CYAN}+${sep}+${NC}"
     local killed=0 already=0
 
@@ -1670,13 +1671,13 @@ cleanup() {
     tty_echo "${BOLD}${CYAN}+${sep}+${NC}"; tty_echo ""
 }
 
-_trap_int()  { printf '\n'>/dev/tty 2>/dev/null; tty_echo "${BOLD}${YELLOW}  [SIGINT]  Ctrl+C -- stopping...${NC}";          cleanup "SIGINT (Ctrl+C)"; exit 130; }
-_trap_term() { printf '\n'>/dev/tty 2>/dev/null; tty_echo "${BOLD}${YELLOW}  [SIGTERM] Stopping...${NC}";                     cleanup "SIGTERM";         exit 143; }
-_trap_quit() { printf '\n'>/dev/tty 2>/dev/null; tty_echo "${BOLD}${YELLOW}  [SIGQUIT] Ctrl+\\ -- stopping...${NC}";          cleanup "SIGQUIT";         exit 131; }
-_trap_hup()  { printf '\n'>/dev/tty 2>/dev/null; tty_echo "${BOLD}${YELLOW}  [SIGHUP]  Terminal closed -- stopping...${NC}";  cleanup "SIGHUP";          exit 129; }
+_trap_int()  { printf '\n'>/dev/tty 2>/dev/null; tty_echo "${BOLD}${YELLOW}  PRISM [SIGINT]  Ctrl+C — stopping...${NC}";           cleanup "SIGINT (Ctrl+C)"; exit 130; }
+_trap_term() { printf '\n'>/dev/tty 2>/dev/null; tty_echo "${BOLD}${YELLOW}  PRISM [SIGTERM] Stopping...${NC}";                    cleanup "SIGTERM";         exit 143; }
+_trap_quit() { printf '\n'>/dev/tty 2>/dev/null; tty_echo "${BOLD}${YELLOW}  PRISM [SIGQUIT] Ctrl+\\ — stopping...${NC}";          cleanup "SIGQUIT";         exit 131; }
+_trap_hup()  { printf '\n'>/dev/tty 2>/dev/null; tty_echo "${BOLD}${YELLOW}  PRISM [SIGHUP]  Terminal closed — stopping...${NC}";  cleanup "SIGHUP";          exit 129; }
 _trap_tstp() {
     printf '\n'>/dev/tty 2>/dev/null
-    tty_echo "${BOLD}${YELLOW}  [Ctrl+Z blocked]${NC}  Backgrounding orphans iperf3 processes."
+    tty_echo "${BOLD}${YELLOW}  PRISM [Ctrl+Z blocked]${NC}  Backgrounding will orphan iperf3 processes."
     tty_echo "${YELLOW}  Use Ctrl+C to stop cleanly.${NC}"
 }
 _trap_exit() { local ec=$?; (( CLEANUP_DONE == 0 )) && cleanup "exit (code ${ec})"; }
@@ -1703,7 +1704,7 @@ find_iperf3() {
     for c in "${candidates[@]}"; do
         [[ -n "$c" && -x "$c" ]] && { IPERF3_BIN="$c"; return 0; }
     done
-    printf '%b\n' "${RED}ERROR: iperf3 not found.${NC}"
+    printf '%b\n' "${RED}PRISM ERROR: iperf3 not found.${NC}"
     if [[ "$OS_TYPE" == "macos" ]]; then
         printf '%b\n' "${YELLOW}Install on macOS: brew install iperf3${NC}"
     else
@@ -7393,7 +7394,7 @@ _render_client_frame() {
 
     # ── Header ────────────────────────────────────────────────────────────
     bline '='
-    bcenter "${BOLD}${CYAN}iperf3 Traffic Streams -- Live Dashboard${NC}"
+    bcenter "${BOLD}${CYAN}PRISM — Live Dashboard${NC}"
     bline '='
     bleft "$(printf \
         '  Active:%-3d  Connected:%-3d  Done:%-3d  Failed:%-3d  Elapsed:%s' \
@@ -7733,7 +7734,7 @@ _render_server_frame() {
 
     # ── Top border + title ─────────────────────────────────────────────────
     bline '='
-    bcenter "${BOLD}${CYAN}iperf3 Traffic Streams -- Server Dashboard${NC}"
+    bcenter "${BOLD}${CYAN}PRISM — Server Dashboard${NC}"
     bline '='
 
     # ── Summary bar ────────────────────────────────────────────────────────
@@ -8283,7 +8284,7 @@ parse_final_results() {
 }
 
 display_results_table() {
-    echo ""; print_header "Final Results"; echo ""
+    echo ""; print_header "PRISM — Final Results"; echo ""
 
     # ── Fixed column widths for results table ─────────────────────────────
     #   C_SN     =  3
@@ -8530,7 +8531,7 @@ offer_log_view() {
 # =============================================================================
 
 run_server_mode() {
-    echo ""; print_header "Server Mode"; echo ""
+    echo ""; print_header "PRISM — Server Mode"; echo ""
     local n
     while true; do
         read -r -p "  How many listeners? [1]: " n </dev/tty; n="${n:-1}"
@@ -9733,7 +9734,7 @@ run_mixed_traffic_mode() {
     echo ""
     local inner=$(( COLS - 2 ))
     printf '+%s+\n' "$(rpt '=' $inner)"
-    bcenter "${BOLD}${CYAN}Mixed Traffic Pattern Generator${NC}"
+    bcenter "${BOLD}${CYAN}PRISM — Mixed Traffic Pattern Generator${NC}"
     printf '+%s+\n' "$(rpt '=' $inner)"
     bleft "  Define a traffic mix by percentage. Streams are calculated"
     bleft "  and configured automatically based on your mix definition."
@@ -9858,7 +9859,7 @@ run_mixed_traffic_mode() {
 
 
 run_client_mode() {
-    echo ""; print_header "Client Mode"; echo ""
+    echo ""; print_header "PRISM — Client Mode"; echo ""
     local n
     while true; do
         read -r -p "  How many streams? [1]: " n </dev/tty; n="${n:-1}"
@@ -9930,7 +9931,7 @@ run_client_mode() {
 }
 
 run_loopback_mode() {
-    echo ""; print_header "Loopback Test Mode"; echo ""
+    echo ""; print_header "PRISM — Loopback Test Mode"; echo ""
     echo "  Launches server and client on 127.0.0.1 for local validation."
     echo ""
     local n
@@ -10722,7 +10723,7 @@ show_main_menu() {
 
     # ── Header ────────────────────────────────────────────────────────────
     printf '+%s+\n' "$(rpt '=' $inner)"
-    bcenter "${BOLD}iperf3 Traffic Streams${NC}  v8.3.1"
+    bcenter "${BOLD}PRISM${NC}  ${DIM}Performance Real-time iPerf3 Stream Manager${NC}  ${BOLD}v8.3.1${NC}"
     printf '+%s+\n' "$(rpt '=' $inner)"
 
     # ── System info: plain text only so bleft padding is exact ────────────
@@ -10912,7 +10913,7 @@ main_menu() {
             7)
                 show_theme_menu ;;
             8|q|Q)
-                echo ""; printf '%b\n' "${GREEN}  Goodbye! Cleaning up...${NC}"; echo "";
+                echo ""; printf '%b\n' "${GREEN}  PRISM — Goodbye! Cleaning up...${NC}"; echo "";
                 cleanup "user exit (option 7)"
                 exit 0 ;;
             "") ;;
