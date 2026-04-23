@@ -553,6 +553,13 @@ declare -a S_CLEANUP_QUEUED=()   # 1 = cleanup already triggered for stream i
 declare -a S_NETEM_IFACE=()
 
 
+declare -a MTP_CLASSES=()    # traffic mix class definitions
+declare -a MTP_TARGETS=()    # per-class target IPs
+declare -a MTP_PORTS=()      # per-class base ports
+declare -a MTP_DURATIONS=()  # per-class durations
+declare -a MTP_BINDS=()      # per-class bind IPs
+declare -a MTP_VRFS=()       # per-class VRFs
+
 STREAM_COUNT=0
 SERVER_COUNT=0
 FRAME_LINES=0
@@ -8518,6 +8525,733 @@ run_server_mode() {
     echo ""; printf '%b\n' "${CYAN}  Server mode ended.${NC}"; echo ""
 }
 
+
+# =============================================================================
+# MIXED TRAFFIC PATTERN GENERATOR
+# =============================================================================
+#
+# Allows the operator to define a traffic mix by percentage. The script
+# calculates stream counts, per-stream bandwidth, and DSCP markings
+# automatically, then launches the resulting streams via run_client_mode
+# logic.
+#
+# Supported traffic classes:
+#   TCP Bulk          — large file transfer, no DSCP or AF11/AF21/AF31
+#   TCP Interactive   — latency-sensitive TCP, AF41/CS3
+#   UDP Real-time     — VoIP/video, EF/AF41/VA
+#   UDP Bulk          — background UDP, CS1/CS2
+#   UDP Low-priority  — scavenger traffic, CS1/default
+#
+# Design:
+#   1. Operator defines a mix profile (up to 5 classes).
+#   2. Each class has a percentage, target IP, port, protocol,
+#      DSCP, and optional bandwidth cap.
+#   3. The script distributes a total stream count across classes
+#      proportionally and allocates bandwidth per stream.
+#   4. The resulting configuration is handed to the stream launch
+#      machinery exactly as if the operator had configured it manually.
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# _mtp_show_presets
+#
+# Displays built-in traffic mix presets the operator can select as a
+# starting point, or they can define a custom mix.
+# ---------------------------------------------------------------------------
+_mtp_show_presets() {
+    local inner=$(( COLS - 2 ))
+    printf '+%s+\n' "$(rpt '=' $inner)"
+    bcenter "${BOLD}${CYAN}Built-in Traffic Mix Presets${NC}"
+    printf '+%s+\n' "$(rpt '=' $inner)"
+
+    local C1=3 C2=22 C3=$(( inner - 3 - 3 - 22 - 2 - 2 ))
+    (( C3 < 20 )) && C3=20
+
+    bleft "${BOLD}$(printf '%-*s  %-*s  %-*s' $C1 '#' $C2 'Preset Name' $C3 'Mix Description')${NC}"
+    printf '+%s+\n' "$(rpt '-' $inner)"
+
+    # Preset data: NUM|NAME|DESCRIPTION
+    local -a presets=(
+        "1|Enterprise WAN|70% TCP Bulk (AF11)  +  20% UDP RTP (EF)  +  10% UDP Low (CS1)"
+        "2|Data Centre|60% TCP Bulk (AF21)  +  30% TCP iSCSI (AF31)  +  10% ICMP/Mgmt (CS2)"
+        "3|Unified Comms|50% UDP Voice (EF)  +  30% UDP Video (AF41)  +  20% TCP Signalling (CS3)"
+        "4|Bulk Transfer|80% TCP Bulk (AF11)  +  20% TCP Background (CS1)"
+        "5|Multimedia CDN|65% TCP HTTPS (AF31)  +  25% UDP Stream (AF41)  +  10% UDP Low (CS1)"
+        "6|Custom Mix|Define your own percentages and classes interactively"
+    )
+
+    local entry
+    for entry in "${presets[@]}"; do
+        local num name desc
+        IFS='|' read -r num name desc <<< "$entry"
+        local row
+        printf -v row '%-*s  %-*s  %-*s' $C1 "$num" $C2 "$name" $C3 "$desc"
+        local rlen=${#row}
+        local rp=$(( inner - 2 - rlen - 1 ))
+        (( rp < 0 )) && rp=0
+        printf '|  %s%s|\n' "$row" "$(rpt ' ' $rp)"
+    done
+
+    printf '+%s+\n' "$(rpt '=' $inner)"
+    echo ""
+}
+
+# ---------------------------------------------------------------------------
+# _mtp_select_preset  <out_array_name>
+#
+# Loads a preset mix into the named array variable.
+# Array format: each element = "PROTO:PCT:DSCP_NAME:BW_PER_STREAM:LABEL"
+#   PROTO        = TCP or UDP
+#   PCT          = integer percentage (must sum to 100)
+#   DSCP_NAME    = e.g. EF, AF11, CS1, or "" for best-effort
+#   BW_PER_STREAM= per-stream bandwidth string e.g. 100M, 0 for unlimited
+#   LABEL        = human-readable class label
+# ---------------------------------------------------------------------------
+_mtp_load_preset() {
+    local preset_num="$1"
+    # Output arrays populated by caller after this function returns
+    # using the MTP_CLASS_* globals set below.
+
+    MTP_CLASSES=()
+
+    case "$preset_num" in
+        1)  # Enterprise WAN
+            MTP_CLASSES=(
+                "TCP:70:AF11:0:TCP Bulk (AF11)"
+                "UDP:20:EF:2M:UDP RTP Voice/Video (EF)"
+                "UDP:10:CS1:512K:UDP Low-Priority (CS1)"
+            )
+            ;;
+        2)  # Data Centre
+            MTP_CLASSES=(
+                "TCP:60:AF21:0:TCP Bulk Storage (AF21)"
+                "TCP:30:AF31:0:TCP iSCSI/NFS (AF31)"
+                "UDP:10:CS2:1M:UDP Management (CS2)"
+            )
+            ;;
+        3)  # Unified Comms
+            MTP_CLASSES=(
+                "UDP:50:EF:1M:UDP Voice (EF)"
+                "UDP:30:AF41:4M:UDP Video Conferencing (AF41)"
+                "TCP:20:CS3:0:TCP Signalling (CS3)"
+            )
+            ;;
+        4)  # Bulk Transfer
+            MTP_CLASSES=(
+                "TCP:80:AF11:0:TCP Bulk (AF11)"
+                "TCP:20:CS1:0:TCP Background (CS1)"
+            )
+            ;;
+        5)  # Multimedia CDN
+            MTP_CLASSES=(
+                "TCP:65:AF31:0:TCP HTTPS Content (AF31)"
+                "UDP:25:AF41:8M:UDP Stream (AF41)"
+                "UDP:10:CS1:256K:UDP Low-Priority (CS1)"
+            )
+            ;;
+        6)  # Custom — caller builds MTP_CLASSES interactively
+            MTP_CLASSES=()
+            ;;
+    esac
+}
+
+# ---------------------------------------------------------------------------
+# _mtp_define_custom_mix
+#
+# Interactive wizard to define a custom traffic mix.
+# Populates MTP_CLASSES global array.
+# ---------------------------------------------------------------------------
+_mtp_define_custom_mix() {
+    local inner=$(( COLS - 2 ))
+    MTP_CLASSES=()
+
+    printf '+%s+\n' "$(rpt '=' $inner)"
+    bcenter "${BOLD}${CYAN}Define Custom Traffic Mix${NC}"
+    printf '+%s+\n' "$(rpt '=' $inner)"
+    bleft "  Define up to 5 traffic classes. Percentages must sum to 100."
+    bleft "  ${DIM}Each class becomes one or more streams proportional to its share.${NC}"
+    printf '+%s+\n' "$(rpt '-' $inner)"
+    echo ""
+
+    local total_pct=0
+    local class_num=0
+    local max_classes=5
+
+    while (( class_num < max_classes )); do
+        local remaining=$(( 100 - total_pct ))
+        if (( remaining <= 0 )); then
+            break
+        fi
+
+        (( class_num++ ))
+        printf '%b  ── Class %d ──%b\n' "$CYAN" "$class_num" "$NC"
+        echo ""
+
+        # Protocol
+        local proto
+        while true; do
+            read -r -p "  Protocol [TCP/UDP] (default TCP): " proto </dev/tty
+            proto="${proto:-TCP}"
+            proto=$(printf '%s' "$proto" | tr '[:lower:]' '[:upper:]')
+            [[ "$proto" == "TCP" || "$proto" == "UDP" ]] && break
+            printf '%b  Enter TCP or UDP.%b\n' "$RED" "$NC"
+        done
+
+        # Percentage
+        local pct
+        while true; do
+            printf "  Percentage of total traffic [remaining: %d%%]: " "$remaining"
+            read -r pct </dev/tty
+            pct="${pct:-$remaining}"
+            if [[ "$pct" =~ ^[0-9]+$ ]] && \
+               (( pct >= 1 && pct <= remaining )); then
+                break
+            fi
+            printf '%b  Enter 1-%d.%b\n' "$RED" "$remaining" "$NC"
+        done
+        total_pct=$(( total_pct + pct ))
+
+        # DSCP
+        printf "  DSCP marking (e.g. EF, AF41, CS1, or Enter for none): "
+        local dscp_raw
+        read -r dscp_raw </dev/tty
+        dscp_raw="${dscp_raw:-}"
+        local dscp_name=""
+        if [[ -n "$dscp_raw" ]]; then
+            local dscp_val
+            dscp_val=$(dscp_name_to_value "$dscp_raw")
+            if [[ "$dscp_val" != "-1" ]]; then
+                dscp_name=$(printf '%s' "$dscp_raw" | tr '[:lower:]' '[:upper:]')
+            else
+                printf '%b  Invalid DSCP — using none.%b\n' "$YELLOW" "$NC"
+            fi
+        fi
+
+        # Per-stream bandwidth (UDP requires it, TCP optional)
+        local bw_per_stream=""
+        if [[ "$proto" == "UDP" ]]; then
+            while true; do
+                read -r -p "  Bandwidth per stream (required for UDP, e.g. 1M, 500K): " \
+                    bw_per_stream </dev/tty
+                bw_per_stream="${bw_per_stream:-1M}"
+                validate_bandwidth "$bw_per_stream" && break
+                printf '%b  Invalid bandwidth.%b\n' "$RED" "$NC"
+            done
+        else
+            read -r -p "  Bandwidth limit per stream (Enter for unlimited): " \
+                bw_per_stream </dev/tty
+            bw_per_stream="${bw_per_stream:-0}"
+            if ! validate_bandwidth "$bw_per_stream" 2>/dev/null; then
+                bw_per_stream="0"
+            fi
+        fi
+        [[ "$bw_per_stream" == "" ]] && bw_per_stream="0"
+
+        # Label
+        local default_label="${proto} ${pct}%${dscp_name:+ (${dscp_name})}"
+        read -r -p "  Class label [${default_label}]: " class_label </dev/tty
+        class_label="${class_label:-$default_label}"
+
+        MTP_CLASSES+=("${proto}:${pct}:${dscp_name}:${bw_per_stream}:${class_label}")
+
+        echo ""
+        if (( total_pct >= 100 )); then
+            break
+        fi
+
+        if (( class_num < max_classes )); then
+            local add_more
+            read -r -p "  Add another class? [Y/n]: " add_more </dev/tty
+            [[ "$add_more" =~ ^[Nn] ]] && break
+        fi
+    done
+
+    # If percentages don't sum to 100, normalise the last class
+    if (( total_pct < 100 && ${#MTP_CLASSES[@]} > 0 )); then
+        local deficit=$(( 100 - total_pct ))
+        printf '%b  Note: percentages sum to %d%%. Adjusting last class by +%d%%.%b\n' \
+            "$YELLOW" "$total_pct" "$deficit" "$NC"
+        # Adjust the last class's percentage
+        local last_idx=$(( ${#MTP_CLASSES[@]} - 1 ))
+        local last="${MTP_CLASSES[$last_idx]}"
+        local lp ln ld lb ll
+        IFS=':' read -r lp ln ld lb ll <<< "$last"
+        ln=$(( ln + deficit ))
+        MTP_CLASSES[$last_idx]="${lp}:${ln}:${ld}:${lb}:${ll}"
+    fi
+
+    echo ""
+}
+
+# ---------------------------------------------------------------------------
+# _mtp_configure_targets
+#
+# For each class in MTP_CLASSES, prompts for target IP and port.
+# Stores results in MTP_TARGETS and MTP_PORTS parallel arrays.
+# ---------------------------------------------------------------------------
+_mtp_configure_targets() {
+    local inner=$(( COLS - 2 ))
+    MTP_TARGETS=()
+    MTP_PORTS=()
+    MTP_DURATIONS=()
+    MTP_BINDS=()
+    MTP_VRFS=()
+
+    printf '+%s+\n' "$(rpt '=' $inner)"
+    bcenter "${BOLD}${CYAN}Configure Targets for Each Traffic Class${NC}"
+    printf '+%s+\n' "$(rpt '=' $inner)"
+    echo ""
+
+    # Global duration
+    local duration
+    while true; do
+        read -r -p "  Test duration in seconds (0=unlimited) [60]: " duration </dev/tty
+        duration="${duration:-60}"
+        validate_duration "$duration" && break
+        printf '%b  Enter a non-negative integer.%b\n' "$RED" "$NC"
+    done
+    local dur_val=0
+    [[ "$duration" != "0" ]] && dur_val=$(( 10#$duration ))
+
+    # Global bind IP (optional)
+    echo ""
+    printf '%b  -- Source Bind IP (optional, Enter to skip) --%b\n' "$CYAN" "$NC"
+    local global_bind=""
+    read -r -p "  Bind source IP or Enter for auto: " global_bind </dev/tty
+    if [[ -n "$global_bind" ]] && ! validate_ip "$global_bind"; then
+        printf '%b  Invalid IP — using auto.%b\n' "$YELLOW" "$NC"
+        global_bind=""
+    fi
+
+    echo ""
+    local last_target="" last_port=5200
+
+    local ci
+    for (( ci=0; ci<${#MTP_CLASSES[@]}; ci++ )); do
+        local class="${MTP_CLASSES[$ci]}"
+        local cproto cpct cdscp cbw clabel
+        IFS=':' read -r cproto cpct cdscp cbw clabel <<< "$class"
+
+        printf '%b  Class %d: %s  (%d%%)%b\n' \
+            "$CYAN" "$(( ci + 1 ))" "$clabel" "$cpct" "$NC"
+
+        # Target IP
+        local tgt_prompt="  Target IP"
+        [[ -n "$last_target" ]] && tgt_prompt="  Target IP [${last_target}]"
+        local tgt
+        while true; do
+            read -r -p "${tgt_prompt}: " tgt </dev/tty
+            tgt="${tgt:-$last_target}"
+            [[ -z "$tgt" ]] && {
+                printf '%b  Target IP is required.%b\n' "$RED" "$NC"
+                continue
+            }
+            validate_ip "$tgt" && break
+            printf '%b  Invalid IP address.%b\n' "$RED" "$NC"
+        done
+        last_target="$tgt"
+
+        # Port
+        local default_port=$(( last_port + 1 ))
+        local port
+        while true; do
+            read -r -p "  Server port [${default_port}]: " port </dev/tty
+            port="${port:-$default_port}"
+            validate_port "$port" && { port=$(( 10#$port )); break; }
+            printf '%b  Invalid port.%b\n' "$RED" "$NC"
+        done
+        last_port=$port
+
+        MTP_TARGETS+=("$tgt")
+        MTP_PORTS+=("$port")
+        MTP_DURATIONS+=("$dur_val")
+        MTP_BINDS+=("$global_bind")
+        MTP_VRFS+=("")
+        echo ""
+    done
+}
+
+# ---------------------------------------------------------------------------
+# _mtp_calculate_streams
+#
+# Given MTP_CLASSES and a total stream count, calculates per-class stream
+# counts and builds the flat stream configuration arrays that the launch
+# machinery expects (S_PROTO, S_TARGET, S_PORT, etc.).
+#
+# Uses a largest-remainder method to distribute streams so they sum exactly
+# to the requested total without rounding errors.
+# ---------------------------------------------------------------------------
+_mtp_calculate_streams() {
+    local total_streams="$1"
+    local inner=$(( COLS - 2 ))
+
+    local n_classes=${#MTP_CLASSES[@]}
+
+    # ── Step 1: Calculate raw (fractional) stream counts ──────────────────
+    local -a raw_counts=()
+    local -a floor_counts=()
+    local -a remainders=()
+
+    local ci
+    for (( ci=0; ci<n_classes; ci++ )); do
+        local class="${MTP_CLASSES[$ci]}"
+        local cpct
+        IFS=':' read -r _ cpct _ _ _ <<< "$class"
+
+        # raw = total_streams * pct / 100  (scaled by 1000 for integer math)
+        local raw=$(( total_streams * cpct * 1000 / 100 ))
+        local floor=$(( raw / 1000 ))
+        local remainder=$(( raw % 1000 ))
+
+        (( floor < 1 )) && floor=1   # every class gets at least 1 stream
+        raw_counts+=("$raw")
+        floor_counts+=("$floor")
+        remainders+=("$remainder")
+    done
+
+    # ── Step 2: Largest-remainder method to hit exactly total_streams ──────
+    local floor_sum=0
+    for f in "${floor_counts[@]}"; do
+        floor_sum=$(( floor_sum + f ))
+    done
+    local deficit=$(( total_streams - floor_sum ))
+
+    # Sort class indices by remainder descending to assign extra streams
+    local -a sorted_indices=()
+    for (( ci=0; ci<n_classes; ci++ )); do
+        sorted_indices+=("$ci")
+    done
+    # Bubble sort by remainder descending (n_classes is always ≤ 5)
+    local swapped=1
+    while (( swapped )); do
+        swapped=0
+        local si
+        for (( si=0; si<${#sorted_indices[@]}-1; si++ )); do
+            local a="${sorted_indices[$si]}"
+            local b="${sorted_indices[$(( si+1 ))]}"
+            if (( remainders[$a] < remainders[$b] )); then
+                sorted_indices[$si]=$b
+                sorted_indices[$(( si+1 ))]=$a
+                swapped=1
+            fi
+        done
+    done
+
+    local -a final_counts=()
+    for (( ci=0; ci<n_classes; ci++ )); do
+        final_counts+=("${floor_counts[$ci]}")
+    done
+    for (( si=0; si<deficit && si<n_classes; si++ )); do
+        local idx="${sorted_indices[$si]}"
+        final_counts[$idx]=$(( final_counts[$idx] + 1 ))
+    done
+
+    # ── Step 3: Display the calculated allocation ──────────────────────────
+    printf '+%s+\n' "$(rpt '=' $inner)"
+    bcenter "${BOLD}${CYAN}Traffic Mix — Stream Allocation${NC}"
+    printf '+%s+\n' "$(rpt '=' $inner)"
+
+    local C_CL=3 C_LB=28 C_PR=5 C_PC=5 C_SC=7 C_BW=12
+    bleft "${BOLD}$(printf '%-*s  %-*s  %-*s  %-*s  %-*s  %-*s' \
+        $C_CL '#' $C_LB 'Class' $C_PR 'Proto' $C_PC 'Pct' \
+        $C_SC 'Streams' $C_BW 'BW/Stream')${NC}"
+    printf '+%s+\n' "$(rpt '-' $inner)"
+
+    local total_check=0
+    for (( ci=0; ci<n_classes; ci++ )); do
+        local class="${MTP_CLASSES[$ci]}"
+        local cproto cpct cdscp cbw clabel
+        IFS=':' read -r cproto cpct cdscp cbw clabel <<< "$class"
+        local sc="${final_counts[$ci]}"
+        total_check=$(( total_check + sc ))
+        local bw_disp="${cbw:-unlimited}"
+        [[ "$bw_disp" == "0" ]] && bw_disp="unlimited"
+
+        local row
+        printf -v row '%-*s  %-*s  %-*s  %-*s  %-*s  %-*s' \
+            $C_CL "$(( ci+1 ))" \
+            $C_LB "$clabel" \
+            $C_PR "$cproto" \
+            $C_PC "${cpct}%" \
+            $C_SC "$sc" \
+            $C_BW "$bw_disp"
+        local rlen=${#row}
+        local rp=$(( inner - 2 - rlen - 1 ))
+        (( rp < 0 )) && rp=0
+        printf '|  %s%s|\n' "$row" "$(rpt ' ' $rp)"
+    done
+
+    printf '+%s+\n' "$(rpt '-' $inner)"
+    bleft "  ${BOLD}Total streams: ${total_check}${NC}   distributed across ${n_classes} traffic class(es)"
+    printf '+%s+\n' "$(rpt '=' $inner)"
+    echo ""
+
+    # ── Step 4: Populate stream configuration arrays ───────────────────────
+    # Reset all stream arrays
+    S_PROTO=();    S_TARGET=();    S_PORT=();      S_BW=()
+    S_DURATION=(); S_DSCP_NAME=(); S_DSCP_VAL=();  S_PARALLEL=()
+    S_REVERSE=();  S_CCA=();       S_WINDOW=();     S_MSS=()
+    S_BIND=();     S_VRF=();       S_DELAY=();      S_JITTER=()
+    S_LOSS=();     S_NOFQ=();      S_LOGFILE=();    S_SCRIPT=()
+    S_START_TS=(); S_STATUS_CACHE=(); S_ERROR_MSG=()
+    S_FINAL_SENDER_BW=(); S_FINAL_RECEIVER_BW=()
+    S_BIDIR=()
+
+    local stream_idx=0
+    for (( ci=0; ci<n_classes; ci++ )); do
+        local class="${MTP_CLASSES[$ci]}"
+        local cproto cpct cdscp cbw clabel
+        IFS=':' read -r cproto cpct cdscp cbw clabel <<< "$class"
+
+        local sc="${final_counts[$ci]}"
+        local tgt="${MTP_TARGETS[$ci]:-}"
+        local port="${MTP_PORTS[$ci]:-5201}"
+        local dur="${MTP_DURATIONS[$ci]:-60}"
+        local bind="${MTP_BINDS[$ci]:-}"
+
+        # Resolve DSCP value
+        local dscp_val=-1
+        if [[ -n "$cdscp" ]]; then
+            dscp_val=$(dscp_name_to_value "$cdscp")
+            [[ "$dscp_val" == "-1" ]] && { cdscp=""; dscp_val=-1; }
+        fi
+
+        # Per-stream bandwidth
+        local bw_str=""
+        if [[ "$cbw" != "0" && -n "$cbw" ]]; then
+            bw_str="$cbw"
+        elif [[ "$cproto" == "UDP" ]]; then
+            bw_str="1M"   # safe default for UDP
+        fi
+
+        local si
+        for (( si=0; si<sc; si++ )); do
+            # Increment port for each stream within the same class
+            local stream_port=$(( port + si ))
+
+            S_PROTO+=("$cproto")
+            S_TARGET+=("$tgt")
+            S_PORT+=("$stream_port")
+            S_BW+=("$bw_str")
+            S_DURATION+=("$dur")
+            S_DSCP_NAME+=("$cdscp")
+            S_DSCP_VAL+=("$dscp_val")
+            S_PARALLEL+=(1)
+            S_REVERSE+=(0)
+            S_CCA+=("")
+            S_WINDOW+=("")
+            S_MSS+=("")
+            S_BIND+=("$bind")
+            S_VRF+=("")
+            S_DELAY+=("")
+            S_JITTER+=("")
+            S_LOSS+=("")
+            S_NOFQ+=(0)
+            S_LOGFILE+=("")
+            S_SCRIPT+=("")
+            S_START_TS+=(0)
+            S_STATUS_CACHE+=("STARTING")
+            S_ERROR_MSG+=("")
+            S_FINAL_SENDER_BW+=("")
+            S_FINAL_RECEIVER_BW+=("")
+            S_BIDIR+=(0)
+            (( stream_idx++ ))
+        done
+    done
+
+    STREAM_COUNT=$stream_idx
+}
+
+# ---------------------------------------------------------------------------
+# _mtp_show_summary
+#
+# Displays a professional summary of the generated stream configuration
+# grouped by traffic class before launch confirmation.
+# ---------------------------------------------------------------------------
+_mtp_show_summary() {
+    local inner=$(( COLS - 2 ))
+    printf '+%s+\n' "$(rpt '=' $inner)"
+    bcenter "${BOLD}${CYAN}Mixed Traffic Configuration Summary${NC}"
+    printf '+%s+\n' "$(rpt '=' $inner)"
+
+    local C_SN=3 C_CL=24 C_PR=5 C_TG=15 C_PO=5 C_BW=13 C_DS=6 C_DU=6
+    bleft "${BOLD}$(printf '%-*s  %-*s  %-*s  %-*s  %*s  %-*s  %-*s  %*s' \
+        $C_SN '#' $C_CL 'Class' $C_PR 'Proto' $C_TG 'Target' \
+        $C_PO 'Port' $C_BW 'Bandwidth' $C_DS 'DSCP' $C_DU 'Dur')${NC}"
+    printf '+%s+\n' "$(rpt '-' $inner)"
+
+    local i
+    for (( i=0; i<STREAM_COUNT; i++ )); do
+        local sn=$(( i + 1 ))
+        local tgt="${S_TARGET[$i]:-?}"
+        (( ${#tgt} > C_TG )) && tgt="${tgt:0:$(( C_TG-1 ))}~"
+        local bw="${S_BW[$i]:-unlimited}"
+        [[ -z "$bw" ]] && bw="unlimited"
+        local dscp="${S_DSCP_NAME[$i]:----}"
+        [[ -z "$dscp" ]] && dscp="---"
+        local dur="${S_DURATION[$i]:-0}"
+        [[ "$dur" == "0" ]] && dur="inf" || dur="${dur}s"
+
+        # Find which class this stream belongs to (derive from DSCP+proto)
+        local class_label=""
+        local ci2
+        for (( ci2=0; ci2<${#MTP_CLASSES[@]}; ci2++ )); do
+            local cl="${MTP_CLASSES[$ci2]}"
+            local cp cd cb clb
+            IFS=':' read -r cp _ cd cb clb <<< "$cl"
+            if [[ "$cp" == "${S_PROTO[$i]}" && "$cd" == "${S_DSCP_NAME[$i]}" ]]; then
+                class_label="$clb"
+                break
+            fi
+        done
+        (( ${#class_label} > C_CL )) && class_label="${class_label:0:$(( C_CL-1 ))}~"
+
+        local row
+        printf -v row '%-*s  %-*s  %-*s  %-*s  %*s  %-*s  %-*s  %*s' \
+            $C_SN "$sn" \
+            $C_CL "$class_label" \
+            $C_PR "${S_PROTO[$i]}" \
+            $C_TG "$tgt" \
+            $C_PO "${S_PORT[$i]}" \
+            $C_BW "$bw" \
+            $C_DS "$dscp" \
+            $C_DU "$dur"
+        local rlen=${#row}
+        local rp=$(( inner - 2 - rlen - 1 ))
+        (( rp < 0 )) && rp=0
+        printf '|  %s%s|\n' "$row" "$(rpt ' ' $rp)"
+    done
+
+    printf '+%s+\n' "$(rpt '=' $inner)"
+    bleft "  ${GREEN}${BOLD}${STREAM_COUNT} streams${NC} configured across ${#MTP_CLASSES[@]} traffic class(es)"
+    printf '+%s+\n' "$(rpt '=' $inner)"
+    echo ""
+}
+
+# ---------------------------------------------------------------------------
+# run_mixed_traffic_mode
+#
+# Main entry point for the Mixed Traffic Pattern Generator.
+# Orchestrates preset selection or custom definition, target configuration,
+# stream calculation, and launch.
+# ---------------------------------------------------------------------------
+run_mixed_traffic_mode() {
+    echo ""
+    local inner=$(( COLS - 2 ))
+    printf '+%s+\n' "$(rpt '=' $inner)"
+    bcenter "${BOLD}${CYAN}Mixed Traffic Pattern Generator${NC}"
+    printf '+%s+\n' "$(rpt '=' $inner)"
+    bleft "  Define a traffic mix by percentage. Streams are calculated"
+    bleft "  and configured automatically based on your mix definition."
+    printf '+%s+\n' "$(rpt '=' $inner)"
+    echo ""
+
+    # ── Step 1: Select or define the mix ──────────────────────────────────
+    _mtp_show_presets
+
+    local preset_choice
+    while true; do
+        read -r -p "  Select preset [1-6]: " preset_choice </dev/tty
+        [[ "$preset_choice" =~ ^[1-6]$ ]] && break
+        printf '%b  Enter 1-6.%b\n' "$RED" "$NC"
+    done
+
+    _mtp_load_preset "$preset_choice"
+
+    if [[ "$preset_choice" == "6" ]]; then
+        _mtp_define_custom_mix
+        if (( ${#MTP_CLASSES[@]} == 0 )); then
+            printf '%b  No classes defined. Returning to menu.%b\n' "$RED" "$NC"
+            return 1
+        fi
+    fi
+
+    echo ""
+
+    # ── Step 2: Total stream count ─────────────────────────────────────────
+    local total_streams
+    while true; do
+        read -r -p "  Total number of streams to generate [10]: " \
+            total_streams </dev/tty
+        total_streams="${total_streams:-10}"
+        if [[ "$total_streams" =~ ^[0-9]+$ ]] && \
+           (( total_streams >= ${#MTP_CLASSES[@]} && total_streams <= 64 )); then
+            break
+        fi
+        printf '%b  Enter %d-%d (minimum 1 per class).%b\n' \
+            "$RED" "${#MTP_CLASSES[@]}" 64 "$NC"
+    done
+
+    echo ""
+
+    # ── Step 3: Configure targets ──────────────────────────────────────────
+    _mtp_configure_targets
+
+    echo ""
+
+    # ── Step 4: Calculate stream allocation ───────────────────────────────
+    _mtp_calculate_streams "$total_streams"
+
+    # ── Step 5: Display summary and confirm ───────────────────────────────
+    _mtp_show_summary
+
+    confirm_proceed "Launch ${STREAM_COUNT} mixed traffic stream(s)?" || return 0
+
+    # ── Step 6: Pre-flight, MTU discovery, and launch ─────────────────────
+    apply_netem
+
+    echo ""
+    if ! run_preflight_checks; then
+        if (( ${#NETEM_IFACES[@]} > 0 )); then
+            local iface
+            for iface in "${NETEM_IFACES[@]}"; do
+                tc qdisc del dev "$iface" root 2>/dev/null
+            done
+            NETEM_IFACES=()
+        fi
+        return 1
+    fi
+
+    run_pmtu_discovery
+
+    local _pmtu_critical=0
+    if (( BASH_MAJOR >= 4 )); then
+        local _pmtu_key
+        for _pmtu_key in "${!PMTU_STATUS[@]}"; do
+            [[ "${PMTU_STATUS[$_pmtu_key]}" == "CRITICAL" ]] && \
+                _pmtu_critical=1 && break
+        done
+    fi
+
+    if (( _pmtu_critical )); then
+        printf '%b  CRITICAL path MTU on one or more paths.%b\n' "$RED" "$NC"
+        if ! confirm_proceed "Proceed despite MTU warnings?"; then
+            return 1
+        fi
+    fi
+
+    echo ""
+    launch_clients
+    echo ""
+    printf '%b  Mixed traffic streams running. Opening dashboard...%b\n' \
+        "$GREEN" "$NC"
+    sleep 1
+    run_dashboard "client"
+    echo ""
+
+    parse_final_results
+    display_results_table
+    offer_log_view
+
+    local _ci
+    for (( _ci=0; _ci<STREAM_COUNT; _ci++ )); do
+        _cleanup_stream_files "$_ci"
+    done
+}
+
+
+
+
 run_client_mode() {
     echo ""; print_header "Client Mode"; echo ""
     local n
@@ -9375,19 +10109,20 @@ show_main_menu() {
     _menu_item "2" "Server Mode"         "Launch one or more iperf3 listeners"
     _menu_item "3" "Client Mode"         "Generate traffic streams with full QoS control"
     _menu_item "4" "Loopback Test"       "Self-contained server + client validation"
+    _menu_item "5" "Mixed Traffic"       "Generate streams from a traffic mix definition"
     printf '+%s+\n' "$(rpt '-' $inner)"
 
     # ── REFERENCE section ─────────────────────────────────────────────────
     _menu_section "REFERENCE"
     printf '+%s+\n' "$(rpt '-' $inner)"
-    _menu_item "5" "DSCP Reference"      "DSCP / TOS / EF / AF / CS class mappings"
-    _menu_item "6" "Colour Theme"        "Dark · Light · Mono  (active: ${THEME_CURRENT:-dark})"
+    _menu_item "6" "DSCP Reference"      "DSCP / TOS / EF / AF / CS class mappings"
+    _menu_item "7" "Colour Theme"        "Dark · Light · Mono  (active: ${THEME_CURRENT:-dark})"
     printf '+%s+\n' "$(rpt '-' $inner)"
 
     # ── SESSION section ───────────────────────────────────────────────────
     _menu_section "SESSION"
     printf '+%s+\n' "$(rpt '-' $inner)"
-    _menu_item "7" "Exit"                ""
+    _menu_item "8" "Exit"                ""
     printf '+%s+\n' "$(rpt '=' $inner)"
     echo ""
 }
@@ -9396,7 +10131,7 @@ main_menu() {
     while true; do
         show_main_menu
         local choice
-        read -r -p "  Select [1-7]: " choice </dev/tty
+        read -r -p "  Select [1-8]: " choice </dev/tty
         case "$choice" in
             1)
                 echo ""; build_vrf_maps; get_interface_list
@@ -9463,12 +10198,37 @@ main_menu() {
                 S_CWND_CURRENT=(); S_CWND_MIN=(); S_CWND_MAX=()
                 S_CWND_FINAL=(); S_CWND_SAMPLES=(); S_CWND_HISTORY=()
                 ;;
+
             5)
+                build_vrf_maps; get_interface_list; run_mixed_traffic_mode; echo ""
+                read -r -p "  Press Enter to return to menu..." </dev/tty
+                STREAM_COUNT=0
+                MTP_CLASSES=(); MTP_TARGETS=(); MTP_PORTS=()
+                MTP_DURATIONS=(); MTP_BINDS=(); MTP_VRFS=()
+                S_PROTO=();  S_TARGET=(); S_PORT=();   S_BW=()
+                S_DURATION=(); S_DSCP_NAME=(); S_DSCP_VAL=()
+                S_PARALLEL=(); S_REVERSE=(); S_CCA=()
+                S_WINDOW=();   S_MSS=();    S_BIND=()
+                S_VRF=();      S_DELAY=();  S_JITTER=(); S_LOSS=()
+                S_NOFQ=();     S_LOGFILE=(); S_SCRIPT=()
+                S_START_TS=(); S_STATUS_CACHE=(); S_ERROR_MSG=()
+                S_FINAL_SENDER_BW=(); S_FINAL_RECEIVER_BW=()
+                STREAM_PIDS=(); PING_PIDS=(); PING_LOGFILES=()
+                S_RTT_MIN=();  S_RTT_AVG=();  S_RTT_MAX=()
+                S_RTT_JITTER=(); S_RTT_LOSS=(); S_RTT_SAMPLES=()
+                S_CWND_CURRENT=(); S_CWND_MIN=(); S_CWND_MAX=()
+                S_CWND_FINAL=(); S_CWND_SAMPLES=(); S_CWND_HISTORY=()
+                S_BIDIR=()
+                if (( BASH_MAJOR >= 4 )); then
+                    PMTU_RESULTS=(); PMTU_STATUS=(); PMTU_RECOMMEND=()
+                fi
+                ;;
+            6)
                 echo ""; show_dscp_table
                 read -r -p "  Press Enter to return to menu..." </dev/tty ;;
-            6)
+            7)
                 show_theme_menu ;;
-            7|q|Q)
+            8|q|Q)
                 echo ""; printf '%b\n' "${GREEN}  Goodbye! Cleaning up...${NC}"; echo "";
                 cleanup "user exit (option 7)"
                 exit 0 ;;
