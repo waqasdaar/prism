@@ -2,7 +2,7 @@
 # =============================================================================
 # PRISM — Performance Real-time iPerf3 Stream Manager
 # Enterprise-grade multi-stream traffic orchestration with live QoS dashboard
-# Version: 8.3.3
+# Version: 8.3.4
 # Author : Waqas Daar (waqasdaar@gmail.com)
 # =============================================================================
 
@@ -612,6 +612,30 @@ declare -a S_CWND_FINAL=()      # last cwnd value at stream end
 declare -a S_CWND_SAMPLES=()    # number of cwnd samples collected
 declare -a S_CWND_SUM=()        # running sum for average calculation
 
+# Per-stream traffic ramp-up profile fields
+# When S_RAMP_ENABLED[$i]=1 the stream starts at near-zero bandwidth,
+# linearly ramps to S_BW[$i] over S_RAMP_UP[$i] seconds, holds at full
+# rate for the test duration, then ramps down over S_RAMP_DOWN[$i] seconds.
+#
+# The ramp engine runs as a background process writing bandwidth commands
+# to the iperf3 process via the tc token bucket shaper (TCP) or by
+# relaunching iperf3 with escalating -b values (UDP).
+#
+# Timeline ring buffer stores normalised throughput levels (0-8) for
+# ASCII sparkline rendering. One sample per dashboard tick (1 sec).
+#   _RAMP_TIMELINE_<idx>   colon-separated ring of level values
+
+declare -a S_RAMP_ENABLED=()   # 1 = ramp profile active for this stream
+declare -a S_RAMP_UP=()        # ramp-up duration in seconds
+declare -a S_RAMP_DOWN=()      # ramp-down duration in seconds
+declare -a S_RAMP_STEPS=()     # number of steps in each ramp phase
+declare -a S_RAMP_PHASE=()     # current phase: RAMPUP|HOLD|RAMPDOWN|DONE
+declare -a S_RAMP_PHASE_TS=()  # epoch timestamp when current phase started
+declare -a S_RAMP_BW_CURRENT=()  # current effective bandwidth string
+declare -a S_RAMP_BW_TARGET=()   # final target bandwidth string
+declare -a S_RAMP_IFACE=()     # egress interface for tc shaping (TCP)
+declare -a S_RAMP_TC_ACTIVE=() # 1 = tc qdisc installed for this stream
+
 # When a stream is configured for bidirectional simultaneous testing, a second
 # iperf3 process is launched with --reverse (-R) alongside the forward stream.
 # Both processes run in parallel for the full test duration.
@@ -699,6 +723,434 @@ _spark_bw_to_bps() {
         else                       bps = val
         printf "%d", bps
     }'
+}
+
+# ---------------------------------------------------------------------------
+# _ramp_bw_to_bps  <bw_string>
+#
+# Converts a bandwidth string with unit suffix to integer bps.
+# Accepts: 100M  500K  1G  10  (bare integer = bps)
+# Returns integer bps string or "0" on failure.
+# ---------------------------------------------------------------------------
+_ramp_bw_to_bps() {
+    local raw="$1"
+    [[ -z "$raw" || "$raw" == "0" || "$raw" == "---" ]] && { printf '0'; return; }
+    printf '%s' "$raw" | awk '
+    {
+        # Strip trailing unit suffix from the value
+        val = $1 + 0
+        unit = toupper($1)
+        gsub(/[0-9.]/,"",unit)       # isolate the suffix letters
+        if      (unit ~ /G/) bps = val * 1e9
+        else if (unit ~ /M/) bps = val * 1e6
+        else if (unit ~ /K/) bps = val * 1e3
+        else                 bps = val
+        printf "%d", bps
+    }'
+}
+
+# ---------------------------------------------------------------------------
+# _ramp_bps_to_bw  <bps_integer>
+#
+# Converts an integer bps value to a human-readable bandwidth string
+# suitable for passing to iperf3 -b or tc tbf rate.
+# Returns e.g. "94M", "512K", "1G"
+# ---------------------------------------------------------------------------
+_ramp_bps_to_bw() {
+    local bps="$1"
+    [[ -z "$bps" || "$bps" == "0" ]] && { printf '1K'; return; }
+    awk -v b="$bps" 'BEGIN {
+        if      (b >= 1e9) printf "%.0fG", b/1e9
+        else if (b >= 1e6) printf "%.0fM", b/1e6
+        else if (b >= 1e3) printf "%.0fK", b/1e3
+        else               printf "%.0f",  b
+    }'
+}
+
+# ---------------------------------------------------------------------------
+# _ramp_timeline_push  <idx>  <bw_current_string>  <bw_target_bps>
+#
+# Appends one normalised level (0-8) to the ramp timeline ring buffer.
+# The level is computed relative to the target bandwidth so the curve
+# accurately reflects the ramp shape.
+# Ring depth: _RAMP_TIMELINE_DEPTH samples (matches test duration window).
+# ---------------------------------------------------------------------------
+readonly _RAMP_TIMELINE_DEPTH=60   # retain up to 60 seconds of history
+
+_ramp_timeline_push() {
+    local idx="$1"
+    local bw_cur_str="$2"
+    local bw_target_bps="$3"
+
+    local varname="_RAMP_TIMELINE_${idx}"
+
+    # Convert current BW to bps
+    local cur_bps
+    cur_bps=$(_ramp_bw_to_bps "$bw_cur_str")
+
+    # Normalise to level 0-8
+    local level=0
+    if [[ -n "$bw_target_bps" ]] && (( bw_target_bps > 0 )) && \
+       [[ -n "$cur_bps" ]] && (( cur_bps > 0 )); then
+        level=$(awk -v c="$cur_bps" -v t="$bw_target_bps" '
+            BEGIN {
+                ratio = c / t
+                if (ratio > 1) ratio = 1
+                lvl = int(ratio * 8 + 0.5)
+                if (lvl < 0) lvl = 0
+                if (lvl > 8) lvl = 8
+                print lvl
+            }')
+    fi
+
+    local existing=""
+    eval "existing=\"\${${varname}:-}\""
+
+    local updated
+    if [[ -z "$existing" ]]; then
+        updated="$level"
+    else
+        updated="${existing}:${level}"
+    fi
+
+    # Trim to depth
+    local trimmed
+    trimmed=$(printf '%s' "$updated" | awk -v d="$_RAMP_TIMELINE_DEPTH" '
+        BEGIN { FS=":"; OFS=":" }
+        {
+            n = split($0, a, ":")
+            start = (n > d) ? n - d + 1 : 1
+            out = ""
+            for (i=start; i<=n; i++) out = (out=="") ? a[i] : out ":" a[i]
+            print out
+        }')
+
+    eval "${varname}=\"\${trimmed}\""
+}
+
+# ---------------------------------------------------------------------------
+# _ramp_timeline_render  <idx>  <width>
+#
+# Renders the ramp timeline as a fixed-width ASCII curve.
+#
+# Characters used (ascending intensity):
+#   0 = · (no traffic)
+#   1 = ▁   2 = ▂   3 = ▃   4 = ▄
+#   5 = ▅   6 = ▆   7 = ▇   8 = █
+#
+# Left-pads with '·' when fewer than <width> samples exist so the field
+# is always exactly <width> printable characters wide.
+# ---------------------------------------------------------------------------
+_ramp_timeline_render() {
+    local idx="$1"
+    local width="${2:-30}"
+    local varname="_RAMP_TIMELINE_${idx}"
+    local buf=""
+    eval "buf=\"\${${varname}:-}\""
+
+    if [[ -z "$buf" ]]; then
+        local d="" k
+        for (( k=0; k<width; k++ )); do d+='·'; done
+        printf '%s' "$d"
+        return
+    fi
+
+    printf '%s' "$buf" | awk \
+        -v width="$width" \
+        'BEGIN {
+            FS = ":"
+            ch[0] = "\302\267"        # · U+00B7 middle dot
+            ch[1] = "\342\226\201"    # ▁ U+2581
+            ch[2] = "\342\226\202"    # ▂ U+2582
+            ch[3] = "\342\226\203"    # ▃ U+2583
+            ch[4] = "\342\226\204"    # ▄ U+2584
+            ch[5] = "\342\226\205"    # ▅ U+2585
+            ch[6] = "\342\226\206"    # ▆ U+2586
+            ch[7] = "\342\226\207"    # ▇ U+2587
+            ch[8] = "\342\226\210"    # █ U+2588
+        }
+        {
+            n = split($0, a, ":")
+            # Take only the last <width> samples
+            start = (n > width) ? n - width + 1 : 1
+            out = ""
+            for (i = start; i <= n; i++) {
+                lvl = int(a[i] + 0)
+                if (lvl < 0) lvl = 0
+                if (lvl > 8) lvl = 8
+                out = out ch[lvl]
+            }
+            # Left-pad with dots
+            dots_needed = width - (n - start + 1)
+            dots = ""
+            for (i = 1; i <= dots_needed; i++) dots = dots ch[0]
+            printf "%s%s", dots, out
+        }'
+}
+
+# ---------------------------------------------------------------------------
+# _ramp_timeline_clear  <idx>
+# Resets the timeline ring buffer to empty.
+# ---------------------------------------------------------------------------
+_ramp_timeline_clear() {
+    local idx="$1"
+    local varname="_RAMP_TIMELINE_${idx}"
+    eval "${varname}=\"\""
+}
+
+# ---------------------------------------------------------------------------
+# _ramp_apply_tc  <idx>  <rate_bps>
+#
+# Installs or updates a tc tbf (Token Bucket Filter) qdisc on the egress
+# interface for stream <idx> to shape TCP traffic to <rate_bps> bps.
+#
+# Uses S_RAMP_IFACE[$idx] which is resolved once during ramp setup.
+# Called from _ramp_tick on every ramp step for TCP streams.
+#
+# Burst and latency parameters:
+#   burst  = rate * 10ms  (minimum 4096 bytes per tc requirement)
+#   latency = 50ms        (maximum queuing delay tolerated)
+# ---------------------------------------------------------------------------
+_ramp_apply_tc() {
+    local idx="$1"
+    local rate_bps="$2"
+    local iface="${S_RAMP_IFACE[$idx]:-}"
+
+    [[ -z "$iface" || "$iface" == "lo" || "$iface" == "lo0" ]] && return 0
+    [[ "$OS_TYPE" == "macos" ]] && return 0
+    (( IS_ROOT == 0 )) && return 0
+
+    # Minimum rate guard — tc requires at least 1 bit/s
+    (( rate_bps < 1000 )) && rate_bps=1000
+
+    # Calculate burst: rate * 10ms, minimum 4096 bytes
+    local burst_bytes
+    burst_bytes=$(awk -v r="$rate_bps" 'BEGIN { b=int(r*0.01/8); print (b<4096)?4096:b }')
+
+    # Remove existing qdisc (suppress error if none exists)
+    tc qdisc del dev "$iface" root 2>/dev/null || true
+
+    # Install tbf
+    tc qdisc add dev "$iface" root tbf \
+        rate "${rate_bps}bit" \
+        burst "${burst_bytes}" \
+        latency 50ms 2>/dev/null
+
+    S_RAMP_TC_ACTIVE[$idx]=1
+}
+
+# ---------------------------------------------------------------------------
+# _ramp_remove_tc  <idx>
+#
+# Removes the tc tbf qdisc installed by _ramp_apply_tc.
+# Called when the ramp completes (DONE phase) or stream cleanup runs.
+# ---------------------------------------------------------------------------
+_ramp_remove_tc() {
+    local idx="$1"
+    local iface="${S_RAMP_IFACE[$idx]:-}"
+
+    [[ -z "$iface" || "${S_RAMP_TC_ACTIVE[$idx]:-0}" != "1" ]] && return 0
+    [[ "$OS_TYPE" == "macos" ]] && return 0
+
+    tc qdisc del dev "$iface" root 2>/dev/null || true
+    S_RAMP_TC_ACTIVE[$idx]=0
+}
+
+# ---------------------------------------------------------------------------
+# _ramp_setup  <idx>
+#
+# Initialises the ramp engine for stream <idx>.
+# Resolves the egress interface, installs initial tc shaping at near-zero
+# rate, and sets phase to RAMPUP.
+#
+# Called from launch_clients after the iperf3 process is launched so the
+# PID and logfile are known.
+# ---------------------------------------------------------------------------
+_ramp_setup() {
+    local idx="$1"
+
+    [[ "${S_RAMP_ENABLED[$idx]:-0}" != "1" ]] && return 0
+
+    local target_bw="${S_BW[$idx]:-}"
+    local proto="${S_PROTO[$idx]:-TCP}"
+
+    # For UDP: target BW is required; for TCP we use tc shaping
+    # TCP streams with no BW limit: use a sensible default for shaping
+    if [[ "$proto" == "TCP" && -z "$target_bw" ]]; then
+        # Default to 100M for shapeable TCP when no limit configured
+        target_bw="100M"
+    fi
+
+    S_RAMP_BW_TARGET[$idx]="$target_bw"
+
+    # Resolve egress interface for tc shaping (TCP only)
+    if [[ "$proto" == "TCP" && "$OS_TYPE" == "linux" && IS_ROOT -eq 1 ]]; then
+        local oif=""
+        local stream_vrf="${S_VRF[$idx]:-}"
+        local stream_target="${S_TARGET[$idx]:-}"
+
+        if [[ -n "$stream_vrf" ]]; then
+            oif=$(ip route get vrf "${stream_vrf}" "${stream_target}" \
+                2>/dev/null | grep -oE '\bdev [^ ]+' | awk '{print $2}' | head -1)
+            [[ -z "$oif" ]] && \
+                oif=$(ip vrf exec "${stream_vrf}" ip route get \
+                    "${stream_target}" 2>/dev/null \
+                    | grep -oE '\bdev [^ ]+' | awk '{print $2}' | head -1)
+        else
+            oif=$(ip route get "${stream_target}" 2>/dev/null \
+                | grep -oE '\bdev [^ ]+' | awk '{print $2}' | head -1)
+        fi
+
+        # Reject loopback — cannot shape loopback
+        if [[ -n "$oif" && "$oif" != "lo" && ! "$oif" =~ ^lo[0-9] ]]; then
+            S_RAMP_IFACE[$idx]="$oif"
+        else
+            S_RAMP_IFACE[$idx]=""
+        fi
+    else
+        S_RAMP_IFACE[$idx]=""
+    fi
+
+    # Set initial phase
+    S_RAMP_PHASE[$idx]="RAMPUP"
+    S_RAMP_PHASE_TS[$idx]=$(date +%s)
+    S_RAMP_TC_ACTIVE[$idx]=0
+
+    # Apply initial near-zero rate for TCP streams
+    if [[ "$proto" == "TCP" && -n "${S_RAMP_IFACE[$idx]}" ]]; then
+        local min_bps=8000    # 8 Kbps floor — enough for TCP handshake
+        _ramp_apply_tc "$idx" "$min_bps"
+        S_RAMP_BW_CURRENT[$idx]=$(_ramp_bps_to_bw "$min_bps")
+    else
+        S_RAMP_BW_CURRENT[$idx]="0"
+    fi
+
+    # Push initial zero sample to timeline
+    local target_bps
+    target_bps=$(_ramp_bw_to_bps "$target_bw")
+    _ramp_timeline_push "$idx" "0" "$target_bps"
+}
+
+# ---------------------------------------------------------------------------
+# _ramp_tick  <idx>
+#
+# Called once per dashboard tick for every stream that has ramp enabled.
+# Computes the current target rate based on elapsed time and phase, then
+# applies it via tc (TCP) or updates S_RAMP_BW_CURRENT (UDP display).
+#
+# Phase transitions:
+#   RAMPUP    → linearly increase from 0 to target over S_RAMP_UP seconds
+#   HOLD      → maintain target rate for the test duration
+#   RAMPDOWN  → linearly decrease from target to 0 over S_RAMP_DOWN seconds
+#   DONE      → remove tc shaping, mark complete
+# ---------------------------------------------------------------------------
+_ramp_tick() {
+    local idx="$1"
+
+    [[ "${S_RAMP_ENABLED[$idx]:-0}" != "1" ]] && return 0
+    [[ "${S_RAMP_PHASE[$idx]:-DONE}" == "DONE" ]] && return 0
+
+    local now
+    now=$(date +%s)
+
+    local phase="${S_RAMP_PHASE[$idx]}"
+    local phase_ts="${S_RAMP_PHASE_TS[$idx]:-$now}"
+    local elapsed=$(( now - phase_ts ))
+
+    local target_bw="${S_RAMP_BW_TARGET[$idx]:-100M}"
+    local target_bps
+    target_bps=$(_ramp_bw_to_bps "$target_bw")
+
+    local ramp_up="${S_RAMP_UP[$idx]:-10}"
+    local ramp_down="${S_RAMP_DOWN[$idx]:-5}"
+    local proto="${S_PROTO[$idx]:-TCP}"
+
+    local effective_bps=$target_bps
+    local new_phase="$phase"
+
+    case "$phase" in
+
+        RAMPUP)
+            if (( elapsed >= ramp_up )); then
+                # Ramp-up complete — transition to HOLD
+                effective_bps=$target_bps
+                new_phase="HOLD"
+                S_RAMP_PHASE_TS[$idx]=$now
+            else
+                # Linear interpolation: min 1% to avoid zero
+                effective_bps=$(awk \
+                    -v t="$target_bps" \
+                    -v e="$elapsed" \
+                    -v r="$ramp_up" \
+                    'BEGIN {
+                        ratio = e / r
+                        if (ratio < 0.01) ratio = 0.01
+                        bps = int(t * ratio)
+                        if (bps < 8000) bps = 8000
+                        print bps
+                    }')
+            fi
+            ;;
+
+        HOLD)
+            effective_bps=$target_bps
+            # Check if the stream duration has elapsed to trigger ramp-down
+            local stream_dur="${S_DURATION[$idx]:-0}"
+            local stream_start="${S_START_TS[$idx]:-$now}"
+            local total_elapsed=$(( now - stream_start ))
+
+            # Ramp-down starts when (total - ramp_down) seconds have elapsed
+            if (( stream_dur > 0 )) && \
+               (( total_elapsed >= stream_dur - ramp_down )) && \
+               (( ramp_down > 0 )); then
+                new_phase="RAMPDOWN"
+                S_RAMP_PHASE_TS[$idx]=$now
+            fi
+            ;;
+
+        RAMPDOWN)
+            if (( elapsed >= ramp_down )); then
+                # Ramp-down complete
+                effective_bps=8000    # floor — keep TCP alive for clean exit
+                new_phase="DONE"
+            else
+                # Linear decrease from target to floor
+                effective_bps=$(awk \
+                    -v t="$target_bps" \
+                    -v e="$elapsed" \
+                    -v r="$ramp_down" \
+                    'BEGIN {
+                        ratio = 1.0 - (e / r)
+                        if (ratio < 0.01) ratio = 0.01
+                        bps = int(t * ratio)
+                        if (bps < 8000) bps = 8000
+                        print bps
+                    }')
+            fi
+            ;;
+
+        DONE)
+            _ramp_remove_tc "$idx"
+            return 0
+            ;;
+    esac
+
+    # Apply rate
+    if [[ "$proto" == "TCP" && -n "${S_RAMP_IFACE[$idx]}" ]]; then
+        _ramp_apply_tc "$idx" "$effective_bps"
+    fi
+
+    # Update state
+    S_RAMP_PHASE[$idx]="$new_phase"
+    S_RAMP_BW_CURRENT[$idx]=$(_ramp_bps_to_bw "$effective_bps")
+
+    # Remove tc when DONE
+    if [[ "$new_phase" == "DONE" ]]; then
+        _ramp_remove_tc "$idx"
+    fi
+
+    # Push to timeline
+    _ramp_timeline_push "$idx" "${S_RAMP_BW_CURRENT[$idx]}" "$target_bps"
 }
 
 # ---------------------------------------------------------------------------
@@ -2238,6 +2690,12 @@ configure_client_streams() {
     S_LOSS=();     S_NOFQ=();      S_LOGFILE=();    S_SCRIPT=()
     S_START_TS=(); S_STATUS_CACHE=(); S_ERROR_MSG=()
     S_FINAL_SENDER_BW=(); S_FINAL_RECEIVER_BW=()
+
+    S_RAMP_ENABLED=(); S_RAMP_UP=();      S_RAMP_DOWN=()
+    S_RAMP_STEPS=();   S_RAMP_PHASE=();   S_RAMP_PHASE_TS=()
+    S_RAMP_BW_CURRENT=(); S_RAMP_BW_TARGET=()
+    S_RAMP_IFACE=();   S_RAMP_TC_ACTIVE=()
+
     local lt="" lp=5200 i
 
     for (( i=0; i<num; i++ )); do
@@ -2736,6 +3194,72 @@ configure_client_streams() {
         fi
         S_BIDIR+=("$bidir")
 
+        # ── Traffic Ramp-Up Profile ───────────────────────────────────────
+        local ramp_enabled=0 ramp_up_secs=0 ramp_down_secs=0
+
+        echo ""
+        printf '%b\n' "${CYAN}  -- Traffic Ramp-Up Profile --${NC}"
+        printf '%b\n' "${DIM}  Ramp from zero to target BW, hold, then ramp down.${NC}"
+        printf '%b\n' "${DIM}  Requires iperf3 duration > 0 and root for TCP tc shaping.${NC}"
+        echo ""
+
+        local ramp_inp
+        read -r -p "  Enable ramp-up profile? [y/N]: " ramp_inp </dev/tty
+        if [[ "$ramp_inp" =~ ^[Yy] ]]; then
+            ramp_enabled=1
+
+            # Ramp-up duration
+            while true; do
+                read -r -p "  Ramp-up duration (seconds) [10]: " \
+                    ramp_up_secs </dev/tty
+                ramp_up_secs="${ramp_up_secs:-10}"
+                if [[ "$ramp_up_secs" =~ ^[0-9]+$ ]] && \
+                   (( ramp_up_secs >= 1 && ramp_up_secs <= 300 )); then
+                    break
+                fi
+                printf '%b\n' "${RED}  Enter 1-300 seconds.${NC}"
+            done
+
+            # Ramp-down duration
+            while true; do
+                read -r -p "  Ramp-down duration (seconds) [5]: " \
+                    ramp_down_secs </dev/tty
+                ramp_down_secs="${ramp_down_secs:-5}"
+                if [[ "$ramp_down_secs" =~ ^[0-9]+$ ]] && \
+                   (( ramp_down_secs >= 0 && ramp_down_secs <= 300 )); then
+                    break
+                fi
+                printf '%b\n' "${RED}  Enter 0-300 seconds (0 = no ramp-down).${NC}"
+            done
+
+            # Sanity check: ramp phases must not exceed stream duration
+            if (( dval > 0 )); then
+                local ramp_total=$(( ramp_up_secs + ramp_down_secs ))
+                if (( ramp_total >= dval )); then
+                    printf '%b\n' \
+                        "${YELLOW}  WARNING: ramp up+down (${ramp_total}s)" \
+                        ">= stream duration (${dval}s). Hold phase will be skipped.${NC}"
+                fi
+            fi
+
+            if (( IS_ROOT == 0 )); then
+                printf '%b\n' \
+                    "${YELLOW}  WARNING: TCP ramp requires root (tc tbf shaping).${NC}"
+                printf '%b\n' \
+                    "${YELLOW}           UDP ramp uses iperf3 -b stepping (no root needed).${NC}"
+            fi
+
+            printf '%b\n' \
+                "${GREEN}  Ramp profile: +${ramp_up_secs}s ↑  hold  ${ramp_down_secs}s ↓${NC}"
+        else
+            printf '%b\n' "${DIM}  No ramp profile — full bandwidth from start.${NC}"
+        fi
+
+        S_RAMP_ENABLED+=("$ramp_enabled")
+        S_RAMP_UP+=("$ramp_up_secs")
+        S_RAMP_DOWN+=("$ramp_down_secs")
+        S_RAMP_STEPS+=(20)    # fixed 20 steps per ramp phase
+
         S_LOGFILE+=(""); S_SCRIPT+=(""); S_START_TS+=(0)
         S_STATUS_CACHE+=("STARTING"); S_ERROR_MSG+=("")
         S_FINAL_SENDER_BW+=(""); S_FINAL_RECEIVER_BW+=("")
@@ -3005,6 +3529,15 @@ show_stream_summary() {
             fi
             [[ "${S_BIDIR[$i]:-0}" == "1" ]] && ex+=" ${GREEN}[BIDIR TX+RX]${NC}"
             [[ -n "$ex" ]] && printf '%b    %s%b\n' "$CYAN" "$ex" "$NC"
+            # Ramp profile annotation
+            if [[ "${S_RAMP_ENABLED[$i]:-0}" == "1" ]]; then
+                printf '%b    ramp: +%ds ↑  hold  %ds ↓  (target: %s)%b\n' \
+                    "$CYAN" \
+                    "${S_RAMP_UP[$i]:-0}" \
+                    "${S_RAMP_DOWN[$i]:-0}" \
+                    "${S_BW[$i]:-unlimited}" \
+                    "$NC"
+            fi
         done
         printf '  %s\n' "$(rpt '-' 72)"
     else
@@ -3453,6 +3986,15 @@ _cleanup_stream_procs() {
     # ── 5. Clear sparkline ring buffers ───────────────────────────────────
     _spark_clear "c" "$idx"
     _spark_clear "r" "$idx"
+
+
+    # ── 5b. Remove ramp tc shaping if active ─────────────────────────────
+    if [[ "${S_RAMP_ENABLED[$idx]:-0}" == "1" ]]; then
+        _ramp_remove_tc "$idx"
+        _ramp_timeline_clear "$idx"
+        S_RAMP_PHASE[$idx]="DONE"
+        S_RAMP_TC_ACTIVE[$idx]=0
+    fi
 
     # ── 6. Set terminal state and post notification ────────────────────────
     S_STATUS_CACHE[$idx]="CLEANED"
@@ -4107,6 +4649,14 @@ launch_clients() {
             S_CWND_FINAL[$i]="---"
             S_CWND_SAMPLES[$i]="0"
             S_CWND_SUM[$i]="0"
+
+            # ── Initialise ramp profile arrays ───────────────────────────────
+            # Sentinel values prevent dashboard display before ramp starts.
+            S_RAMP_PHASE[$i]="RAMPUP"
+            S_RAMP_PHASE_TS[$i]=0
+            S_RAMP_BW_CURRENT[$i]="---"
+            S_RAMP_TC_ACTIVE[$i]=0
+            _ramp_timeline_clear "$i"
             continue
         fi
 
@@ -4136,6 +4686,14 @@ launch_clients() {
         S_CWND_SAMPLES[$i]="0"
         S_CWND_SUM[$i]="0"
 
+        # ── Initialise ramp profile arrays ───────────────────────────────
+        # Sentinel values prevent dashboard display before ramp starts.
+        S_RAMP_PHASE[$i]="RAMPUP"
+        S_RAMP_PHASE_TS[$i]=0
+        S_RAMP_BW_CURRENT[$i]="---"
+        S_RAMP_TC_ACTIVE[$i]=0
+        _ramp_timeline_clear "$i"
+
         # ── Launch the iperf3 client process ─────────────────────────────
         bash "$sf" > "$lf" 2>&1 &
         local pid=$!
@@ -4163,6 +4721,17 @@ launch_clients() {
         #   iperf3 <  3.7: _bidir_launch starts a separate --reverse
         #                  process with a 2-second startup delay.
         _bidir_launch "$i"
+
+        # ── Start ramp profile if configured ─────────────────────────────
+        if [[ "${S_RAMP_ENABLED[$i]:-0}" == "1" ]]; then
+            _ramp_setup "$i"
+            printf '%b[RAMP   ]%b  stream %d  +%ds ↑  hold  %ds ↓  target: %s\n' \
+                "$CYAN" "$NC" \
+                "$sn" \
+                "${S_RAMP_UP[$i]}" \
+                "${S_RAMP_DOWN[$i]}" \
+                "${S_RAMP_BW_TARGET[$i]:-unlimited}"
+        fi
     done
 }
 
@@ -6900,6 +7469,7 @@ _render_client_frame() {
                 _rtt_parse "$i"
                 _bidir_parse_bw "$i"
                 [[ "${S_PROTO[$i]:-TCP}" == "TCP" ]] && _cwnd_parse "$i"
+                [[ "${S_RAMP_ENABLED[$i]:-0}" == "1" ]] && _ramp_tick "$i"
                 ;;
         esac
     done
@@ -7211,6 +7781,41 @@ _render_client_frame() {
             fi
 
             bleft "  ${DIM}cwnd${NC}  ${DIM}cur${NC} ${cw_col}${f_cur}${NC}${DIM}KB${NC}  ${DIM}min${NC} ${CYAN}${f_min}${NC}${DIM}KB${NC}  ${DIM}max${NC} ${YELLOW}${f_max}${NC}${DIM}KB${NC}  ${DIM}avg${NC} ${f_avg}${DIM}KB${NC}"
+        fi
+
+        # ── Ramp timeline row (ramp-enabled streams only) ─────────────────
+        if [[ "${S_RAMP_ENABLED[$i]:-0}" == "1" ]]; then
+            local ramp_phase="${S_RAMP_PHASE[$i]:-RAMPUP}"
+            local ramp_bw_cur="${S_RAMP_BW_CURRENT[$i]:----}"
+            local ramp_tgt="${S_RAMP_BW_TARGET[$i]:----}"
+            local ramp_up_s="${S_RAMP_UP[$i]:-0}"
+            local ramp_dn_s="${S_RAMP_DOWN[$i]:-0}"
+
+            # Phase colour and label
+            local ramp_phase_col ramp_phase_lbl
+            case "$ramp_phase" in
+                RAMPUP)   ramp_phase_col="$GREEN";  ramp_phase_lbl="↑ RAMP UP"   ;;
+                HOLD)     ramp_phase_col="$CYAN";   ramp_phase_lbl="→ HOLD"      ;;
+                RAMPDOWN) ramp_phase_col="$YELLOW"; ramp_phase_lbl="↓ RAMP DOWN" ;;
+                DONE)     ramp_phase_col="$DIM";    ramp_phase_lbl="✓ DONE"      ;;
+                *)        ramp_phase_col="$DIM";    ramp_phase_lbl="  ---"        ;;
+            esac
+
+            # Render 30-char timeline curve
+            local ramp_curve
+            ramp_curve=$(_ramp_timeline_render "$i" 30)
+
+            # Build the ramp row as plain text for bleft alignment.
+            # Layout:  "  ramp [TIMELINE30] PHASE     cur:XXXX tgt:XXXX"
+            # All labels are fixed-width so the row never misaligns.
+            local ramp_phase_fixed
+            ramp_phase_fixed=$(printf '%-11s' "$ramp_phase_lbl")
+
+            local ramp_cur_fixed ramp_tgt_fixed
+            ramp_cur_fixed=$(printf '%6s' "$ramp_bw_cur")
+            ramp_tgt_fixed=$(printf '%6s' "$ramp_tgt")
+
+            bleft "  ${DIM}ramp${NC} ${ramp_phase_col}${ramp_curve}${NC} ${ramp_phase_col}${ramp_phase_fixed}${NC}  ${DIM}cur${NC} ${ramp_phase_col}${ramp_cur_fixed}${NC}  ${DIM}tgt${NC} ${ramp_tgt_fixed}"
         fi
 
         # ── Progress bar row (fixed-duration non-FAILED streams only) ─────
@@ -7573,6 +8178,11 @@ run_dashboard() {
                    [[ ! "$_fctgt" =~ ^127\. && \
                       "$_fctgt" != "::1" ]] && \
                    [[ "${S_CWND_SAMPLES[$_fci]:-0}" != "0" ]]; then
+                    _fc=$(( _fc + 1 ))
+                fi
+
+                # Ramp timeline row — ramp-enabled streams only
+                if [[ "${S_RAMP_ENABLED[$_fci]:-0}" == "1" ]]; then
                     _fc=$(( _fc + 1 ))
                 fi
 
@@ -8056,6 +8666,31 @@ display_results_table() {
             printf '%b' "${DIM}avg${NC} ${rf_avg}${DIM}KB${NC}  "
             printf '%b' "${DIM}final${NC} ${rf_col}${rf_fin}${NC}${DIM}KB${NC}"
             printf '  %b(%d smpl)%b\n' "$DIM" "$rc_smp" "$NC"
+        fi
+
+        # ── Ramp profile summary (ramp-enabled streams only) ──────────────
+        if [[ "${S_RAMP_ENABLED[$i]:-0}" == "1" ]]; then
+            local rs_up="${S_RAMP_UP[$i]:-0}"
+            local rs_dn="${S_RAMP_DOWN[$i]:-0}"
+            local rs_tgt="${S_RAMP_BW_TARGET[$i]:----}"
+            local rs_dur="${S_DURATION[$i]:-0}"
+
+            # Compute hold duration
+            local rs_hold=$(( rs_dur - rs_up - rs_dn ))
+            (( rs_hold < 0 )) && rs_hold=0
+
+            # Render 36-char timeline for results
+            local rs_curve
+            rs_curve=$(_ramp_timeline_render "$i" 36)
+
+            # Indent 36 chars to align under Sender BW column
+            printf '  %-36s' ''
+            printf '%b' "${BOLD}${CYAN}ramp${NC}  "
+            printf '%b' "${DIM}↑${NC}${GREEN}%ds${NC}  " "$rs_up"
+            printf '%b' "${DIM}hold${NC} ${CYAN}%ds${NC}  " "$rs_hold"
+            printf '%b' "${DIM}↓${NC}${YELLOW}%ds${NC}  " "$rs_dn"
+            printf '%b' "${DIM}target${NC} %s  " "$rs_tgt"
+            printf '%b\n' "${GREEN}${rs_curve}${NC}"
         fi
 
         # ── RTT detail sub-row ────────────────────────────────────────────
@@ -10356,7 +10991,7 @@ show_main_menu() {
 
     # ── Header ────────────────────────────────────────────────────────────
     printf '+%s+\n' "$(rpt '=' $inner)"
-    bcenter "${BOLD}PRISM${NC}  ${DIM}Performance Real-time iPerf3 Stream Manager${NC}  ${BOLD}v8.3.3${NC}"
+    bcenter "${BOLD}PRISM${NC}  ${DIM}Performance Real-time iPerf3 Stream Manager${NC}  ${BOLD}v8.3.4${NC}"
     printf '+%s+\n' "$(rpt '=' $inner)"
 
     # ── System info: plain text only so bleft padding is exact ────────────
@@ -10484,6 +11119,10 @@ main_menu() {
                 S_RTT_JITTER=(); S_RTT_LOSS=(); S_RTT_SAMPLES=()
                 S_CWND_CURRENT=(); S_CWND_MIN=();   S_CWND_MAX=()
                 S_CWND_FINAL=();   S_CWND_SAMPLES=(); S_CWND_SUM=()
+                S_RAMP_ENABLED=(); S_RAMP_UP=();      S_RAMP_DOWN=()
+                S_RAMP_STEPS=();   S_RAMP_PHASE=();   S_RAMP_PHASE_TS=()
+                S_RAMP_BW_CURRENT=(); S_RAMP_BW_TARGET=()
+                S_RAMP_IFACE=();   S_RAMP_TC_ACTIVE=()
                 if (( BASH_MAJOR >= 4 )); then
                     PMTU_RESULTS=(); PMTU_STATUS=(); PMTU_RECOMMEND=()
                 fi
@@ -10512,6 +11151,10 @@ main_menu() {
                 S_RTT_JITTER=(); S_RTT_LOSS=(); S_RTT_SAMPLES=()
                 S_CWND_CURRENT=(); S_CWND_MIN=();   S_CWND_MAX=()
                 S_CWND_FINAL=();   S_CWND_SAMPLES=(); S_CWND_SUM=()
+                S_RAMP_ENABLED=(); S_RAMP_UP=();      S_RAMP_DOWN=()
+                S_RAMP_STEPS=();   S_RAMP_PHASE=();   S_RAMP_PHASE_TS=()
+                S_RAMP_BW_CURRENT=(); S_RAMP_BW_TARGET=()
+                S_RAMP_IFACE=();   S_RAMP_TC_ACTIVE=()
                 ;;
 
             5)
@@ -10533,6 +11176,10 @@ main_menu() {
                 S_RTT_JITTER=(); S_RTT_LOSS=(); S_RTT_SAMPLES=()
                 S_CWND_CURRENT=(); S_CWND_MIN=();   S_CWND_MAX=()
                 S_CWND_FINAL=();   S_CWND_SAMPLES=(); S_CWND_SUM=()
+                S_RAMP_ENABLED=(); S_RAMP_UP=();      S_RAMP_DOWN=()
+                S_RAMP_STEPS=();   S_RAMP_PHASE=();   S_RAMP_PHASE_TS=()
+                S_RAMP_BW_CURRENT=(); S_RAMP_BW_TARGET=()
+                S_RAMP_IFACE=();   S_RAMP_TC_ACTIVE=()
                 S_BIDIR=()
                 MTP_BASE_PORT=5201
                 MTP_PORT_MODE="auto"
