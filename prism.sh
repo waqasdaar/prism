@@ -2,7 +2,7 @@
 # =============================================================================
 # PRISM — Performance Real-time iPerf3 Stream Manager
 # Enterprise-grade multi-stream traffic orchestration with live QoS dashboard
-# Version: 8.3.4
+# Version: 8.3.5
 # Author : Waqas Daar (waqasdaar@gmail.com)
 # =============================================================================
 
@@ -635,6 +635,7 @@ declare -a S_RAMP_BW_CURRENT=()  # current effective bandwidth string
 declare -a S_RAMP_BW_TARGET=()   # final target bandwidth string
 declare -a S_RAMP_IFACE=()     # egress interface for tc shaping (TCP)
 declare -a S_RAMP_TC_ACTIVE=() # 1 = tc qdisc installed for this stream
+declare -a S_RAMP_TIMELINE_SNAPSHOT=()  # frozen curve string captured at stream end
 
 # When a stream is configured for bidirectional simultaneous testing, a second
 # iperf3 process is launched with --reverse (-R) alongside the forward stream.
@@ -3991,6 +3992,9 @@ _cleanup_stream_procs() {
     # ── 5b. Remove ramp tc shaping if active ─────────────────────────────
     if [[ "${S_RAMP_ENABLED[$idx]:-0}" == "1" ]]; then
         _ramp_remove_tc "$idx"
+        # Snapshot the rendered curve BEFORE clearing the ring buffer
+        # so display_results_table can still render it after cleanup.
+        S_RAMP_TIMELINE_SNAPSHOT[$idx]=$(_ramp_timeline_render "$idx" 36)
         _ramp_timeline_clear "$idx"
         S_RAMP_PHASE[$idx]="DONE"
         S_RAMP_TC_ACTIVE[$idx]=0
@@ -4656,6 +4660,7 @@ launch_clients() {
             S_RAMP_PHASE_TS[$i]=0
             S_RAMP_BW_CURRENT[$i]="---"
             S_RAMP_TC_ACTIVE[$i]=0
+            S_RAMP_TIMELINE_SNAPSHOT[$i]=""
             _ramp_timeline_clear "$i"
             continue
         fi
@@ -4692,6 +4697,7 @@ launch_clients() {
         S_RAMP_PHASE_TS[$i]=0
         S_RAMP_BW_CURRENT[$i]="---"
         S_RAMP_TC_ACTIVE[$i]=0
+        S_RAMP_TIMELINE_SNAPSHOT[$i]=""
         _ramp_timeline_clear "$i"
 
         # ── Launch the iperf3 client process ─────────────────────────────
@@ -8679,17 +8685,22 @@ display_results_table() {
             local rs_hold=$(( rs_dur - rs_up - rs_dn ))
             (( rs_hold < 0 )) && rs_hold=0
 
-            # Render 36-char timeline for results
-            local rs_curve
-            rs_curve=$(_ramp_timeline_render "$i" 36)
+            # Use frozen snapshot captured at cleanup time.
+            # The live ring buffer is already cleared by this point.
+            # Fall back to a live render only if snapshot is empty
+            # (e.g. stream failed before any ramp samples were recorded).
+            local rs_curve="${S_RAMP_TIMELINE_SNAPSHOT[$i]:-}"
+            if [[ -z "$rs_curve" ]]; then
+                rs_curve=$(_ramp_timeline_render "$i" 36)
+            fi
 
             # Indent 36 chars to align under Sender BW column
             printf '  %-36s' ''
             printf '%b' "${BOLD}${CYAN}ramp${NC}  "
-            printf '%b' "${DIM}↑${NC}${GREEN}%ds${NC}  " "$rs_up"
-            printf '%b' "${DIM}hold${NC} ${CYAN}%ds${NC}  " "$rs_hold"
-            printf '%b' "${DIM}↓${NC}${YELLOW}%ds${NC}  " "$rs_dn"
-            printf '%b' "${DIM}target${NC} %s  " "$rs_tgt"
+            printf '%b' "${DIM}↑${NC}${GREEN}${rs_up}s${NC}  "
+            printf '%b' "${DIM}hold${NC} ${CYAN}${rs_hold}s${NC}  "
+            printf '%b' "${DIM}↓${NC}${YELLOW}${rs_dn}s${NC}  "
+            printf '%b' "${DIM}target${NC} ${rs_tgt}  "
             printf '%b\n' "${GREEN}${rs_curve}${NC}"
         fi
 
@@ -10991,7 +11002,7 @@ show_main_menu() {
 
     # ── Header ────────────────────────────────────────────────────────────
     printf '+%s+\n' "$(rpt '=' $inner)"
-    bcenter "${BOLD}PRISM${NC}  ${DIM}Performance Real-time iPerf3 Stream Manager${NC}  ${BOLD}v8.3.4${NC}"
+    bcenter "${BOLD}PRISM${NC}  ${DIM}Performance Real-time iPerf3 Stream Manager${NC}  ${BOLD}v8.3.5${NC}"
     printf '+%s+\n' "$(rpt '=' $inner)"
 
     # ── System info: plain text only so bleft padding is exact ────────────
@@ -11123,6 +11134,7 @@ main_menu() {
                 S_RAMP_STEPS=();   S_RAMP_PHASE=();   S_RAMP_PHASE_TS=()
                 S_RAMP_BW_CURRENT=(); S_RAMP_BW_TARGET=()
                 S_RAMP_IFACE=();   S_RAMP_TC_ACTIVE=()
+                S_RAMP_TIMELINE_SNAPSHOT=()
                 if (( BASH_MAJOR >= 4 )); then
                     PMTU_RESULTS=(); PMTU_STATUS=(); PMTU_RECOMMEND=()
                 fi
@@ -11155,6 +11167,7 @@ main_menu() {
                 S_RAMP_STEPS=();   S_RAMP_PHASE=();   S_RAMP_PHASE_TS=()
                 S_RAMP_BW_CURRENT=(); S_RAMP_BW_TARGET=()
                 S_RAMP_IFACE=();   S_RAMP_TC_ACTIVE=()
+                S_RAMP_TIMELINE_SNAPSHOT=()
                 ;;
 
             5)
@@ -11181,6 +11194,7 @@ main_menu() {
                 S_RAMP_BW_CURRENT=(); S_RAMP_BW_TARGET=()
                 S_RAMP_IFACE=();   S_RAMP_TC_ACTIVE=()
                 S_BIDIR=()
+                S_RAMP_TIMELINE_SNAPSHOT=()
                 MTP_BASE_PORT=5201
                 MTP_PORT_MODE="auto"
                 if (( BASH_MAJOR >= 4 )); then
