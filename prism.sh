@@ -578,6 +578,9 @@ BIDIR_SUPPORTED=0
 _PREV_DYNAMIC_LINES=0
 _LAST_FRAME_LINE_COUNT=0   # set by run_dashboard after each render
 
+# Session context string — built once at startup, displayed in all reports
+SESSION_HEADER=""
+
 # =============================================================================
 # COLOUR THEME ENGINE
 # =============================================================================
@@ -1576,6 +1579,78 @@ confirm_proceed() {
 format_seconds() {
     local s="$1"; (( s < 0 )) && s=0
     printf '%02d:%02d' "$(( s / 60 ))" "$(( s % 60 ))"
+}
+
+# ---------------------------------------------------------------------------
+# _build_session_header
+#
+# Builds the one-line session context string and stores it in SESSION_HEADER.
+# Called once from main() after iperf3 version detection completes so all
+# fields are available.
+#
+# Format:
+#   host:<hostname>  user:<username>  date:<YYYY-MM-DD HH:MM>
+#   iperf3:<version>  os:<kernel>
+#
+# All fields are plain ASCII — no ANSI codes — so the string can be safely
+# written to log files and embedded in printf format strings.
+# ---------------------------------------------------------------------------
+_build_session_header() {
+    local h u d v o
+    h="host:$(hostname)"
+    u="user:$USER"
+    d="date:$(date +'%Y-%m-%d %H:%M')"
+    v="iperf3:$(iperf3 -v | head -n1 | awk '{print $2}')"
+    # Get kernel version and simplify
+    o="os:$(uname -sr)"
+
+    # Export as a single string for the logic to evaluate
+    SESSION_HEADER_RAW="$h  $u  $d  $v  $o"
+}
+
+# ---------------------------------------------------------------------------
+# _print_session_header  [<context_label>]
+#
+# Renders SESSION_HEADER inside the standard box-drawing frame.
+# Optional <context_label> (e.g. "Client Mode") is appended on the right.
+#
+# Alignment guarantee:
+#   The session line is built as plain text first, its visible length is
+#   measured, and padding is added so the right border lands exactly at
+#   COLS - 1. ANSI colour codes are applied after measurement so vlen()
+#   is not needed here.
+#
+# Called at the top of every mode function and results table.
+# ---------------------------------------------------------------------------
+_print_session_header() {
+    local term_width=78  # Standard PRISM box width
+    local inner_width=$((term_width - 4)) # Space between '|  ' and '  |'
+
+    _build_session_header
+
+    echo "+$(rpt '-' $((term_width - 2)))+"
+
+    if [ ${#SESSION_HEADER_RAW} -le $inner_width ]; then
+        # Single Line Mode
+        local rp=$((inner_width - ${#SESSION_HEADER_RAW}))
+        printf "|  %b%s%b%s  |\n" "$DIM" "$SESSION_HEADER_RAW" "$NC" "$(rpt ' ' $rp)"
+    else
+        # Multi-Line Mode (Splits host/user/date and iperf3/os)
+        local line1="host:$(hostname)  user:$USER  date:$(date +'%Y-%m-%d %H:%M')"
+        local line2="iperf3:$(iperf3 -v | head -n1 | awk '{print $2}')  os:$(uname -sr)"
+
+        # Calculate padding for Line 1
+        local rp1=$((inner_width - ${#line1}))
+        [ $rp1 -lt 0 ] && rp1=0
+        printf "|  %b%s%b%s  |\n" "$DIM" "$line1" "$NC" "$(rpt ' ' $rp1)"
+
+        # Calculate padding for Line 2
+        local rp2=$((inner_width - ${#line2}))
+        [ $rp2 -lt 0 ] && rp2=0
+        printf "|  %b%s%b%s  |\n" "$DIM" "$line2" "$NC" "$(rpt ' ' $rp2)"
+    fi
+
+    echo "+$(rpt '-' $((term_width - 2)))+"
 }
 
 # =============================================================================
@@ -3506,7 +3581,11 @@ configure_server_streams() {
 }
 
 show_stream_summary() {
-    local mode="${1:-client}"; echo ""; print_header "Stream Configuration Summary"; echo ""
+    local mode="${1:-client}"
+    echo ""
+    print_header "Stream Configuration Summary"
+    _print_session_header
+    echo ""
     if [[ "$mode" == "client" ]]; then
         printf '  %-3s  %-5s  %-18s  %-6s  %-10s  %-5s  %-5s  %-10s\n' \
             "#" "Proto" "Target" "Port" "Bandwidth" "Dur" "DSCP" "VRF"
@@ -8534,7 +8613,10 @@ parse_final_results() {
 }
 
 display_results_table() {
-    echo ""; print_header "PRISM — Final Results"; echo ""
+    echo ""
+    print_header "PRISM — Final Results"
+    _print_session_header "Final Results"
+    echo ""
 
     # ── Fixed column widths for results table ─────────────────────────────
     #   C_SN     =  3
@@ -8810,7 +8892,10 @@ offer_log_view() {
 # =============================================================================
 
 run_server_mode() {
-    echo ""; print_header "PRISM — Server Mode"; echo ""
+    echo ""
+    print_header "PRISM — Server Mode"
+    _print_session_header "Server Mode"
+    echo ""
     local n
     while true; do
         read -r -p "  How many listeners? [1]: " n </dev/tty; n="${n:-1}"
@@ -10013,6 +10098,8 @@ run_mixed_traffic_mode() {
     echo ""
     local inner=$(( COLS - 2 ))
     printf '+%s+\n' "$(rpt '=' $inner)"
+    _print_session_header "Mixed Traffic"
+    echo ""
     bcenter "${BOLD}${CYAN}PRISM — Mixed Traffic Pattern Generator${NC}"
     printf '+%s+\n' "$(rpt '=' $inner)"
     bleft "  Define a traffic mix by percentage. Streams are calculated"
@@ -10138,7 +10225,10 @@ run_mixed_traffic_mode() {
 
 
 run_client_mode() {
-    echo ""; print_header "PRISM — Client Mode"; echo ""
+    echo ""
+    print_header "PRISM — Client Mode"
+    _print_session_header "Client Mode"
+    echo ""
     local n
     while true; do
         read -r -p "  How many streams? [1]: " n </dev/tty; n="${n:-1}"
@@ -10210,7 +10300,10 @@ run_client_mode() {
 }
 
 run_loopback_mode() {
-    echo ""; print_header "PRISM — Loopback Test Mode"; echo ""
+    echo ""
+    print_header "PRISM — Loopback Test Mode"
+    _print_session_header "Loopback Test"
+    echo ""
     echo "  Launches server and client on 127.0.0.1 for local validation."
     echo ""
     local n
@@ -11230,6 +11323,7 @@ main() {
     find_iperf3
     get_iperf3_version
     detect_forceflush
+    _build_session_header
     check_root
     build_vrf_maps
     get_interface_list
