@@ -2,7 +2,7 @@
 # =============================================================================
 # PRISM — Performance Real-time iPerf3 Stream Manager
 # Enterprise-grade multi-stream traffic orchestration with live QoS dashboard
-# Version: 8.3.2
+# Version: 8.3.3
 # Author : Waqas Daar (waqasdaar@gmail.com)
 # =============================================================================
 
@@ -598,6 +598,19 @@ _LAST_FRAME_LINE_COUNT=0   # set by run_dashboard after each render
 THEME_CURRENT=""                          # active theme name
 THEME_PREFS_DIR="${HOME}/.config/prism"
 THEME_PREFS_FILE="${THEME_PREFS_DIR}/theme"
+
+
+# Live CWND fields (updated every dashboard tick from stream log)
+# cwnd values are in KBytes as reported by iperf3 TCP verbose output.
+# Format: [  5]  0.00-1.00  sec  128 KBytes  1.05 Mbits/sec  0  90.5 KBytes
+#                                                              ^   ^^^^^^^^^
+#                                                           retr    cwnd
+declare -a S_CWND_CURRENT=()    # most recent cwnd value in KBytes (float string)
+declare -a S_CWND_MIN=()        # minimum cwnd seen during stream
+declare -a S_CWND_MAX=()        # maximum cwnd seen during stream
+declare -a S_CWND_FINAL=()      # last cwnd value at stream end
+declare -a S_CWND_SAMPLES=()    # number of cwnd samples collected
+declare -a S_CWND_SUM=()        # running sum for average calculation
 
 # When a stream is configured for bidirectional simultaneous testing, a second
 # iperf3 process is launched with --reverse (-R) alongside the forward stream.
@@ -1502,6 +1515,23 @@ _capture_final_bw() {
 
     S_FINAL_SENDER_BW[$idx]="${sbw:-N/A}"
     S_FINAL_RECEIVER_BW[$idx]="${rbw:-N/A}"
+
+    # Capture final cwnd from the last interval line
+    if [[ "${S_PROTO[$idx]:-TCP}" == "TCP" && -f "$lf" && -s "$lf" ]]; then
+        local final_cwnd_line
+        final_cwnd_line=$(grep -E '[0-9.]+-[0-9.]+[[:space:]]+sec' "$lf" \
+            2>/dev/null \
+            | grep -vE '[[:space:]](sender|receiver)[[:space:]]*$' \
+            | grep -E '[[:space:]][0-9]+(\.[0-9]+)?[[:space:]]+KBytes[[:space:]]*$' \
+            | tail -1)
+        if [[ -n "$final_cwnd_line" ]]; then
+            local fv
+            fv=$(printf '%s\n' "$final_cwnd_line" | awk '
+                { if ($NF == "KBytes" && $(NF-1)+0 > 0)
+                    printf "%.1f", $(NF-1)+0 }')
+            [[ -n "$fv" && "$fv" != "0.0" ]] && S_CWND_FINAL[$idx]="$fv"
+        fi
+    fi
 }
 
 # =============================================================================
@@ -3201,6 +3231,94 @@ _rtt_parse() {
     S_RTT_SAMPLES[$idx]="${rtt_count:-0}"
 }
 
+
+# ---------------------------------------------------------------------------
+# _cwnd_parse  <stream_idx>
+#
+# Parses the congestion window (cwnd) from the iperf3 TCP stream log.
+#
+# iperf3 TCP verbose output format (per-interval line):
+#   [  5]   0.00-1.00   sec   128 KBytes  1.05 Mbits/sec    0   90.5 KBytes
+#                                                            ^    ^^^^^^^^^
+#                                                         retr      cwnd
+#
+# The cwnd field is the LAST field on TCP interval lines reported in
+# KBytes. UDP lines do not have a cwnd field and are safely ignored.
+# For --bidir streams the [TX-C] tagged lines carry the cwnd for TX.
+#
+# Called once per dashboard tick for each CONNECTED TCP stream.
+# ---------------------------------------------------------------------------
+_cwnd_parse() {
+    local idx="$1"
+    local logfile="${S_LOGFILE[$idx]:-}"
+
+    [[ -z "$logfile" || ! -f "$logfile" || ! -s "$logfile" ]] && return
+    [[ "${S_PROTO[$idx]:-TCP}" != "TCP" ]] && return
+
+    # Extract the most recent interval line that ends with "NNN KBytes"
+    # (the cwnd field). Both plain and --bidir [TX-C] tagged lines match.
+    local last_line
+    last_line=$(grep -E '[0-9.]+-[0-9.]+[[:space:]]+sec' "$logfile" 2>/dev/null \
+        | grep -vE '[[:space:]](sender|receiver)[[:space:]]*$' \
+        | grep -E '[[:space:]][0-9]+(\.[0-9]+)?[[:space:]]+KBytes[[:space:]]*$' \
+        | tail -1)
+
+    [[ -z "$last_line" ]] && return
+
+    # Extract cwnd: second-to-last field when last field is "KBytes"
+    local cwnd_val
+    cwnd_val=$(printf '%s\n' "$last_line" | awk '
+        { if ($NF == "KBytes" && $(NF-1)+0 > 0) printf "%.1f", $(NF-1)+0 }')
+
+    [[ -z "$cwnd_val" || "$cwnd_val" == "0.0" ]] && return
+
+    # Update current value
+    S_CWND_CURRENT[$idx]="$cwnd_val"
+    S_CWND_SAMPLES[$idx]=$(( ${S_CWND_SAMPLES[$idx]:-0} + 1 ))
+
+    # Running sum for average
+    local prev_sum="${S_CWND_SUM[$idx]:-0}"
+    S_CWND_SUM[$idx]=$(awk -v s="$prev_sum" -v v="$cwnd_val" \
+        'BEGIN { printf "%.1f", s + v }')
+
+    # Update min
+    local cur_min="${S_CWND_MIN[$idx]:-}"
+    if [[ -z "$cur_min" || "$cur_min" == "---" ]]; then
+        S_CWND_MIN[$idx]="$cwnd_val"
+    else
+        S_CWND_MIN[$idx]=$(awk -v a="$cur_min" -v b="$cwnd_val" \
+            'BEGIN { printf "%.1f", (b < a) ? b : a }')
+    fi
+
+    # Update max
+    local cur_max="${S_CWND_MAX[$idx]:-0}"
+    S_CWND_MAX[$idx]=$(awk -v a="$cur_max" -v b="$cwnd_val" \
+        'BEGIN { printf "%.1f", (b > a) ? b : a }')
+
+    # Always update final to most recent value
+    S_CWND_FINAL[$idx]="$cwnd_val"
+}
+
+# ---------------------------------------------------------------------------
+# _cwnd_avg  <stream_idx>
+#
+# Returns the running average cwnd as a formatted float string.
+# Safe to call at any time — returns "---" when no samples exist.
+# ---------------------------------------------------------------------------
+_cwnd_avg() {
+    local idx="$1"
+    local samples="${S_CWND_SAMPLES[$idx]:-0}"
+    local sum="${S_CWND_SUM[$idx]:-0}"
+
+    if (( samples == 0 )); then
+        printf '%s' "---"
+        return
+    fi
+
+    awk -v s="$sum" -v n="$samples" \
+        'BEGIN { printf "%.1f", s / n }'
+}
+
 # ---------------------------------------------------------------------------
 # _cleanup_stream_procs  <stream_index>
 #
@@ -3906,7 +4024,7 @@ launch_clients() {
     PING_PIDS=()
     PING_LOGFILES=()
 
-    #— initialise bidir tracking arrays
+    # Initialise bidir tracking arrays
     BIDIR_PIDS=()
     BIDIR_LOGFILES=()
 
@@ -3935,7 +4053,7 @@ launch_clients() {
                 fi
             done
 
-            # Case 1: VRF set but bind IP is in GRT → clear VRF
+            # Case 1: VRF set but bind IP is in GRT — clear VRF
             if [[ -n "$_vvrf" && "$_vactual" == "GRT" ]]; then
                 printf '%b\n' \
                     "${YELLOW}  [PRE-LAUNCH FIX] Stream $((_vi+1)):" \
@@ -3943,7 +4061,7 @@ launch_clients() {
                     "Clearing VRF '${_vvrf}' to prevent bad file descriptor.${NC}"
                 S_VRF[$_vi]=""
 
-            # Case 2: VRF set to wrong VRF → correct it
+            # Case 2: VRF set to wrong VRF — correct it
             elif [[ -n "$_vvrf" && "$_vactual" != "GRT" && \
                     "$_vactual" != "$_vvrf" ]]; then
                 printf '%b\n' \
@@ -3952,7 +4070,7 @@ launch_clients() {
                     "not '${_vvrf}'. Correcting VRF.${NC}"
                 S_VRF[$_vi]="$_vactual"
 
-            # Case 3: No VRF set but bind IP is in a VRF → auto-apply
+            # Case 3: No VRF set but bind IP is in a VRF — auto-apply
             elif [[ -z "$_vvrf" && "$_vactual" != "GRT" && \
                     -n "$_vactual" ]]; then
                 printf '%b\n' \
@@ -3967,30 +4085,83 @@ launch_clients() {
     local i
 
     for (( i=0; i<STREAM_COUNT; i++ )); do
-        local sn=$(( i + 1 )) sf="${TMPDIR}/stream_${sn}.sh" lf="${TMPDIR}/stream_${sn}.log"
+        local sn=$(( i + 1 ))
+        local sf="${TMPDIR}/stream_${sn}.sh"
+        local lf="${TMPDIR}/stream_${sn}.log"
+
         if ! write_launch_script "$sf" "$(build_client_command "$i")"; then
             printf '%b\n' "${RED}  [ERROR] Cannot write script for stream ${sn}.${NC}"
-            STREAM_PIDS+=(0); S_LOGFILE[$i]="$lf"
-            S_STATUS_CACHE[$i]="FAILED"; S_ERROR_MSG[$i]="Script creation failed"
-            # — placeholder so array indices stay aligned
-            PING_PIDS+=(0); PING_LOGFILES+=("")
+            STREAM_PIDS+=(0)
+            S_LOGFILE[$i]="$lf"
+            S_STATUS_CACHE[$i]="FAILED"
+            S_ERROR_MSG[$i]="Script creation failed"
+            # Placeholder entries so all arrays stay index-aligned
+            PING_PIDS+=(0)
+            PING_LOGFILES+=("")
+            # CWND arrays — initialise to sentinel values even on failure
+            # so display_results_table and _render_client_frame never read
+            # uninitialised variables for this stream index.
+            S_CWND_CURRENT[$i]="---"
+            S_CWND_MIN[$i]="---"
+            S_CWND_MAX[$i]="---"
+            S_CWND_FINAL[$i]="---"
+            S_CWND_SAMPLES[$i]="0"
+            S_CWND_SUM[$i]="0"
             continue
         fi
-        S_SCRIPT[$i]="$sf"; S_LOGFILE[$i]="$lf"
-        S_START_TS[$i]=$(date +%s); S_STATUS_CACHE[$i]="STARTING"; S_ERROR_MSG[$i]=""
 
+        S_SCRIPT[$i]="$sf"
+        S_LOGFILE[$i]="$lf"
+        S_START_TS[$i]=$(date +%s)
+        S_STATUS_CACHE[$i]="STARTING"
+        S_ERROR_MSG[$i]=""
+
+        # ── Initialise CWND tracking arrays for this stream ───────────────
+        # All fields are set to known-good sentinel values before launch so
+        # the render functions never encounter uninitialised variables.
+        #
+        # Sentinel meanings:
+        #   S_CWND_CURRENT  "---"  = no sample parsed yet
+        #   S_CWND_MIN      "---"  = no sample parsed yet
+        #   S_CWND_MAX      "---"  = no sample parsed yet  (not "0" to
+        #                            avoid showing "0" in dashboard before
+        #                            first sample arrives)
+        #   S_CWND_FINAL    "---"  = stream not yet finished
+        #   S_CWND_SAMPLES  "0"    = counter starts at zero
+        #   S_CWND_SUM      "0"    = running sum starts at zero
+        S_CWND_CURRENT[$i]="---"
+        S_CWND_MIN[$i]="---"
+        S_CWND_MAX[$i]="---"
+        S_CWND_FINAL[$i]="---"
+        S_CWND_SAMPLES[$i]="0"
+        S_CWND_SUM[$i]="0"
+
+        # ── Launch the iperf3 client process ─────────────────────────────
         bash "$sf" > "$lf" 2>&1 &
-        local pid=$!; STREAM_PIDS+=("$pid")
-        printf '%b[STARTED]%b  stream %d  PID %-6d  %s -> %s:%s\n' \
-            "$GREEN" "$NC" "$sn" "$pid" "${S_PROTO[$i]}" "${S_TARGET[$i]}" "${S_PORT[$i]}"
+        local pid=$!
+        STREAM_PIDS+=("$pid")
 
-        # RTT ping
+        printf '%b[STARTED]%b  stream %d  PID %-6d  %s -> %s:%s\n' \
+            "$GREEN" "$NC" \
+            "$sn" "$pid" \
+            "${S_PROTO[$i]}" "${S_TARGET[$i]}" "${S_PORT[$i]}"
+
+        # ── Launch RTT background ping ────────────────────────────────────
+        # One continuous ping per stream, running in parallel with iperf3.
+        # Skipped automatically for loopback targets inside _rtt_launch.
         _rtt_launch "$i"
         if [[ "${PING_PIDS[$i]:-0}" != "0" ]]; then
             printf '%b[PING   ]%b  stream %d  PID %-6d  rtt → %s\n' \
-                "$CYAN" "$NC" "$sn" "${PING_PIDS[$i]}" "${S_TARGET[$i]}"
+                "$CYAN" "$NC" \
+                "$sn" "${PING_PIDS[$i]}" "${S_TARGET[$i]}"
         fi
-        # ──— launch reverse (RX) process for bidir ───
+
+        # ── Launch bidirectional reverse process ──────────────────────────
+        # For streams with S_BIDIR=1:
+        #   iperf3 >= 3.7: _bidir_launch points BIDIR_LOGFILES at the
+        #                  forward log — no separate process needed.
+        #   iperf3 <  3.7: _bidir_launch starts a separate --reverse
+        #                  process with a 2-second startup delay.
         _bidir_launch "$i"
     done
 }
@@ -6627,8 +6798,6 @@ _count_client_frame_lines_for_state() {
             (( total++ ))   # RTT row — non-loopback only
         fi
 
-        # CWND inline: excluded from pre-reservation (always 0 samples at tick 0)
-
         if (( S_DURATION[$i] > 0 )) && [[ "$st" != "FAILED" ]]; then
             (( total++ ))   # progress bar row
         fi
@@ -6730,6 +6899,7 @@ _render_client_frame() {
             *)
                 _rtt_parse "$i"
                 _bidir_parse_bw "$i"
+                [[ "${S_PROTO[$i]:-TCP}" == "TCP" ]] && _cwnd_parse "$i"
                 ;;
         esac
     done
@@ -7012,6 +7182,37 @@ _render_client_frame() {
             bleft "$rtt_str"
         fi
 
+        # ── CWND inline row (TCP non-loopback streams with data) ──────────
+        if [[ "${S_PROTO[$i]:-TCP}" == "TCP" ]] && \
+           [[ ! "$stream_tgt" =~ ^127\. && "$stream_tgt" != "::1" ]] && \
+           [[ "${S_CWND_SAMPLES[$i]:-0}" != "0" ]]; then
+
+            local cw_cur="${S_CWND_CURRENT[$i]:----}"
+            local cw_min="${S_CWND_MIN[$i]:----}"
+            local cw_max="${S_CWND_MAX[$i]:----}"
+            local cw_avg; cw_avg=$(_cwnd_avg "$i")
+
+            # Fixed-width numeric fields — 6 chars each (e.g. " 94.6")
+            # The label+field pairs are assembled as plain text first so
+            # vlen() padding in bleft() counts visible chars correctly.
+            local f_cur f_min f_max f_avg
+            f_cur=$(printf '%6s' "$cw_cur")
+            f_min=$(printf '%6s' "$cw_min")
+            f_max=$(printf '%6s' "$cw_max")
+            f_avg=$(printf '%6s' "$cw_avg")
+
+            # Colour the current value by magnitude
+            local cw_col="$GREEN"
+            local cw_int
+            cw_int=$(printf '%.0f' "$cw_cur" 2>/dev/null || printf '0')
+            if   (( cw_int < 10  )); then cw_col="$RED"
+            elif (( cw_int < 50  )); then cw_col="$YELLOW"
+            elif (( cw_int < 200 )); then cw_col="$CYAN"
+            fi
+
+            bleft "  ${DIM}cwnd${NC}  ${DIM}cur${NC} ${cw_col}${f_cur}${NC}${DIM}KB${NC}  ${DIM}min${NC} ${CYAN}${f_min}${NC}${DIM}KB${NC}  ${DIM}max${NC} ${YELLOW}${f_max}${NC}${DIM}KB${NC}  ${DIM}avg${NC} ${f_avg}${DIM}KB${NC}"
+        fi
+
         # ── Progress bar row (fixed-duration non-FAILED streams only) ─────
         if (( show_bar == 1 )) && (( has_fixed_dur == 1 )); then
             local bar_str; bar_str=$(_render_progress_bar "$stream_elapsed" "$dur")
@@ -7204,7 +7405,11 @@ run_dashboard() {
     local count
     [[ "$mode" == "server" ]] && count=$SERVER_COUNT || count=$STREAM_COUNT
 
-    # ── Initialise per-stream cleanup tracking arrays ──────────────────────
+    # ── Initialise per-stream cleanup tracking arrays ─────────────────────
+    # S_CLEANUP_QUEUED tracks the two-phase non-blocking cleanup state:
+    #   0 = not yet queued
+    #   1 = queued (CLEANUP_PENDING set, waiting for Phase B)
+    #   2 = cleanup ran this tick (_cleanup_stream_procs was called)
     if [[ "$mode" != "server" ]]; then
         local _ci
         for (( _ci=0; _ci<STREAM_COUNT; _ci++ )); do
@@ -7213,6 +7418,10 @@ run_dashboard() {
     fi
 
     # ── Initial status probe before pre-reservation ───────────────────────
+    # Run one probe pass before reserving blank lines so the initial
+    # _fc calculation reflects the actual stream states rather than all
+    # being STARTING, which could under-reserve and cause a scroll jump
+    # on the very first tick.
     if [[ "$mode" != "server" ]]; then
         local j
         for (( j=0; j<STREAM_COUNT; j++ )); do
@@ -7220,7 +7429,9 @@ run_dashboard() {
         done
     fi
 
-    # ── Calculate pre-reserve line count ──────────────────────────────────
+    # ── Calculate pre-reserve line count ─────────────────────────────────
+    # Use the state-aware counter so the blank block is sized correctly
+    # for the current stream configuration from tick zero.
     local pre_lines
     if [[ "$mode" == "server" ]]; then
         pre_lines=$(_count_server_frame_lines)
@@ -7232,24 +7443,28 @@ run_dashboard() {
     _PREV_DYNAMIC_LINES=0
     local _last_total=$pre_lines
 
-    # ── Reserve vertical space and establish the frame anchor ──────────────
+    # ── Reserve vertical space and establish the frame anchor ─────────────
+    # Print exactly pre_lines blank lines then jump back to the top.
+    # This "claims" the terminal real estate the dashboard will occupy
+    # and prevents the prompt or other output from interfering.
     local k
     for (( k=0; k<pre_lines; k++ )); do printf '\n'; done
     printf '\033[%dA' "$pre_lines"
-    printf '\033[s'
-    printf '\033[?25l'
+    printf '\033[s'          # save cursor — this is the frame anchor
+    printf '\033[?25l'       # hide cursor during live rendering
 
     local _dashboard_running=1
 
-    # ══════════════════════════════════════════════════════════════════════
+    # ════════════════════════════════════════════════════════════════════════
     # Main render loop
-    # ══════════════════════════════════════════════════════════════════════
+    # ════════════════════════════════════════════════════════════════════════
     while (( _dashboard_running == 1 )); do
 
-        # ── Per-tick state probe ───────────────────────────────────────────
-        # NOTE: _render_client_frame also calls probe_client_status for each
-        # stream at the top of its render loop. The probe here ensures Phase A
-        # (below) sees the latest state BEFORE the render runs.
+        # ── Per-tick state probe ──────────────────────────────────────────
+        # Run probe_client_status here so Phase A (below) sees the latest
+        # state BEFORE the render runs. _render_client_frame also calls
+        # probe_client_status internally; the double call is safe because
+        # probe_client_status is idempotent for terminal states.
         if [[ "$mode" != "server" ]]; then
             local j
             for (( j=0; j<STREAM_COUNT; j++ )); do
@@ -7257,7 +7472,10 @@ run_dashboard() {
             done
         fi
 
-        # ── Stream cleanup state machine — Phase A ─────────────────────────
+        # ── Stream cleanup state machine — Phase A ────────────────────────
+        # Transition DONE/FAILED → CLEANUP_PENDING so the render function
+        # shows the "CLEANING…" tombstone while Phase B runs cleanup.
+        # Only queue once: skip streams already at state 1 or 2.
         if [[ "$mode" != "server" ]]; then
             local _si
             for (( _si=0; _si<STREAM_COUNT; _si++ )); do
@@ -7272,10 +7490,13 @@ run_dashboard() {
             done
         fi
 
-        # ── Restore cursor to top of frame ────────────────────────────────
+        # ── Restore cursor to top of frame ───────────────────────────────
+        # Every tick redraws from the saved anchor position so the
+        # dashboard overwrites its own previous content rather than
+        # scrolling the terminal.
         printf '\033[u'
 
-        # ── Render the frame ───────────────────────────────────────────────
+        # ── Render the frame ─────────────────────────────────────────────
         local fixed_lines
         if [[ "$mode" == "server" ]]; then
             _render_server_frame
@@ -7283,55 +7504,102 @@ run_dashboard() {
         else
             _render_client_frame
 
-            # ── Calculate line count inline ────────────────────────────────
-            # IMPORTANT: All variables used inside the loop are declared
-            # BEFORE the loop. Re-declaring with 'local' inside a bash loop
-            # body resets the variable to empty on the second iteration in
-            # some bash versions, causing the RTT/CWND/separator rows for
-            # streams after stream 0 to be miscounted.
+            # ── Inline line-count calculation ─────────────────────────────
+            # CRITICAL: this must be computed in the main shell context
+            # (not via a subshell call) so that array variables such as
+            # S_CWND_SAMPLES, S_BIDIR, S_DURATION, and S_STATUS_CACHE are
+            # read from the live parent-shell state, not a stale snapshot.
+            #
+            # Variable declarations are placed BEFORE the loop to avoid a
+            # Bash bug where re-declaring 'local' inside a loop body resets
+            # the variable to empty on the second iteration, causing rows
+            # after stream 0 to be miscounted.
+            #
+            # Row anatomy per stream (all conditional on state/protocol):
+            #   +1  TX row              always
+            #   +1  RX row              bidir streams only
+            #   +1  RTT row             non-loopback streams only
+            #   +1  CWND inline row     TCP non-loopback with samples > 0
+            #   +1  progress bar row    fixed-duration non-FAILED streams
+            #   +1  per-stream sep      between streams (not after last)
+            #
+            # Fixed overhead = 11:
+            #   1  top border (bline '=')
+            #   1  title (bcenter)
+            #   1  title border (bline '=')
+            #   1  counters row (bleft)
+            #   1  counters border (bline '=')
+            #   1  column header (bleft)
+            #   1  header underline (bline '-')
+            #   1  bottom border (bline '=')
+            #   1  hint row (bleft)
+            #   1  final border (bline '=')
+            #   1  notification banner (always exactly 1 line)
+
             local _fc=11
             local _fci _fcst _fctgt
             for (( _fci=0; _fci<STREAM_COUNT; _fci++ )); do
                 _fcst="${S_STATUS_CACHE[$_fci]:-STARTING}"
+                _fctgt="${S_TARGET[$_fci]:-}"
 
+                # CLEANED and CLEANUP_PENDING render as a single tombstone
+                # row — no RTT/CWND/bar rows for these terminal states.
                 if [[ "$_fcst" == "CLEANED" || \
                       "$_fcst" == "CLEANUP_PENDING" ]]; then
-                    _fc=$(( _fc + 1 ))
+                    _fc=$(( _fc + 1 ))          # tombstone row
                     if (( _fci < STREAM_COUNT - 1 )); then
-                        _fc=$(( _fc + 1 ))
+                        _fc=$(( _fc + 1 ))      # per-stream separator
                     fi
                     continue
                 fi
 
-                _fc=$(( _fc + 1 ))   # TX row
+                _fc=$(( _fc + 1 ))              # TX row (always)
 
+                # RX row — bidirectional streams only
                 if [[ "${S_BIDIR[$_fci]:-0}" == "1" ]]; then
-                    _fc=$(( _fc + 1 ))   # RX row
+                    _fc=$(( _fc + 1 ))
                 fi
 
-                _fctgt="${S_TARGET[$_fci]:-}"
+                # RTT row — non-loopback streams only
                 if [[ ! "$_fctgt" =~ ^127\. && \
                       "$_fctgt" != "::1" ]]; then
-                    _fc=$(( _fc + 1 ))   # RTT row
+                    _fc=$(( _fc + 1 ))
                 fi
 
+                # CWND inline row — TCP non-loopback streams with ≥1 sample
+                # The guard exactly mirrors the condition in
+                # _render_client_frame so the counter stays in sync.
+                if [[ "${S_PROTO[$_fci]:-TCP}" == "TCP" ]] && \
+                   [[ ! "$_fctgt" =~ ^127\. && \
+                      "$_fctgt" != "::1" ]] && \
+                   [[ "${S_CWND_SAMPLES[$_fci]:-0}" != "0" ]]; then
+                    _fc=$(( _fc + 1 ))
+                fi
+
+                # Progress bar row — fixed-duration non-FAILED streams
                 if (( S_DURATION[$_fci] > 0 )) && \
                    [[ "$_fcst" != "FAILED" ]]; then
-                    _fc=$(( _fc + 1 ))   # progress bar row
+                    _fc=$(( _fc + 1 ))
                 fi
 
+                # Per-stream separator — between streams, not after last
                 if (( _fci < STREAM_COUNT - 1 )); then
-                    _fc=$(( _fc + 1 ))   # per-stream separator
+                    _fc=$(( _fc + 1 ))
                 fi
             done
 
             fixed_lines=$_fc
             _LAST_FRAME_LINE_COUNT=$_fc
         fi
+
         # ── Erase stale content below the current frame ───────────────────
+        # \033[J clears from the current cursor position to the end of the
+        # screen. This ensures that if the frame shrinks (e.g. a stream
+        # transitions to CLEANED and loses its RTT/CWND rows), the now-
+        # unused lines are blanked rather than showing ghost content.
         printf '\033[J'
 
-        # ── Dynamic panels (client only) ───────────────────────────────────
+        # ── Dynamic panels (client mode only) ─────────────────────────────
         local completed_lines=0 failed_lines=0
         if [[ "$mode" != "server" ]]; then
             completed_lines=$(_count_completed_panel_lines)
@@ -7340,38 +7608,39 @@ run_dashboard() {
             (( failed_lines    > 0 )) && _render_failed_panel
         fi
 
-        # ── DSCP verify hint ──────────────────────────────────────────────
-        # Always print exactly 3 lines for non-loopback client mode.
+        # ── DSCP verify hint block ────────────────────────────────────────
+        # Always prints exactly 3 lines for non-loopback client mode.
         # Keeping _hint_lines=3 constant from tick 1 eliminates the
-        # transition-tick anchor drift caused by _hint_lines going 0→3
-        # when the stream first becomes CONNECTED.
+        # anchor drift that occurs when _hint_lines transitions 0→3 on
+        # the tick a stream first becomes CONNECTED.
         local _hint_lines=0
         if [[ "$mode" != "server" ]] && ! _all_streams_loopback; then
             local _any_verifiable=0
             local _ji
             for (( _ji=0; _ji<STREAM_COUNT; _ji++ )); do
                 if [[ "${S_STATUS_CACHE[$_ji]}" == "CONNECTED" ]] && \
-                   [[ ! "${S_TARGET[$_ji]:-}" =~ ^127\. ]] && \
+                   [[ ! "${S_TARGET[$_ji]:-}" =~ ^127\. ]]        && \
                    [[ "${S_TARGET[$_ji]:-}" != "::1" ]]; then
                     _any_verifiable=1
                     break
                 fi
             done
-            # Line 1: blank
-            printf '\033[K\n'
-            # Line 2: hint text or blank
+            printf '\033[K\n'                           # line 1: blank
             if (( _any_verifiable == 1 )); then
                 printf '  %b[v/p]%b  Verify DSCP marking for a stream\033[K\n' \
-                    "$DIM" "$NC"
+                    "$DIM" "$NC"                        # line 2: hint
             else
-                printf '\033[K\n'
+                printf '\033[K\n'                       # line 2: blank
             fi
-            # Line 3: blank
-            printf '\033[K\n'
+            printf '\033[K\n'                           # line 3: blank
             _hint_lines=3
         fi
 
-        # ── Record total lines and re-anchor cursor position ──────────────
+        # ── Record total lines and re-anchor cursor ───────────────────────
+        # _last_total is the number of lines printed since the frame anchor
+        # (\033[s). After printing the frame + panels + hint we jump back
+        # by exactly this many lines and re-save the anchor so the next
+        # tick overwrites everything cleanly.
         local dynamic_lines=$(( completed_lines + failed_lines ))
         _last_total=$(( fixed_lines + dynamic_lines + _hint_lines ))
         _PREV_DYNAMIC_LINES=$(( completed_lines + failed_lines ))
@@ -7379,13 +7648,17 @@ run_dashboard() {
         if (( _last_total > 0 )); then
             printf '\033[%dA' "$_last_total"
         fi
-        printf '\033[s'
+        printf '\033[s'     # re-save anchor at top of rendered frame
 
-        # ── Stream cleanup state machine — Phase B ─────────────────────────
+        # ── Stream cleanup state machine — Phase B ────────────────────────
+        # For every stream that Phase A queued (S_CLEANUP_QUEUED == 1),
+        # run _cleanup_stream_procs now. This happens AFTER the render so
+        # the "CLEANING…" tombstone is visible for at least one full tick
+        # before transitioning to CLEANED.
         if [[ "$mode" != "server" ]]; then
             local _si
             for (( _si=0; _si<STREAM_COUNT; _si++ )); do
-                if [[ "${S_STATUS_CACHE[$_si]:-}" == "CLEANUP_PENDING" && \
+                if [[ "${S_STATUS_CACHE[$_si]:-}"  == "CLEANUP_PENDING" && \
                       "${S_CLEANUP_QUEUED[$_si]:-0}" == "1" ]]; then
                     S_CLEANUP_QUEUED[$_si]="2"
                     _cleanup_stream_procs "$_si"
@@ -7393,7 +7666,16 @@ run_dashboard() {
             done
         fi
 
-        # ── Exit condition (client mode) ───────────────────────────────────
+        # ── Exit condition (client mode) ──────────────────────────────────
+        # The dashboard exits when every stream has reached a terminal
+        # state. The states and their exit eligibility are:
+        #
+        #   CLEANED          → always eligible
+        #   FAILED           → always eligible
+        #   CLEANUP_PENDING  → eligible only when queued=2 (cleanup ran)
+        #   DONE             → force to CLEANED if queued=2 (safety net);
+        #                      re-queue if queued=0; not eligible otherwise
+        #   anything else    → not finished, loop continues
         if [[ "$mode" != "server" ]]; then
             local _all_finished=1
             local j
@@ -7401,26 +7683,23 @@ run_dashboard() {
                 local _jst="${S_STATUS_CACHE[$j]:-STARTING}"
                 case "$_jst" in
                     CLEANED|FAILED)
-                        # Terminal states — done
+                        # Terminal states — no action needed
                         ;;
                     CLEANUP_PENDING)
-                        # cleanup ran this tick (queued=2) → treat as done
-                        # cleanup not yet run (queued=1) → still in progress
+                        # Eligible only if cleanup already ran this tick
                         if [[ "${S_CLEANUP_QUEUED[$j]:-0}" != "2" ]]; then
                             _all_finished=0
                         fi
                         ;;
                     DONE)
-                        # DONE with queued=2 means _cleanup_stream_procs was
-                        # called but failed to set CLEANED (e.g. early return
-                        # due to a subprocess error). Force CLEANED now so
-                        # the dashboard can exit rather than looping forever.
                         if [[ "${S_CLEANUP_QUEUED[$j]:-0}" == "2" ]]; then
+                            # _cleanup_stream_procs ran but CLEANED was not
+                            # set (e.g. early return via the RETURN trap).
+                            # Force CLEANED so the loop can exit.
                             S_STATUS_CACHE[$j]="CLEANED"
                         else
-                            # cleanup has not been attempted yet — Phase A
-                            # should handle this, but if queued is still 0
-                            # trigger it directly here as a safety net
+                            # Cleanup not attempted yet — trigger Phase A
+                            # as a safety net in case it was skipped.
                             if [[ "${S_CLEANUP_QUEUED[$j]:-0}" == "0" ]]; then
                                 S_CLEANUP_QUEUED[$j]="1"
                                 S_STATUS_CACHE[$j]="CLEANUP_PENDING"
@@ -7440,49 +7719,62 @@ run_dashboard() {
             fi
         fi
 
-        # ── Non-blocking keyboard poll (~1 s per tick) ────────────────────
+        # ── Non-blocking keyboard poll (~1 s per tick) ───────────────────
+        # The poll is split into 10 × 0.1 s slices so the dashboard
+        # refreshes approximately once per second while remaining
+        # responsive to keypresses. Each slice checks _dashboard_running
+        # and CLEANUP_DONE so the loop exits immediately on stream
+        # completion or signal rather than waiting out the full second.
         local key_pressed="" key_lower=""
         local tick_slice
         for (( tick_slice=0; tick_slice<10; tick_slice++ )); do
 
-            # Exit the poll immediately when the loop is flagged to stop.
-            # This prevents a 1-second delay after stream completion.
+            # Short-circuit: exit poll immediately if loop should stop
             if (( _dashboard_running == 0 )); then
                 break
             fi
 
-            if IFS= read -r -s -n 1 -t 0.1 key_pressed </dev/tty 2>/dev/null; then
-                key_lower=$(printf '%s' "$key_pressed" | tr '[:upper:]' '[:lower:]')
+            if IFS= read -r -s -n 1 -t 0.1 \
+                   key_pressed </dev/tty 2>/dev/null; then
+                key_lower=$(printf '%s' "$key_pressed" \
+                    | tr '[:upper:]' '[:lower:]')
                 break
             fi
             key_pressed=""
             key_lower=""
+
+            # Check for signal-triggered cleanup between slices
             if (( CLEANUP_DONE == 1 )); then
                 _dashboard_running=0
                 break
             fi
         done
 
-        # Exit immediately if a signal handler set CLEANUP_DONE
+        # Exit immediately if a signal handler set CLEANUP_DONE mid-poll
         if (( CLEANUP_DONE == 1 )); then
             _dashboard_running=0
             continue
         fi
 
-        # ── Handle DSCP verify keypress (client, v or p) ───────────────────
-        if [[ "$mode" != "server" ]] && \
-           ! _all_streams_loopback && \
+        # ── DSCP verify keypress handler (client mode, v or p) ────────────
+        # Temporarily suspend the dashboard, run the interactive DSCP
+        # capture tool, then re-establish the frame anchor so rendering
+        # resumes from the correct position.
+        if [[ "$mode" != "server" ]]   && \
+           ! _all_streams_loopback     && \
            [[ "$key_lower" == "v" || "$key_lower" == "p" ]]; then
 
-            printf '\033[?25h'
-            printf '\033[%dB' "$_last_total"
+            printf '\033[?25h'                  # show cursor
+            printf '\033[%dB' "$_last_total"    # move below frame
             _dscp_verify_interactive
 
+            # Re-probe all streams after returning from the overlay
             local j
             for (( j=0; j<STREAM_COUNT; j++ )); do
                 probe_client_status "$j"
             done
 
+            # Recalculate pre-reserve size for the re-established anchor
             local new_pre
             new_pre=$(_count_client_frame_lines_for_state)
             FRAME_LINES=$new_pre
@@ -7490,12 +7782,14 @@ run_dashboard() {
             for (( k=0; k<new_pre; k++ )); do printf '\n'; done
             printf '\033[%dA' "$new_pre"
             printf '\033[s'
-            printf '\033[?25l'
+            printf '\033[?25l'                  # hide cursor again
 
             _last_total=$new_pre
         fi
 
-        # ── Handle packet capture keypress (server, c) ─────────────────────
+        # ── Packet capture keypress handler (server mode, c) ──────────────
+        # Same suspend/resume pattern as the DSCP verify handler above,
+        # but calls the server-side capture interactive function instead.
         if [[ "$mode" == "server" ]] && [[ "$key_lower" == "c" ]]; then
 
             printf '\033[?25h'
@@ -7515,28 +7809,32 @@ run_dashboard() {
         fi
 
     done
-    # ══════════════════════════════════════════════════════════════════════
+    # ════════════════════════════════════════════════════════════════════════
     # End of render loop
-    # ══════════════════════════════════════════════════════════════════════
+    # ════════════════════════════════════════════════════════════════════════
 
-    # ── Restore terminal state ─────────────────────────────────────────────
-    printf '\033[?25h'
+    # ── Restore terminal state ────────────────────────────────────────────
+    printf '\033[?25h'      # always restore cursor visibility on exit
 
-    # ── Move cursor below the entire rendered output ───────────────────────
-    # Restore to the top-of-frame anchor, then advance downward past all
-    # rendered content (frame + dynamic panels + hint).  This guarantees
-    # that subsequent output (results table, log viewer, cleanup messages)
-    # starts on a clean line below the TUI and does not overwrite or
-    # interleave with dashboard content still visible on screen.
+    # ── Move cursor below the entire rendered output ──────────────────────
+    # Restore to the top-of-frame anchor, then advance downward by
+    # _last_total lines. This guarantees that subsequent output (results
+    # table, log viewer, cleanup messages) starts on a clean line below
+    # all dashboard content and does not overwrite or interleave with it.
     printf '\033[u'
     if (( _last_total > 0 )); then
         printf '\033[%dB' "$_last_total"
     fi
-    # Erase from this position downward to clean up any partial renders
+
+    # Erase from the cursor to end of screen to clean up any ghost content
+    # left from a frame that was taller than the final render.
     printf '\033[J'
     printf '\n'
 
-    # ── Display buffered cleanup events ────────────────────────────────────
+    # ── Display buffered stream cleanup event log ─────────────────────────
+    # _cleanup_stream_procs writes timestamped events to this log file
+    # rather than stdout (since stdout belongs to the dashboard during
+    # rendering). Now that the dashboard has exited we flush them.
     local _log_file="/tmp/iperf3_streams_events.log"
     if [[ -f "$_log_file" ]]; then
         printf '\n'
@@ -7721,6 +8019,44 @@ display_results_table() {
 
         # ── MTU annotation ────────────────────────────────────────────────
         _pmtu_annotate_stream_summary "$i"
+
+        # ── CWND results sub-row (TCP non-loopback only) ──────────────────
+        if [[ "${S_PROTO[$i]:-TCP}" == "TCP" && \
+              ! "${S_TARGET[$i]:-}" =~ ^127\. && \
+              "${S_TARGET[$i]:-}" != "::1" && \
+              "${S_CWND_SAMPLES[$i]:-0}" != "0" ]]; then
+
+            local rc_min="${S_CWND_MIN[$i]:----}"
+            local rc_max="${S_CWND_MAX[$i]:----}"
+            local rc_fin="${S_CWND_FINAL[$i]:----}"
+            local rc_avg; rc_avg=$(_cwnd_avg "$i")
+            local rc_smp="${S_CWND_SAMPLES[$i]:-0}"
+
+            # Fixed-width fields — 7 chars (e.g. "  94.6")
+            local rf_min rf_max rf_fin rf_avg
+            rf_min=$(printf '%7s' "$rc_min")
+            rf_max=$(printf '%7s' "$rc_max")
+            rf_fin=$(printf '%7s' "$rc_fin")
+            rf_avg=$(printf '%7s' "$rc_avg")
+
+            # Colour final value by magnitude
+            local rf_col="$GREEN"
+            local rf_int
+            rf_int=$(printf '%.0f' "$rc_fin" 2>/dev/null || printf '0')
+            if   (( rf_int < 10  )); then rf_col="$RED"
+            elif (( rf_int < 50  )); then rf_col="$YELLOW"
+            elif (( rf_int < 200 )); then rf_col="$CYAN"
+            fi
+
+            # Indent 36 chars to align under Sender BW column
+            printf '  %-36s' ''
+            printf '%b' "${BOLD}${CYAN}cwnd${NC}  "
+            printf '%b' "${DIM}min${NC} ${CYAN}${rf_min}${NC}${DIM}KB${NC}  "
+            printf '%b' "${DIM}max${NC} ${YELLOW}${rf_max}${NC}${DIM}KB${NC}  "
+            printf '%b' "${DIM}avg${NC} ${rf_avg}${DIM}KB${NC}  "
+            printf '%b' "${DIM}final${NC} ${rf_col}${rf_fin}${NC}${DIM}KB${NC}"
+            printf '  %b(%d smpl)%b\n' "$DIM" "$rc_smp" "$NC"
+        fi
 
         # ── RTT detail sub-row ────────────────────────────────────────────
         local stream_tgt="${S_TARGET[$i]:-}"
@@ -10020,7 +10356,7 @@ show_main_menu() {
 
     # ── Header ────────────────────────────────────────────────────────────
     printf '+%s+\n' "$(rpt '=' $inner)"
-    bcenter "${BOLD}PRISM${NC}  ${DIM}Performance Real-time iPerf3 Stream Manager${NC}  ${BOLD}v8.3.2${NC}"
+    bcenter "${BOLD}PRISM${NC}  ${DIM}Performance Real-time iPerf3 Stream Manager${NC}  ${BOLD}v8.3.3${NC}"
     printf '+%s+\n' "$(rpt '=' $inner)"
 
     # ── System info: plain text only so bleft padding is exact ────────────
@@ -10146,6 +10482,8 @@ main_menu() {
                 PING_PIDS=();  PING_LOGFILES=()
                 S_RTT_MIN=();  S_RTT_AVG=();  S_RTT_MAX=()
                 S_RTT_JITTER=(); S_RTT_LOSS=(); S_RTT_SAMPLES=()
+                S_CWND_CURRENT=(); S_CWND_MIN=();   S_CWND_MAX=()
+                S_CWND_FINAL=();   S_CWND_SAMPLES=(); S_CWND_SUM=()
                 if (( BASH_MAJOR >= 4 )); then
                     PMTU_RESULTS=(); PMTU_STATUS=(); PMTU_RECOMMEND=()
                 fi
@@ -10172,6 +10510,8 @@ main_menu() {
                 PING_PIDS=();   PING_LOGFILES=()
                 S_RTT_MIN=();   S_RTT_AVG=();  S_RTT_MAX=()
                 S_RTT_JITTER=(); S_RTT_LOSS=(); S_RTT_SAMPLES=()
+                S_CWND_CURRENT=(); S_CWND_MIN=();   S_CWND_MAX=()
+                S_CWND_FINAL=();   S_CWND_SAMPLES=(); S_CWND_SUM=()
                 ;;
 
             5)
@@ -10191,6 +10531,8 @@ main_menu() {
                 STREAM_PIDS=(); PING_PIDS=(); PING_LOGFILES=()
                 S_RTT_MIN=();  S_RTT_AVG=();  S_RTT_MAX=()
                 S_RTT_JITTER=(); S_RTT_LOSS=(); S_RTT_SAMPLES=()
+                S_CWND_CURRENT=(); S_CWND_MIN=();   S_CWND_MAX=()
+                S_CWND_FINAL=();   S_CWND_SAMPLES=(); S_CWND_SUM=()
                 S_BIDIR=()
                 MTP_BASE_PORT=5201
                 MTP_PORT_MODE="auto"
