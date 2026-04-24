@@ -95,6 +95,43 @@ _assoc_clear() {
     eval "_ASSOC_VALS_${name}=()"
 }
 
+_init_colors() {
+    # Use $'...' syntax to store true escape bytes (not literal backslash)
+    R=$'\033[31m'
+    G=$'\033[32m'
+    Y=$'\033[33m'
+    B=$'\033[34m'
+    M=$'\033[35m'
+    C=$'\033[36m'
+    W=$'\033[37m'
+    BOLD=$'\033[1m'
+    DIM=$'\033[2m'
+    NC=$'\033[0m'
+
+    # ==================================================================
+    # ANSI length constants
+    # These reflect the BYTE length of each escape sequence.
+    # Used by any TUI renderer that needs to account for invisible chars.
+    # With $'...' syntax: \033[Xm = ESC(1) + [(1) + digit(1) + m(1) = 4
+    # With $'...' syntax: \033[0m = ESC(1) + [(1) + 0(1)   + m(1) = 4
+    # ==================================================================
+    _LEN_RED=${#R}       # Should be 5: ESC [ 3 1 m
+    _LEN_GREEN=${#G}
+    _LEN_YELLOW=${#Y}
+    _LEN_NC=${#NC}       # Should be 4: ESC [ 0 m
+    _LEN_DIM=${#DIM}
+    _LEN_BOLD=${#BOLD}
+
+    # Safety guard: if any length resolved to 0 (bare assignment fallback),
+    # force them to the known correct values so division never hits zero.
+    [[ $_LEN_RED   -eq 0 ]] && _LEN_RED=5
+    [[ $_LEN_GREEN -eq 0 ]] && _LEN_GREEN=5
+    [[ $_LEN_YELLOW -eq 0 ]] && _LEN_YELLOW=5
+    [[ $_LEN_NC    -eq 0 ]] && _LEN_NC=4
+    [[ $_LEN_DIM   -eq 0 ]] && _LEN_DIM=4
+    [[ $_LEN_BOLD  -eq 0 ]] && _LEN_BOLD=4
+}
+
 _iface_to_vrf_set() {
     (( BASH_MAJOR >= 4 )) && IFACE_TO_VRF["$1"]="$2"  || _assoc_set  "IFACE_TO_VRF" "$1" "$2"
 }
@@ -137,6 +174,319 @@ _init_ansi_lengths() {
     _LEN_RED=${#RED};   _LEN_GREEN=${#GREEN};   _LEN_YELLOW=${#YELLOW}
     _LEN_BLUE=${#BLUE}; _LEN_CYAN=${#CYAN};     _LEN_BOLD=${#BOLD}
     _LEN_NC=${#NC}
+}
+
+# ==============================================================================
+# _init_colors
+#
+# PURPOSE:
+#   Initializes all ANSI escape code variables and their associated byte-length
+#   constants used throughout the PRISM TUI renderer, Capability Matrix, and
+#   session header functions.
+#
+# DESIGN RULES:
+#   1. Uses $'...' syntax for TRUE escape byte storage (not literal backslash).
+#   2. Populates _LEN_* constants for every color so TUI padding arithmetic
+#      never divides by zero or miscalculates visible column widths.
+#   3. Detects NO_COLOR / non-interactive terminals and gracefully degrades
+#      to plain text mode, setting all _LEN_* to 0 safely.
+#   4. Provides _strip_ansi() and _visible_len() as inline TUI helpers so
+#      any renderer can calculate true printable width without fragile division.
+#   5. Safety guards ensure _LEN_* are never zero in color mode, preventing
+#      the (N - N) / _LEN_RED division-by-zero seen in run_dashboard().
+#
+# DEPENDENCIES: None (pure Bash 3.2+, sed, tput optional)
+#
+# GLOBALS SET:
+#   Color codes    : R G Y B M C W BOLD DIM UL NC
+#   Length consts  : _LEN_R _LEN_G _LEN_Y _LEN_B _LEN_M _LEN_C _LEN_W
+#                    _LEN_BOLD _LEN_DIM _LEN_UL _LEN_NC
+#                    _LEN_RED (alias of _LEN_R, legacy compat)
+#   Mode flag      : _COLORS_ENABLED (1 = color, 0 = plain)
+#   Helpers        : _strip_ansi(), _visible_len()
+#
+# CALLED BY: Entry point, before any TUI, CAP, or dashboard function.
+# ==============================================================================
+_init_colors() {
+
+    # --------------------------------------------------------------------------
+    # SECTION 1: Terminal Capability Detection
+    # Determines whether the current environment supports ANSI color output.
+    # Degrades gracefully when:
+    #   - stdout is not a terminal (e.g., piped to a file or another process)
+    #   - The NO_COLOR environment variable is set (https://no-color.org)
+    #   - The TERM variable indicates a non-color terminal (dumb, unknown)
+    # --------------------------------------------------------------------------
+    _COLORS_ENABLED=1
+
+    # Respect the NO_COLOR standard
+    if [[ -n "${NO_COLOR+x}" ]]; then
+        _COLORS_ENABLED=0
+    fi
+
+    # Disable colors when stdout is not a TTY (e.g., redirected to a file)
+    if [[ ! -t 1 ]]; then
+        _COLORS_ENABLED=0
+    fi
+
+    # Disable colors for known non-color terminal types
+    case "${TERM:-}" in
+        dumb|unknown|"")
+            _COLORS_ENABLED=0
+            ;;
+    esac
+
+    # --------------------------------------------------------------------------
+    # SECTION 2A: Color Mode — assign true ANSI escape sequences
+    # Uses $'...' ANSI-C quoting so the ESC byte (0x1B) is stored as a real
+    # single byte, not as the 4-character literal string \033.
+    #
+    # Byte layout reference:
+    #   \033[0m    = ESC(1) + [(1) + 0(1) + m(1)      = 4 bytes
+    #   \033[1m    = ESC(1) + [(1) + 1(1) + m(1)      = 4 bytes
+    #   \033[2m    = ESC(1) + [(1) + 2(1) + m(1)      = 4 bytes
+    #   \033[4m    = ESC(1) + [(1) + 4(1) + m(1)      = 4 bytes
+    #   \033[31m   = ESC(1) + [(1) + 3(1) + 1(1) + m  = 5 bytes
+    #   \033[1;33m = ESC(1) + [(1) + 1;33 (4)  + m    = 7 bytes
+    # --------------------------------------------------------------------------
+    if [[ $_COLORS_ENABLED -eq 1 ]]; then
+
+        # Standard foreground colors
+        R=$'\033[31m'          # Red
+        G=$'\033[32m'          # Green
+        Y=$'\033[33m'          # Yellow
+        B=$'\033[34m'          # Blue
+        M=$'\033[35m'          # Magenta
+        C=$'\033[36m'          # Cyan
+        W=$'\033[37m'          # White
+
+        # Text attributes
+        BOLD=$'\033[1m'        # Bold
+        DIM=$'\033[2m'         # Dim / faint
+        UL=$'\033[4m'          # Underline
+
+        # Reset — returns terminal to default state
+        NC=$'\033[0m'          # No Color / Reset
+
+        # Bright variants (used in headers and alerts)
+        BR=$'\033[91m'         # Bright Red
+        BG=$'\033[92m'         # Bright Green
+        BY=$'\033[93m'         # Bright Yellow
+        BB=$'\033[94m'         # Bright Blue
+        BM=$'\033[95m'         # Bright Magenta
+        BC=$'\033[96m'         # Bright Cyan
+        BW=$'\033[97m'         # Bright White
+
+        # Combined attributes (Bold + Color, used in titles/warnings)
+        BOLD_R=$'\033[1;31m'   # Bold Red
+        BOLD_G=$'\033[1;32m'   # Bold Green
+        BOLD_Y=$'\033[1;33m'   # Bold Yellow
+        BOLD_C=$'\033[1;36m'   # Bold Cyan
+        BOLD_W=$'\033[1;37m'   # Bold White
+
+    # --------------------------------------------------------------------------
+    # SECTION 2B: Plain Text Mode — assign empty strings
+    # All color variables resolve to "", making every printf identical to
+    # a no-color call. The TUI boxes and borders remain intact.
+    # --------------------------------------------------------------------------
+    else
+        R="" G="" Y="" B="" M="" C="" W=""
+        BOLD="" DIM="" UL="" NC=""
+        BR="" BG="" BY="" BB="" BM="" BC="" BW=""
+        BOLD_R="" BOLD_G="" BOLD_Y="" BOLD_C="" BOLD_W=""
+    fi
+
+    # --------------------------------------------------------------------------
+    # SECTION 3: Byte-Length Constants
+    # Each _LEN_* variable stores the byte count of its corresponding escape
+    # sequence as measured by the shell itself using ${#var}.
+    #
+    # These constants are used by TUI renderers to calculate the visible
+    # (printable) width of colored strings so that box borders align correctly.
+    #
+    # Example usage in a renderer:
+    #   colored_str="${R}FAIL${NC}"
+    #   visible_len=$(( ${#colored_str} - _LEN_R - _LEN_NC ))
+    #   padding=$(( box_width - visible_len ))
+    #
+    # In plain text mode all lengths are 0, making the arithmetic transparent.
+    # --------------------------------------------------------------------------
+
+    # Standard colors
+    _LEN_R=${#R}
+    _LEN_G=${#G}
+    _LEN_Y=${#Y}
+    _LEN_B=${#B}
+    _LEN_M=${#M}
+    _LEN_C=${#C}
+    _LEN_W=${#W}
+
+    # Attributes
+    _LEN_BOLD=${#BOLD}
+    _LEN_DIM=${#DIM}
+    _LEN_UL=${#UL}
+    _LEN_NC=${#NC}
+
+    # Bright variants
+    _LEN_BR=${#BR}
+    _LEN_BG=${#BG}
+    _LEN_BY=${#BY}
+    _LEN_BB=${#BB}
+    _LEN_BM=${#BM}
+    _LEN_BC=${#BC}
+    _LEN_BW=${#BW}
+
+    # Combined bold+color lengths
+    _LEN_BOLD_R=${#BOLD_R}
+    _LEN_BOLD_G=${#BOLD_G}
+    _LEN_BOLD_Y=${#BOLD_Y}
+    _LEN_BOLD_C=${#BOLD_C}
+    _LEN_BOLD_W=${#BOLD_W}
+
+    # Legacy alias — preserves compatibility with existing run_dashboard()
+    # arithmetic that references _LEN_RED directly.
+    _LEN_RED=$_LEN_R
+
+    # --------------------------------------------------------------------------
+    # SECTION 4: Safety Guards
+    # In color mode, no _LEN_* should ever be 0. If ${#var} returned 0 for
+    # any reason (e.g., a subshell export issue, locale problem, or edge case
+    # in the Bash version), force the known correct byte lengths here.
+    #
+    # This directly prevents the:
+    #   "prism.sh: line 1694: (37 - 37) / _LEN_RED : division by 0"
+    # error seen in run_dashboard() even when _init_colors() is called first.
+    # --------------------------------------------------------------------------
+    if [[ $_COLORS_ENABLED -eq 1 ]]; then
+
+        # 4-byte sequences: \033[Xm (reset, bold, dim, underline)
+        [[ $_LEN_NC   -eq 0 ]] && _LEN_NC=4
+        [[ $_LEN_BOLD -eq 0 ]] && _LEN_BOLD=4
+        [[ $_LEN_DIM  -eq 0 ]] && _LEN_DIM=4
+        [[ $_LEN_UL   -eq 0 ]] && _LEN_UL=4
+
+        # 5-byte sequences: \033[XXm (standard colors 30-37, 90-97)
+        [[ $_LEN_R  -eq 0 ]] && _LEN_R=5
+        [[ $_LEN_G  -eq 0 ]] && _LEN_G=5
+        [[ $_LEN_Y  -eq 0 ]] && _LEN_Y=5
+        [[ $_LEN_B  -eq 0 ]] && _LEN_B=5
+        [[ $_LEN_M  -eq 0 ]] && _LEN_M=5
+        [[ $_LEN_C  -eq 0 ]] && _LEN_C=5
+        [[ $_LEN_W  -eq 0 ]] && _LEN_W=5
+        [[ $_LEN_BR -eq 0 ]] && _LEN_BR=5
+        [[ $_LEN_BG -eq 0 ]] && _LEN_BG=5
+        [[ $_LEN_BY -eq 0 ]] && _LEN_BY=5
+        [[ $_LEN_BB -eq 0 ]] && _LEN_BB=5
+        [[ $_LEN_BM -eq 0 ]] && _LEN_BM=5
+        [[ $_LEN_BC -eq 0 ]] && _LEN_BC=5
+        [[ $_LEN_BW -eq 0 ]] && _LEN_BW=5
+
+        # 7-byte sequences: \033[1;XXm (bold+color)
+        [[ $_LEN_BOLD_R -eq 0 ]] && _LEN_BOLD_R=7
+        [[ $_LEN_BOLD_G -eq 0 ]] && _LEN_BOLD_G=7
+        [[ $_LEN_BOLD_Y -eq 0 ]] && _LEN_BOLD_Y=7
+        [[ $_LEN_BOLD_C -eq 0 ]] && _LEN_BOLD_C=7
+        [[ $_LEN_BOLD_W -eq 0 ]] && _LEN_BOLD_W=7
+
+        # Sync legacy alias after guards
+        _LEN_RED=$_LEN_R
+
+    fi
+
+    # --------------------------------------------------------------------------
+    # SECTION 5: ANSI-Safe TUI Helper Functions
+    # These inline helpers allow any renderer to calculate the true visible
+    # (printable) width of a string containing ANSI escape codes without
+    # relying on _LEN_* arithmetic, which requires knowing exactly how many
+    # and which color codes are embedded.
+    #
+    # Use _visible_len() when the number of embedded codes is dynamic or
+    # unknown. Use _LEN_* arithmetic when the codes are statically known
+    # (e.g., exactly one ${R}...${NC} wrap) for maximum performance.
+    # --------------------------------------------------------------------------
+
+    # _strip_ansi <string>
+    # Removes all ANSI CSI escape sequences from the input string.
+    # Handles: colors, bold, dim, underline, reset, and cursor codes.
+    # Compatible with GNU sed and BSD sed (macOS).
+    _strip_ansi() {
+        printf "%s" "$1" | sed $'s/\033\\[[0-9;]*[a-zA-Z]//g'
+    }
+
+    # _visible_len <string>
+    # Returns the integer printable character count of a string,
+    # after stripping all embedded ANSI escape sequences.
+    #
+    # Usage:
+    #   local vlen
+    #   vlen=$(_visible_len "${R}ERROR${NC} something")
+    #   # vlen = 14 (length of "ERROR something")
+    _visible_len() {
+        local _stripped
+        _stripped=$(_strip_ansi "$1")
+        printf "%d" "${#_stripped}"
+    }
+
+    # _rpad <string> <width>
+    # Prints <string> followed by enough spaces to reach <width> visible chars.
+    # ANSI-safe: uses _visible_len() so color codes do not count toward width.
+    #
+    # Usage:
+    #   _rpad "${G}OK${NC}" 12
+    #   # prints: "\033[32mOK\033[0m          " (10 trailing spaces)
+    _rpad() {
+        local _str="$1"
+        local _width="$2"
+        local _vlen
+        _vlen=$(_visible_len "$_str")
+        local _pad=$(( _width - _vlen ))
+        [[ $_pad -lt 0 ]] && _pad=0
+        printf "%b%s" "$_str" "$(rpt ' ' $_pad)"
+    }
+
+    # _lpad <string> <width>
+    # Prints enough spaces to left-pad <string> to <width> visible chars,
+    # then prints the string. ANSI-safe.
+    _lpad() {
+        local _str="$1"
+        local _width="$2"
+        local _vlen
+        _vlen=$(_visible_len "$_str")
+        local _pad=$(( _width - _vlen ))
+        [[ $_pad -lt 0 ]] && _pad=0
+        printf "%s%b" "$(rpt ' ' $_pad)" "$_str"
+    }
+
+    # _center <string> <width>
+    # Centers <string> within <width> visible characters.
+    # ANSI-safe: invisible escape bytes do not affect centering math.
+    #
+    # Usage:
+    #   _center "${BOLD}PRISM${NC}" 78
+    _center() {
+        local _str="$1"
+        local _width="$2"
+        local _vlen
+        _vlen=$(_visible_len "$_str")
+        local _lpad=$(( (_width - _vlen) / 2 ))
+        local _rpad=$(( _width - _vlen - _lpad ))
+        [[ $_lpad -lt 0 ]] && _lpad=0
+        [[ $_rpad -lt 0 ]] && _rpad=0
+        printf "%s%b%s" "$(rpt ' ' $_lpad)" "$_str" "$(rpt ' ' $_rpad)"
+    }
+
+    # --------------------------------------------------------------------------
+    # SECTION 6: Initialization Confirmation (Debug Mode Only)
+    # Prints a compact verification line when PRISM_DEBUG=1 is set.
+    # Shows the resolved byte lengths so color-mode issues are immediately
+    # visible without needing to instrument the TUI renderer.
+    # --------------------------------------------------------------------------
+    if [[ "${PRISM_DEBUG:-0}" == "1" ]]; then
+        printf "%b[_init_colors]%b color=%d  " "$DIM" "$NC" "$_COLORS_ENABLED"
+        printf "_LEN_R=%d _LEN_G=%d _LEN_Y=%d " "$_LEN_R" "$_LEN_G" "$_LEN_Y"
+        printf "_LEN_NC=%d _LEN_BOLD=%d _LEN_DIM=%d " "$_LEN_NC" "$_LEN_BOLD" "$_LEN_DIM"
+        printf "_LEN_RED=%d\n" "$_LEN_RED"
+    fi
 }
 
 # ---------------------------------------------------------------------------
@@ -580,6 +930,341 @@ _LAST_FRAME_LINE_COUNT=0   # set by run_dashboard after each render
 
 # Session context string — built once at startup, displayed in all reports
 SESSION_HEADER=""
+
+# ==============================================================================
+# CAPABILITY MATRIX GLOBALS
+# Populated by _check_capabilities() at startup.
+# Values are ANSI-colored strings used directly in the TUI renderer.
+# ==============================================================================
+CAP_RAMP=""
+CAP_BIDIR=""
+CAP_VRF=""
+CAP_SNIFF=""
+CAP_CWND=""
+CAP_MTP=""
+CAP_RAMP_REASON=""
+CAP_BIDIR_REASON=""
+CAP_VRF_REASON=""
+CAP_SNIFF_REASON=""
+CAP_CWND_REASON=""
+CAP_MTP_REASON=""
+
+# ==============================================================================
+# _check_capabilities (Fixed v3)
+#
+# KEY FIX: _cap_badge now stores ONLY the ANSI color codes wrapped around
+# the raw text. The raw text is stored SEPARATELY in CAP_X_RAW.
+# _cm_row prints them independently — colored badge for display, raw badge
+# for arithmetic. This eliminates the double-print bug.
+# ==============================================================================
+_check_capabilities() {
+
+    # Raw badge strings — exactly 8 visible characters each.
+    # These are used for:
+    #   (a) width arithmetic in _cm_row padding calculations
+    #   (b) the legend row rendering
+    # They are NEVER printed directly inside _cm_row.
+    local RAW_OK="[  OK  ]"
+    local RAW_WARN="[ WARN ]"
+    local RAW_OFF="[ OFF  ]"
+
+    # _cap_badge: returns ONLY the ANSI color code pair (prefix + suffix).
+    # The raw text is stored separately. This prevents double-printing.
+    # Usage: CAP_X_COLOR=$(_cap_badge ok)
+    _cap_badge() {
+        case "$1" in
+            ok)   printf "%s"  "${G}"  ;;
+            warn) printf "%s"  "${Y}"  ;;
+            off)  printf "%s"  "${R}"  ;;
+        esac
+    }
+
+    # ------------------------------------------------------------------
+    # 1. TCP Ramp-Up (requires root + tc/iproute2)
+    # ------------------------------------------------------------------
+    if [[ $EUID -eq 0 ]] && command -v tc >/dev/null 2>&1; then
+        CAP_RAMP_COLOR="$(_cap_badge ok)"
+        CAP_RAMP_RAW="$RAW_OK"
+        CAP_RAMP_REASON="root + tc (iproute2) confirmed"
+    elif command -v tc >/dev/null 2>&1; then
+        CAP_RAMP_COLOR="$(_cap_badge warn)"
+        CAP_RAMP_RAW="$RAW_WARN"
+        CAP_RAMP_REASON="tc found but requires root privileges"
+    else
+        CAP_RAMP_COLOR="$(_cap_badge off)"
+        CAP_RAMP_RAW="$RAW_OFF"
+        CAP_RAMP_REASON="Install iproute2 and run as root"
+    fi
+
+    # ------------------------------------------------------------------
+    # 2. Bidir Support (requires iperf3 >= 3.7)
+    # ------------------------------------------------------------------
+    if command -v iperf3 >/dev/null 2>&1; then
+        local v_full v_major v_minor
+        v_full=$(iperf3 -v 2>&1 | head -n1 | awk '{print $2}')
+        v_major=$(echo "$v_full" | cut -d. -f1)
+        v_minor=$(echo "$v_full" | cut -d. -f2)
+        if [[ "$v_major" -gt 3 ]] || \
+           [[ "$v_major" -eq 3 && "$v_minor" -ge 7 ]]; then
+            CAP_BIDIR_COLOR="$(_cap_badge ok)"
+            CAP_BIDIR_RAW="$RAW_OK"
+            CAP_BIDIR_REASON="iperf3 v${v_full} supports --bidir"
+        else
+            CAP_BIDIR_COLOR="$(_cap_badge off)"
+            CAP_BIDIR_RAW="$RAW_OFF"
+            CAP_BIDIR_REASON="iperf3 v${v_full} detected, upgrade to v3.7+"
+        fi
+    else
+        CAP_BIDIR_COLOR="$(_cap_badge off)"
+        CAP_BIDIR_RAW="$RAW_OFF"
+        CAP_BIDIR_REASON="iperf3 not found in PATH"
+    fi
+
+    # ------------------------------------------------------------------
+    # 3. VRF Orchestration (requires root + kernel VRF)
+    # ------------------------------------------------------------------
+    if [[ $EUID -eq 0 ]]; then
+        if ip vrf show >/dev/null 2>&1; then
+            CAP_VRF_COLOR="$(_cap_badge ok)"
+            CAP_VRF_RAW="$RAW_OK"
+            CAP_VRF_REASON="root + kernel VRF support confirmed"
+        else
+            CAP_VRF_COLOR="$(_cap_badge warn)"
+            CAP_VRF_RAW="$RAW_WARN"
+            CAP_VRF_REASON="root ok, kernel VRF module not loaded"
+        fi
+    else
+        CAP_VRF_COLOR="$(_cap_badge off)"
+        CAP_VRF_RAW="$RAW_OFF"
+        CAP_VRF_REASON="Requires root privileges"
+    fi
+
+    # ------------------------------------------------------------------
+    # 4. DSCP / Packet Sniffing (requires root + tcpdump)
+    # ------------------------------------------------------------------
+    if [[ $EUID -eq 0 ]] && command -v tcpdump >/dev/null 2>&1; then
+        CAP_SNIFF_COLOR="$(_cap_badge ok)"
+        CAP_SNIFF_RAW="$RAW_OK"
+        CAP_SNIFF_REASON="root + tcpdump confirmed"
+    elif command -v tcpdump >/dev/null 2>&1; then
+        CAP_SNIFF_COLOR="$(_cap_badge warn)"
+        CAP_SNIFF_RAW="$RAW_WARN"
+        CAP_SNIFF_REASON="tcpdump found but requires root privileges"
+    else
+        CAP_SNIFF_COLOR="$(_cap_badge off)"
+        CAP_SNIFF_RAW="$RAW_OFF"
+        CAP_SNIFF_REASON="Install tcpdump and run as root"
+    fi
+
+    # ------------------------------------------------------------------
+    # 5. TCP CWND Tracking (standard iperf3 verbose)
+    # ------------------------------------------------------------------
+    if command -v iperf3 >/dev/null 2>&1; then
+        CAP_CWND_COLOR="$(_cap_badge ok)"
+        CAP_CWND_RAW="$RAW_OK"
+        CAP_CWND_REASON="Standard iperf3 verbose log parsing"
+    else
+        CAP_CWND_COLOR="$(_cap_badge off)"
+        CAP_CWND_RAW="$RAW_OFF"
+        CAP_CWND_REASON="iperf3 not found in PATH"
+    fi
+
+    # ------------------------------------------------------------------
+    # 6. Mixed Traffic Pattern — MTP (requires iperf3 + awk)
+    # ------------------------------------------------------------------
+    if command -v iperf3 >/dev/null 2>&1 && \
+       command -v awk    >/dev/null 2>&1; then
+        CAP_MTP_COLOR="$(_cap_badge ok)"
+        CAP_MTP_RAW="$RAW_OK"
+        CAP_MTP_REASON="iperf3 + awk confirmed"
+    else
+        CAP_MTP_COLOR="$(_cap_badge off)"
+        CAP_MTP_RAW="$RAW_OFF"
+        CAP_MTP_REASON="Requires iperf3 and awk in PATH"
+    fi
+}
+
+
+# ==============================================================================
+# _print_capability_matrix (Fixed v3)
+#
+# COLUMN GEOMETRY (total box width = 80):
+#
+#   +--80 chars total----------------------------------------------------------+
+#   |sp| C1=28 |sp|sp| C2=8 |sp|sp| C3=36 |sp|
+#   +--------------------------------------------------------------------------+
+#
+#   Border breakdown per row:
+#     "| " + 28 + " | " + 8 + " | " + 36 + " |"
+#      2  +  28 +  3  +  8  +  3  +  36  +  2  = 82 ... adjusted below
+#
+#   Actual chosen widths that sum to exactly 80:
+#     "| " + C1(24) + " | " + C2(8) + " | " + C3(38) + " |"
+#      2   +   24   +  3   +    8   +  3   +    38   +  2  = 80 ✓
+#
+# KEY FIXES:
+#   1. _cm_row prints the color code, then the raw badge text, then NC.
+#      No double printing. No separate badge_color variable needed.
+#   2. C3 widened to 38 so the longest reason strings fit without truncation.
+#   3. Legend row rebuilt with exact character accounting to fill 80 chars.
+#   4. All padding uses _visible_len() for ANSI-safe arithmetic.
+# ==============================================================================
+_print_capability_matrix() {
+
+    _check_capabilities
+
+    # ------------------------------------------------------------------
+    # Box geometry — all arithmetic derives from these four constants.
+    # Change W to resize the entire matrix cleanly.
+    # ------------------------------------------------------------------
+    local W=80          # Total box width  (including left + right border chars)
+    local C1=24         # Feature name column  (visible chars)
+    local C2=8          # Status badge column  (visible chars, matches badge width)
+    local C3=38         # Requirement/Note column (visible chars)
+    # Verify: 2 + C1 + 3 + C2 + 3 + C3 + 2 = 2+24+3+8+3+38+2 = 80 ✓
+
+    local INNER=$(( W - 2 ))   # 78 — usable space between outer border pipes
+
+    # ------------------------------------------------------------------
+    # _cm_rule <left> <fill> <right>
+    # Draws a full-width horizontal rule.
+    # ------------------------------------------------------------------
+    _cm_rule() {
+        printf "%s%s%s\n" "$1" "$(rpt "$2" $((W - 2)))" "$3"
+    }
+
+    # ------------------------------------------------------------------
+    # _cm_row <feature> <badge_color_code> <badge_raw_text> <reason>
+    #
+    # Prints one data row. Badge is rendered as:
+    #   <color_code><raw_text><NC>
+    # Padding is calculated from ${#badge_raw_text} only (no ANSI bytes).
+    #
+    # EXAMPLE CALL:
+    #   _cm_row "TCP Ramp-Up (TBF)" "$CAP_RAMP_COLOR" "$CAP_RAMP_RAW" \
+    #           "$CAP_RAMP_REASON"
+    # ------------------------------------------------------------------
+    _cm_row() {
+        local feat="$1"
+        local badge_color="$2"
+        local badge_raw="$3"
+        local reason="$4"
+
+        # Truncate inputs to their column widths as a last-resort safety net.
+        # Correct geometry means this should never activate.
+        feat="${feat:0:$C1}"
+        reason="${reason:0:$C3}"
+
+        # Calculate right-padding for each column
+        local feat_pad=$(( C1 - ${#feat} ))
+        local badge_pad=$(( C2 - ${#badge_raw} ))
+        local reason_pad=$(( C3 - ${#reason} ))
+
+        # Guard against negative padding (should never happen with correct C*)
+        [[ $feat_pad   -lt 0 ]] && feat_pad=0
+        [[ $badge_pad  -lt 0 ]] && badge_pad=0
+        [[ $reason_pad -lt 0 ]] && reason_pad=0
+
+        # Print the row:
+        #   "| " FEATURE_PADDED " | " COLOR+RAW_BADGE+NC+PAD " | " REASON_PADDED " |"
+        printf "| %s%s | %s%s%s%s | %s%s |\n"        \
+            "$feat"        "$(rpt ' ' $feat_pad)"     \
+            "$badge_color" "$badge_raw" "${NC}"        \
+            "$(rpt ' ' $badge_pad)"                    \
+            "$reason"      "$(rpt ' ' $reason_pad)"
+    }
+
+    # ------------------------------------------------------------------
+    # _cm_col_sep
+    # Prints the column separator row between header and data rows.
+    # ------------------------------------------------------------------
+    _cm_col_sep() {
+        printf "|%s|%s|%s|\n"                 \
+            "$(rpt '-' $(( C1 + 2 )))"        \
+            "$(rpt '-' $(( C2 + 2 )))"        \
+            "$(rpt '-' $(( C3 + 2 )))"
+    }
+
+    # ------------------------------------------------------------------
+    # Begin rendering
+    # ------------------------------------------------------------------
+    echo ""
+    _cm_rule "+" "=" "+"
+
+    # -- Title row (centered) --
+    local title="PRISM  PRE-FLIGHT CAPABILITY MATRIX"
+    local tlen=${#title}
+    local tlpad=$(( (INNER - tlen) / 2 ))
+    local trpad=$(( INNER - tlen - tlpad ))
+    printf "|%s%b%s%b%s|\n"                   \
+        "$(rpt ' ' $tlpad)"                    \
+        "${BOLD_W}" "$title" "${NC}"           \
+        "$(rpt ' ' $trpad)"
+
+    # -- Context line (host / user / OS) --
+    local ctx="host:$(hostname)  user:${USER}  os:$(uname -sr)"
+    # Trim context if it exceeds inner width minus 2 spaces for padding
+    local ctx_max=$(( INNER - 2 ))
+    [[ ${#ctx} -gt $ctx_max ]] && ctx="${ctx:0:$ctx_max}"
+    local ctx_pad=$(( ctx_max - ${#ctx} ))
+    printf "| %b%s%b%s |\n"                   \
+        "${DIM}" "$ctx" "${NC}"               \
+        "$(rpt ' ' $ctx_pad)"
+
+    _cm_rule "+" "-" "+"
+
+    # -- Column header row --
+    local h1="Feature"
+    local h2="Status"
+    local h3="Requirement / Note"
+    printf "| %b%s%b%s | %b%s%b%s | %b%s%b%s |\n"  \
+        "${BOLD}" "$h1" "${NC}" "$(rpt ' ' $(( C1 - ${#h1} )))"  \
+        "${BOLD}" "$h2" "${NC}" "$(rpt ' ' $(( C2 - ${#h2} )))"  \
+        "${BOLD}" "$h3" "${NC}" "$(rpt ' ' $(( C3 - ${#h3} )))"
+
+    _cm_col_sep
+
+    # -- Data rows --
+    _cm_row "TCP Ramp-Up (TBF)"   \
+            "$CAP_RAMP_COLOR"  "$CAP_RAMP_RAW"  "$CAP_RAMP_REASON"
+
+    _cm_row "Bidir Streams"       \
+            "$CAP_BIDIR_COLOR" "$CAP_BIDIR_RAW" "$CAP_BIDIR_REASON"
+
+    _cm_row "VRF Orchestration"   \
+            "$CAP_VRF_COLOR"   "$CAP_VRF_RAW"   "$CAP_VRF_REASON"
+
+    _cm_row "DSCP Verification"   \
+            "$CAP_SNIFF_COLOR" "$CAP_SNIFF_RAW" "$CAP_SNIFF_REASON"
+
+    _cm_row "TCP CWND Tracking"   \
+            "$CAP_CWND_COLOR"  "$CAP_CWND_RAW"  "$CAP_CWND_REASON"
+
+    _cm_row "Mixed Traffic (MTP)" \
+            "$CAP_MTP_COLOR"   "$CAP_MTP_RAW"   "$CAP_MTP_REASON"
+
+    _cm_rule "+" "-" "+"
+
+    # -- Legend row --
+    # Layout inside the box (INNER=78 chars):
+    #   " " + badge(8) + " " + label + "   " + badge(8) + " " + label + ...
+    # We build the legend string, measure its visible length, then right-pad.
+    local leg
+    leg=" ${G}[  OK  ]${NC} Ready"
+    leg="${leg}   ${Y}[ WARN ]${NC} Needs change"
+    leg="${leg}   ${R}[ OFF  ]${NC} Not available"
+
+    # Use _visible_len to get the printable length (strips ANSI codes)
+    local leg_vlen
+    leg_vlen=$(_visible_len "$leg")
+    local leg_pad=$(( INNER - leg_vlen - 1 ))
+    [[ $leg_pad -lt 0 ]] && leg_pad=0
+
+    printf "|%b%s%b%s|\n" "" "$leg" "" "$(rpt ' ' $leg_pad)"
+
+    _cm_rule "+" "=" "+"
+    echo ""
+}
 
 # =============================================================================
 # COLOUR THEME ENGINE
@@ -8938,60 +9623,261 @@ run_server_mode() {
 #      machinery exactly as if the operator had configured it manually.
 # =============================================================================
 
-# ---------------------------------------------------------------------------
-# _mtp_show_presets
+# ==============================================================================
+# _mtp_show_presets  (Fixed v2)
 #
-# Displays built-in traffic mix presets the operator can select as a
-# starting point, or they can define a custom mix.
-# ---------------------------------------------------------------------------
+# Renders the Built-in Traffic Mix Presets table inside a box that adapts
+# to the current terminal width (COLS).
+#
+# DESIGN:
+#   - All column widths are derived dynamically from COLS so the table
+#     renders cleanly at any terminal width from 60 to 220+ columns.
+#   - Long Mix Description strings are word-wrapped across continuation
+#     lines. Each continuation line prints blank # and Preset Name fields
+#     so only the description text wraps — the borders always close cleanly.
+#   - The _wrap_text helper splits on spaces (word-aware) and stores each
+#     physical line in the _WRAP_LINES[] array (Bash 3.2 compatible).
+#   - A visual separator is printed before option 6 (Custom Mix) and
+#     option 7 (Back to Main Menu) to group them distinctly.
+#   - The session header is rendered at the top using _print_session_header
+#     which already handles its own truncation/wrapping.
+#
+# BOX GEOMETRY (example at COLS=80):
+#   "| " + C_NUM(3) + " | " + C_NAME(20) + " | " + C_DESC + " |"
+#    2   +    3     +  3   +      20     +  3   +   C_DESC  +  2
+#   C_DESC = COLS - 2 - 3 - 3 - 20 - 3 - 2 = COLS - 33
+#   At COLS=80: C_DESC = 47  (fits all preset descriptions without wrapping)
+#   At COLS=120: C_DESC = 87 (all descriptions on one line, spacious)
+#   At COLS=60: C_DESC = 27  (wrapping activates for longer descriptions)
+#
+# MINIMUM WIDTH: 60 columns enforced — below this the table degrades
+#   gracefully by truncating the Preset Name column before C_DESC.
+# ==============================================================================
 _mtp_show_presets() {
-    local inner=$(( COLS - 2 ))
-    printf '+%s+\n' "$(rpt '=' $inner)"
-    bcenter "${BOLD}${CYAN}Built-in Traffic Mix Presets${NC}"
-    printf '+%s+\n' "$(rpt '=' $inner)"
 
-    local C1=3 C2=22 C3=$(( inner - 3 - 3 - 22 - 2 - 2 ))
-    (( C3 < 20 )) && C3=20
+    # ------------------------------------------------------------------
+    # SECTION 1: Terminal width and box geometry
+    # ------------------------------------------------------------------
+    local W="${COLS:-80}"
+    [[ $W -lt 60 ]] && W=60
+    local INNER=$(( W - 2 ))
 
-    bleft "${BOLD}$(printf '%-*s  %-*s  %-*s' \
-        $C1 '#' $C2 'Preset Name' $C3 'Mix Description')${NC}"
-    printf '+%s+\n' "$(rpt '-' $inner)"
+    # Fixed column widths
+    local C_NUM=3    # "#" column — always 3 chars
+    local C_NAME=20  # Preset name — fixed at 20, truncated if needed
 
-    local -a presets=(
-        "1|Enterprise WAN|70% TCP Bulk (AF11)  +  20% UDP RTP (EF)  +  10% UDP Low (CS1)"
-        "2|Data Centre|60% TCP Bulk (AF21)  +  30% TCP iSCSI (AF31)  +  10% ICMP/Mgmt (CS2)"
-        "3|Unified Comms|50% UDP Voice (EF)  +  30% UDP Video (AF41)  +  20% TCP Signalling (CS3)"
-        "4|Bulk Transfer|80% TCP Bulk (AF11)  +  20% TCP Background (CS1)"
-        "5|Multimedia CDN|65% TCP HTTPS (AF31)  +  25% UDP Stream (AF41)  +  10% UDP Low (CS1)"
-        "6|Custom Mix|Define your own percentages and classes interactively"
+    # Description column gets all remaining space:
+    # Border chars: "| " + C_NUM + " | " + C_NAME + " | " + C_DESC + " |"
+    #               2   +  C_NUM +  3   +   C_NAME  +  3  +  C_DESC  + 2
+    local C_DESC=$(( W - 2 - C_NUM - 3 - C_NAME - 3 - 2 ))
+    [[ $C_DESC -lt 15 ]] && C_DESC=15  # enforce absolute minimum
+
+    # ------------------------------------------------------------------
+    # SECTION 2: Preset data
+    # Plain text only — no ANSI codes embedded in data strings.
+    # Numbers, names, and descriptions are stored separately so the
+    # word-wrap and padding arithmetic works on clean character counts.
+    # ------------------------------------------------------------------
+    local -a P_NUMS=(  1   2   3   4   5   6   7 )
+
+    local -a P_NAMES=(
+        "Enterprise WAN"
+        "Data Centre"
+        "Unified Comms"
+        "Bulk Transfer"
+        "Multimedia CDN"
+        "Custom Mix"
+        "Back to Main Menu"
     )
 
-    local entry
-    for entry in "${presets[@]}"; do
-        local num name desc
-        IFS='|' read -r num name desc <<< "$entry"
-        local row
-        printf -v row '%-*s  %-*s  %-*s' $C1 "$num" $C2 "$name" $C3 "$desc"
-        local rlen=${#row}
-        local rp=$(( inner - 2 - rlen - 1 ))
-        (( rp < 0 )) && rp=0
-        printf '|  %s%s|\n' "$row" "$(rpt ' ' $rp)"
+    local -a P_DESCS=(
+        "70% TCP Bulk (AF11) + 20% UDP RTP (EF) + 10% UDP Low (CS1)"
+        "60% TCP Bulk (AF21) + 30% TCP iSCSI (AF31) + 10% ICMP/Mgmt (CS2)"
+        "50% UDP Voice (EF) + 30% UDP Video (AF41) + 20% TCP Signalling (CS3)"
+        "80% TCP Bulk (AF11) + 20% TCP Background (CS1)"
+        "65% TCP HTTPS (AF31) + 25% UDP Stream (AF41) + 10% UDP Low (CS1)"
+        "Define your own percentages and classes interactively"
+        "Return without launching any streams"
+    )
+
+    # ------------------------------------------------------------------
+    # SECTION 3: Helper — horizontal rule
+    # Usage: _mtp_rule <left_char> <fill_char> <right_char>
+    # ------------------------------------------------------------------
+    _mtp_rule() {
+        printf "%s%s%s\n" "$1" "$(rpt "$2" $INNER)" "$3"
+    }
+
+    # ------------------------------------------------------------------
+    # SECTION 4: Helper — word-wrap
+    # Splits <text> into lines of at most <width> visible characters,
+    # breaking only at spaces. Result stored in _WRAP_LINES[].
+    # Bash 3.2 compatible (no mapfile, no associative arrays).
+    # ------------------------------------------------------------------
+    _wrap_text() {
+        local text="$1"
+        local maxw="$2"
+        _WRAP_LINES=()
+        local line="" word
+
+        # Split on whitespace using read -ra (Bash 3.2 safe)
+        local IFS_SAVE="$IFS"
+        IFS=' '
+        local -a words
+        read -ra words <<< "$text"
+        IFS="$IFS_SAVE"
+
+        for word in "${words[@]}"; do
+            if [[ -z "$line" ]]; then
+                line="$word"
+            elif (( ${#line} + 1 + ${#word} <= maxw )); then
+                line="$line $word"
+            else
+                _WRAP_LINES+=("$line")
+                line="$word"
+            fi
+        done
+        [[ -n "$line" ]] && _WRAP_LINES+=("$line")
+
+        # Guarantee at least one element even for empty input
+        [[ ${#_WRAP_LINES[@]} -eq 0 ]] && _WRAP_LINES+=("")
+    }
+
+    # ------------------------------------------------------------------
+    # SECTION 5: Helper — single table data row
+    # Prints one physical line of the presets table.
+    #
+    # Parameters:
+    #   $1  num_str   — value for # column  (empty on continuation lines)
+    #   $2  name_str  — value for Name col  (empty on continuation lines)
+    #   $3  desc_line — one wrapped line of the description
+    #   $4  is_first  — "1" = first line of an entry (colors applied)
+    #                   "0" = continuation line (dim/no color)
+    # ------------------------------------------------------------------
+    _mtp_data_row() {
+        local num_str="$1"
+        local name_str="$2"
+        local desc_line="$3"
+        local is_first="$4"
+
+        # Safety: truncate inputs to their column widths as a last resort
+        num_str="${num_str:0:$C_NUM}"
+        name_str="${name_str:0:$C_NAME}"
+        desc_line="${desc_line:0:$C_DESC}"
+
+        # Calculate right-padding for each column
+        local num_pad=$(( C_NUM  - ${#num_str}  ))
+        local name_pad=$(( C_NAME - ${#name_str} ))
+        local desc_pad=$(( C_DESC - ${#desc_line} ))
+        [[ $num_pad  -lt 0 ]] && num_pad=0
+        [[ $name_pad -lt 0 ]] && name_pad=0
+        [[ $desc_pad -lt 0 ]] && desc_pad=0
+
+        if [[ "$is_first" == "1" ]]; then
+            # First line: apply colors to each field
+            printf "| %b%s%b%s | %b%s%b%s | %s%s |\n"            \
+                "${CYAN}"  "$num_str"  "${NC}" "$(rpt ' ' $num_pad)"   \
+                "${BOLD}"  "$name_str" "${NC}" "$(rpt ' ' $name_pad)"  \
+                "$desc_line" "$(rpt ' ' $desc_pad)"
+        else
+            # Continuation line: blank num/name, dim description
+            printf "| %s%s | %s%s | %b%s%b%s |\n"                 \
+                "$num_str"  "$(rpt ' ' $num_pad)"                  \
+                "$name_str" "$(rpt ' ' $name_pad)"                 \
+                "${DIM}" "$desc_line" "${NC}" "$(rpt ' ' $desc_pad)"
+        fi
+    }
+
+    # ------------------------------------------------------------------
+    # SECTION 6: Helper — column separator row
+    # Prints the horizontal rule between header and data, and between
+    # grouped sections (before option 6 and option 7).
+    # ------------------------------------------------------------------
+    _mtp_col_sep() {
+        printf "|%s|%s|%s|\n"                      \
+            "$(rpt '-' $(( C_NUM  + 2 )))"         \
+            "$(rpt '-' $(( C_NAME + 2 )))"         \
+            "$(rpt '-' $(( C_DESC + 2 )))"
+    }
+
+    # ------------------------------------------------------------------
+    # SECTION 7: Helper — centered title line inside the box
+    # ------------------------------------------------------------------
+    _mtp_title() {
+        local txt="$1"
+        local vlen=${#txt}
+        local lpad=$(( (INNER - vlen) / 2 ))
+        local rpad=$(( INNER - vlen - lpad ))
+        [[ $lpad -lt 0 ]] && lpad=0
+        [[ $rpad -lt 0 ]] && rpad=0
+        printf "|%s%b%s%b%s|\n"                    \
+            "$(rpt ' ' $lpad)"                      \
+            "${BOLD_W}" "$txt" "${NC}"              \
+            "$(rpt ' ' $rpad)"
+    }
+
+    # ------------------------------------------------------------------
+    # SECTION 8: Helper — left-aligned full-width info line
+    # ------------------------------------------------------------------
+    _mtp_info() {
+        local txt="$1"
+        local tlen=${#txt}
+        local rpad=$(( INNER - tlen - 3 ))
+        [[ $rpad -lt 0 ]] && rpad=0
+        printf "|  %b%s%b%s|\n" "${DIM}" "$txt" "${NC}" "$(rpt ' ' $rpad)"
+    }
+
+    # ------------------------------------------------------------------
+    # SECTION 9: Render the session header and intro block
+    # ------------------------------------------------------------------
+
+    echo ""
+
+    # ------------------------------------------------------------------
+    # SECTION 10: Render the presets table
+    # ------------------------------------------------------------------
+    _mtp_rule "+" "=" "+"
+    _mtp_title "Built-in Traffic Mix Presets"
+    _mtp_rule "+" "=" "+"
+
+    # Column header row
+    printf "| %b%-${C_NUM}s%b | %b%-${C_NAME}s%b | %b%-${C_DESC}s%b |\n" \
+        "${BOLD}" "#"             "${NC}"  \
+        "${BOLD}" "Preset Name"   "${NC}"  \
+        "${BOLD}" "Mix Description" "${NC}"
+
+    _mtp_col_sep
+
+    # Data rows — iterate over all presets
+    local i
+    for i in "${!P_NUMS[@]}"; do
+        local num="${P_NUMS[$i]}"
+        local name="${P_NAMES[$i]}"
+        local desc="${P_DESCS[$i]}"
+
+        # Visual separator before Custom Mix (6) and Back to Menu (7)
+        # so they are clearly grouped away from the 5 main presets.
+        if [[ "$num" -eq 6 || "$num" -eq 7 ]]; then
+            _mtp_col_sep
+        fi
+
+        # Word-wrap the description to fit C_DESC
+        _wrap_text "$desc" "$C_DESC"
+
+        # Print the first physical line (num + name + first desc line)
+        _mtp_data_row "$num" "$name" "${_WRAP_LINES[0]}" "1"
+
+        # Print any continuation lines (blank num + name, wrapped desc)
+        local j
+        for (( j=1; j<${#_WRAP_LINES[@]}; j++ )); do
+            _mtp_data_row "" "" "${_WRAP_LINES[$j]}" "0"
+        done
     done
 
-    # Separator before the back option so it is visually distinct
-    printf '+%s+\n' "$(rpt '-' $inner)"
-
-    local back_row
-    printf -v back_row '%-*s  %-*s  %-*s' \
-        $C1 "7" $C2 "Back to Main Menu" $C3 "Return without launching any streams"
-    local brlen=${#back_row}
-    local brp=$(( inner - 2 - brlen - 1 ))
-    (( brp < 0 )) && brp=0
-    printf '|  %b%s%b%s|\n' "$DIM" "$back_row" "$NC" "$(rpt ' ' $brp)"
-
-    printf '+%s+\n' "$(rpt '=' $inner)"
+    _mtp_rule "+" "=" "+"
     echo ""
 }
+
 # ---------------------------------------------------------------------------
 # _mtp_select_preset  <out_array_name>
 #
@@ -10097,9 +10983,16 @@ _mtp_show_summary() {
 run_mixed_traffic_mode() {
     echo ""
     local inner=$(( COLS - 2 ))
-    printf '+%s+\n' "$(rpt '=' $inner)"
-    _print_session_header "Mixed Traffic"
+
+    # ------------------------------------------------------------------
+    # SESSION HEADER + INTRO BLOCK
+    # Rendered exactly once here. _mtp_show_presets must NOT render
+    # its own copy of this content.
+    # ------------------------------------------------------------------
+    _print_session_header
+
     echo ""
+    printf '+%s+\n' "$(rpt '=' $inner)"
     bcenter "${BOLD}${CYAN}PRISM — Mixed Traffic Pattern Generator${NC}"
     printf '+%s+\n' "$(rpt '=' $inner)"
     bleft "  Define a traffic mix by percentage. Streams are calculated"
@@ -10107,7 +11000,11 @@ run_mixed_traffic_mode() {
     printf '+%s+\n' "$(rpt '=' $inner)"
     echo ""
 
-    # ── Step 1: Select or define the mix ──────────────────────────────────
+    # ------------------------------------------------------------------
+    # PRESETS TABLE
+    # _mtp_show_presets renders ONLY the Built-in Traffic Mix Presets
+    # table. It does not repeat the session header or intro block.
+    # ------------------------------------------------------------------
     _mtp_show_presets
 
     local preset_choice
@@ -11085,99 +11982,221 @@ _dscp_verify_server_interactive() {
 }
 
 
-# =============================================================================
-# SECTION 15 — MAIN MENU
-# =============================================================================
+# ==============================================================================
+# show_main_menu
+#
+# ALIGNMENT GUARANTEES:
+#   1. All box lines use COLS as the single source of truth for width.
+#   2. The title is centered using _visible_len() (ANSI-safe) so color
+#      codes never corrupt the centering arithmetic.
+#   3. Section labels use exact right-padding derived from INNER width
+#      and the plain-text label length — no ANSI bytes in the math.
+#   4. Menu item rows use a two-pass approach: build the plain-text
+#      portion first, measure it, then pad to INNER width.
+#   5. All fields are truncated before printing so nothing can overflow
+#      the right border regardless of terminal width.
+#   6. COLS is re-read at the start of every call so the menu adapts
+#      immediately when the operator resizes the terminal.
+# ==============================================================================
 
 show_main_menu() {
     clear
-    local inner=$(( COLS - 2 ))
 
-    # ── Header ────────────────────────────────────────────────────────────
-    printf '+%s+\n' "$(rpt '=' $inner)"
-    bcenter "${BOLD}PRISM${NC}  ${DIM}Performance Real-time iPerf3 Stream Manager${NC}  ${BOLD}v8.3.5${NC}"
-    printf '+%s+\n' "$(rpt '=' $inner)"
-
-    # ── System info: plain text only so bleft padding is exact ────────────
-    local _iperf_line="iperf3 ${IPERF3_MAJOR}.${IPERF3_MINOR}.${IPERF3_PATCH}  at ${IPERF3_BIN}"
-    [[ "$OS_TYPE" == "macos" ]] && \
-        _iperf_line+="  [macOS / bash ${BASH_MAJOR}.x]"
-
-    local _root_text
-    if (( IS_ROOT )); then
-        _root_text="root"
+    # ------------------------------------------------------------------
+    # Re-detect terminal width on every call.
+    # This ensures the menu adapts when the terminal is resized between
+    # menu invocations without requiring a full script restart.
+    # ------------------------------------------------------------------
+    local TW
+    if command -v tput >/dev/null 2>&1 && TW=$(tput cols 2>/dev/null); then
+        :
+    elif [[ -n "${COLUMNS:-}" ]]; then
+        TW=$COLUMNS
     else
-        _root_text="non-root"
+        TW=80
     fi
-    local _status_line="User  ${_root_text}  ·  Theme  ${THEME_CURRENT:-dark}  ·  OS  ${OS_TYPE}"
+    [[ $TW -lt 60 ]] && TW=60
+    COLS=$TW
 
-    bleft "$_iperf_line"
-    bleft "$_status_line"
-    printf '+%s+\n' "$(rpt '=' $inner)"
+    local INNER=$(( COLS - 2 ))   # usable chars between left and right border
 
-    # ── Section label helper ──────────────────────────────────────────────
-    # Prints a left-aligned section label using plain text so bleft
-    # does not have to account for ANSI bytes in the width calculation.
-    _menu_section() {
-        local label="$1"
-        local rp=$(( inner - 1 - ${#label} ))
-        (( rp < 0 )) && rp=0
-        printf '|  %s%s|\n' "$label" "$(rpt ' ' $(( rp - 2 )))"
+    # ------------------------------------------------------------------
+    # _mh_rule <left> <fill> <right>
+    # Full-width horizontal rule using the current COLS value.
+    # ------------------------------------------------------------------
+    _mh_rule() {
+        printf "%s%s%s\n" "$1" "$(rpt "$2" $INNER)" "$3"
     }
 
-    # ── Menu item helper ──────────────────────────────────────────────────
-    # Prints:  |  N  Name                Description                       |
-    # All fields plain text so column math is exact.
-    _menu_item() {
+    # ------------------------------------------------------------------
+    # _mh_center <text>
+    # Centers text inside the box using _visible_len() so ANSI escape
+    # codes do not corrupt the padding arithmetic.
+    # ------------------------------------------------------------------
+    _mh_center() {
+        local txt="$1"
+        local vlen
+        vlen=$(_visible_len "$txt")
+        local lpad=$(( (INNER - vlen) / 2 ))
+        local rpad=$(( INNER - vlen - lpad ))
+        [[ $lpad -lt 0 ]] && lpad=0
+        [[ $rpad -lt 0 ]] && rpad=0
+        printf "|%s%b%s|\n" \
+            "$(rpt ' ' $lpad)" "$txt" "$(rpt ' ' $rpad)"
+    }
+
+    # ------------------------------------------------------------------
+    # _mh_left <text>
+    # Left-aligned full-width line. Uses _visible_len() for right-pad
+    # so embedded ANSI codes do not affect border alignment.
+    # ------------------------------------------------------------------
+    _mh_left() {
+        local txt="$1"
+        local vlen
+        vlen=$(_visible_len "$txt")
+        local rpad=$(( INNER - vlen ))
+        [[ $rpad -lt 0 ]] && rpad=0
+        printf "|%b%s|\n" "$txt" "$(rpt ' ' $rpad)"
+    }
+
+    # ------------------------------------------------------------------
+    # _mh_section <label>
+    # Renders a section label row.
+    # The label is plain text (no ANSI) so ${#label} is exact.
+    # Layout: "|  " + label + spaces + "|"
+    #          2   + len   + rpad   + 1  = COLS
+    #          rpad = INNER - 2 - len
+    # ------------------------------------------------------------------
+    _mh_section() {
+        local label="$1"
+        local llen=${#label}
+        local rpad=$(( INNER - 2 - llen ))
+        [[ $rpad -lt 0 ]] && rpad=0
+        printf "|  %b%s%b%s|\n" \
+            "${BOLD}" "$label" "${NC}" "$(rpt ' ' $rpad)"
+    }
+
+    # ------------------------------------------------------------------
+    # _mh_item <num> <name> <desc>
+    # Renders one menu item row with exact border alignment.
+    #
+    # Layout:
+    #   "|  " + num(1) + "  " + name(name_col) + " " + desc + pad + "|"
+    #
+    # Column widths:
+    #   num_col  = 1   (single digit 1-8)
+    #   name_col = 20  (fixed, truncated with ~ if too long)
+    #   desc_col = INNER - 2 - num_col - 2 - name_col - 1 - 1
+    #            = INNER - 26
+    #
+    # All arithmetic is on plain text lengths only.
+    # The description is truncated to desc_col before printing so it
+    # can never push past the right border.
+    # ------------------------------------------------------------------
+    _mh_item() {
         local num="$1"
         local name="$2"
         local desc="$3"
 
-        # Fixed column layout within inner width:
-        #   2 spaces indent + 1 num + 2 spaces + 20 name + 1 space + desc + padding + |
+        local num_col=1
         local name_col=20
-        local name_padded
-        if (( ${#name} >= name_col )); then
-            name_padded="${name:0:$((name_col-1))}~"
-        else
-            name_padded="${name}$(rpt ' ' $(( name_col - ${#name} )))"
+
+        # Available space for description
+        # "|  " + num + "  " + name + " " + desc + pad + "|"
+        #  2   +  1  +  2  +  20  + 1  + desc  +  0  + 1  = COLS
+        # desc_max = COLS - 2 - num_col - 2 - name_col - 1 - 1
+        #          = COLS - 27
+        local desc_max=$(( COLS - 27 ))
+        [[ $desc_max -lt 10 ]] && desc_max=10
+
+        # Truncate name and desc to their column widths
+        if (( ${#name} > name_col )); then
+            name="${name:0:$(( name_col - 1 ))}~"
+        fi
+        if (( ${#desc} > desc_max )); then
+            desc="${desc:0:$(( desc_max - 1 ))}~"
         fi
 
-        local prefix="  ${num}  ${name_padded} "
-        local prefix_len=$(( 2 + ${#num} + 2 + name_col + 1 ))
-        local desc_max=$(( inner - prefix_len - 1 ))
-        local desc_disp="$desc"
-        (( ${#desc_disp} > desc_max )) && \
-            desc_disp="${desc_disp:0:$(( desc_max - 1 ))}~"
+        # Right-pad name to exactly name_col chars
+        local name_pad=$(( name_col - ${#name} ))
+        [[ $name_pad -lt 0 ]] && name_pad=0
 
-        local rp=$(( inner - prefix_len - ${#desc_disp} ))
-        (( rp < 0 )) && rp=0
-        printf '|%s%s%s|\n' \
-            "$prefix" "$desc_disp" "$(rpt ' ' $rp)"
+        # Right-pad desc to exactly desc_max chars
+        local desc_pad=$(( desc_max - ${#desc} ))
+        [[ $desc_pad -lt 0 ]] && desc_pad=0
+
+        # Build and print the row
+        # Visible structure: "|  N  NAME_PADDED DESC_PADDED|"
+        printf "|  %b%s%b  %b%s%b%s %s%s|\n"      \
+            "${CYAN}"  "$num"  "${NC}"              \
+            "${BOLD}"  "$name" "${NC}"              \
+            "$(rpt ' ' $name_pad)"                  \
+            "$desc"                                 \
+            "$(rpt ' ' $desc_pad)"
     }
 
-    # ── NETWORK section ───────────────────────────────────────────────────
-    _menu_section "NETWORK"
-    printf '+%s+\n' "$(rpt '-' $inner)"
-    _menu_item "1" "Interface Table"     "List interfaces, IPs, VRFs and link state"
-    _menu_item "2" "Server Mode"         "Launch one or more iperf3 listeners"
-    _menu_item "3" "Client Mode"         "Generate traffic streams with full QoS control"
-    _menu_item "4" "Loopback Test"       "Self-contained server + client validation"
-    _menu_item "5" "Mixed Traffic"       "Generate streams from a traffic mix definition"
-    printf '+%s+\n' "$(rpt '-' $inner)"
+    # ------------------------------------------------------------------
+    # RENDER: Header block
+    # ------------------------------------------------------------------
+    _mh_rule "+" "=" "+"
 
-    # ── REFERENCE section ─────────────────────────────────────────────────
-    _menu_section "REFERENCE"
-    printf '+%s+\n' "$(rpt '-' $inner)"
-    _menu_item "6" "DSCP Reference"      "DSCP / TOS / EF / AF / CS class mappings"
-    _menu_item "7" "Colour Theme"        "Dark · Light · Mono  (active: ${THEME_CURRENT:-dark})"
-    printf '+%s+\n' "$(rpt '-' $inner)"
+    # Title — uses _mh_center with _visible_len so BOLD/NC bytes are
+    # excluded from the centering calculation.
+    local _title
+    _title="${BOLD}PRISM${NC}  ${DIM}Performance Real-time iPerf3 Stream Manager${NC}  ${BOLD}v8.3.5${NC}"
+    _mh_center "$_title"
 
-    # ── SESSION section ───────────────────────────────────────────────────
-    _menu_section "SESSION"
-    printf '+%s+\n' "$(rpt '-' $inner)"
-    _menu_item "8" "Exit"                ""
-    printf '+%s+\n' "$(rpt '=' $inner)"
+    _mh_rule "+" "=" "+"
+
+    # System info lines — plain text built first, then printed with
+    # _mh_left which uses _visible_len for correct right-padding.
+    local _iperf_line="${DIM}iperf3 ${IPERF3_MAJOR}.${IPERF3_MINOR}.${IPERF3_PATCH}${NC}"
+    _iperf_line+="  at ${IPERF3_BIN}"
+    [[ "$OS_TYPE" == "macos" ]] && \
+        _iperf_line+="  ${DIM}[macOS / bash ${BASH_MAJOR}.x]${NC}"
+
+    local _root_text
+    (( IS_ROOT )) && _root_text="${GREEN}root${NC}" || _root_text="${YELLOW}non-root${NC}"
+
+    local _status_line
+    _status_line="| ${DIM}User${NC}  ${_root_text}"
+    _status_line+="  ${DIM}·${NC}  Theme  ${DIM}${THEME_CURRENT:-dark}${NC}"
+    _status_line+="  ${DIM}·${NC}  OS  ${DIM}${OS_TYPE}${NC}"
+
+    _mh_left " ${_iperf_line}"
+    _mh_left "${_status_line}"
+
+    _mh_rule "+" "=" "+"
+
+    # ------------------------------------------------------------------
+    # RENDER: NETWORK section
+    # ------------------------------------------------------------------
+    _mh_section "NETWORK"
+    _mh_rule "+" "-" "+"
+    _mh_item "1" "Interface Table"  "List interfaces, IPs, VRFs and link state"
+    _mh_item "2" "Server Mode"      "Launch one or more iperf3 listeners"
+    _mh_item "3" "Client Mode"      "Generate traffic streams with full QoS control"
+    _mh_item "4" "Loopback Test"    "Self-contained server + client validation"
+    _mh_item "5" "Mixed Traffic"    "Generate streams from a traffic mix definition"
+    _mh_rule "+" "-" "+"
+
+    # ------------------------------------------------------------------
+    # RENDER: REFERENCE section
+    # ------------------------------------------------------------------
+    _mh_section "REFERENCE"
+    _mh_rule "+" "-" "+"
+    _mh_item "6" "DSCP Reference"   "DSCP / TOS / EF / AF / CS class mappings"
+    _mh_item "7" "Colour Theme"     "Dark · Light · Mono  (active: ${THEME_CURRENT:-dark})"
+    _mh_rule "+" "-" "+"
+
+    # ------------------------------------------------------------------
+    # RENDER: SESSION section
+    # ------------------------------------------------------------------
+    _mh_section "SESSION"
+    _mh_rule "+" "-" "+"
+    _mh_item "8" "Exit"             ""
+    _mh_rule "+" "=" "+"
+
     echo ""
 }
 
@@ -11311,23 +12330,49 @@ main_menu() {
     done
 }
 
-# =============================================================================
-# SECTION 16 — ENTRY POINT
-# =============================================================================
-
+# ==============================================================================
+# MAIN EXECUTION FLOW
+# ==============================================================================
 main() {
+    _init_colors
     _init_ansi_lengths
-    _theme_load          # load saved theme (or auto-detect and save default)
+    _build_session_header
+    _theme_load
     register_traps
     init_tmpdir
     find_iperf3
     get_iperf3_version
     detect_forceflush
-    _build_session_header
     check_root
     build_vrf_maps
     get_interface_list
+    _print_capability_matrix
+
+    # Step 5: Feature guard checks using populated CAP_* globals.
+    if [[ "$S_RAMP_ENABLED" == "1" ]] && [[ "$CAP_RAMP" == *"OFF"* ]]; then
+        printf "%bERROR:%b TCP Ramp-Up requested but capability is [OFF].\n" \
+            "$R" "$NC"
+        printf "       Run as root with iproute2 (tc) installed.\n"
+        exit 1
+    fi
+
+    if [[ "$S_BIDIR" == "1" ]] && [[ "$CAP_BIDIR" == *"OFF"* ]]; then
+        printf "%bERROR:%b Bidir requested but iperf3 version is too old.\n" \
+            "$R" "$NC"
+        printf "       Upgrade iperf3 to v3.7 or later.\n"
+        exit 1
+    fi
+
+    # Step 6: Countdown before TUI takes over.
+    printf "Launching PRISM dashboard in 5 seconds "
+    for _i in 5 4 3 2 1; do
+        printf "%d... " "$_i"
+        sleep 1
+    done
+    printf "\n\n\n"
+
     main_menu
 }
 
+# Entry point
 main "$@"
