@@ -202,3 +202,32 @@ sudo dnf install iperf3
 ```bash
 brew install iperf3
 ```
+
+### Step 4 — Install the full toolchain (recommended)
+
+Installing the complete set of optional dependencies enables all PRISM features including VRF routing, traffic shaping, DSCP verification, and path discovery.
+
+```bash
+# Debian / Ubuntu
+sudo apt install \
+    iperf3 iproute2 tcpdump traceroute \
+    dnsutils python3 ethtool jq
+
+# RHEL / CentOS / Rocky Linux
+sudo dnf install \
+    iperf3 iproute tcpdump traceroute \
+    bind-utils python3 ethtool jq
+
+# macOS (Homebrew)
+brew install iperf3 jq
+```
+
+### Step 5 — Run PRISM
+```bash
+# Recommended: run as root for full feature access
+sudo ./prism.sh
+
+# Non-root: core features work; VRF, tc, and tcpdump features
+# will display [ WARN ] or [ OFF ] in the Capability Matrix
+./prism.sh
+```
