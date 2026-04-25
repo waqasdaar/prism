@@ -2,7 +2,7 @@
 # =============================================================================
 # PRISM — Performance Real-time iPerf3 Stream Manager
 # Enterprise-grade multi-stream traffic orchestration with live QoS dashboard
-# Version: 8.3.6
+# Version: 8.3.7
 # Author : Waqas Daar (waqasdaar@gmail.com)
 # =============================================================================
 
@@ -1104,6 +1104,540 @@ SESSION_ID=""
 SESSION_NOTE=""
 SESSION_RUN_TS=""
 SESSION_HISTORY_FILE="${HOME}/.config/prism/session_history.json"
+
+# ==============================================================================
+# JSON RESULTS EXPORT GLOBALS
+# ==============================================================================
+
+# Directory where JSON result files are written.
+# Defaults to the directory containing the running script.
+JSON_EXPORT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"
+[[ -z "$JSON_EXPORT_DIR" || ! -d "$JSON_EXPORT_DIR" ]] && \
+    JSON_EXPORT_DIR="$(pwd)"
+
+# Array tracking every JSON export file created this run.
+# Populated by _json_export_write(). Used by cleanup prompt.
+declare -a JSON_EXPORT_FILES=()
+
+# Per-stream per-second bandwidth sample ring buffers for JSON export.
+# Each element is a colon-separated list of "timestamp:bps" pairs.
+# Variable naming: _JSON_SAMPLES_<stream_idx>
+# Populated by _json_sample_push() on every dashboard tick.
+# Flushed to the export file by _json_export_write().
+
+# Global flag: 1 = JSON export is enabled for the current session.
+# Set to 0 to suppress export (e.g. server-only mode).
+JSON_EXPORT_ENABLED=0
+
+# ==============================================================================
+# _json_sample_push  <stream_idx>  <bw_string>  <timestamp_epoch>
+#
+# Appends one per-second bandwidth sample to the in-memory ring buffer for
+# a stream. Called from _render_client_frame on every dashboard tick so that
+# a complete time-series is available for the JSON export.
+#
+# Storage format per entry: "EPOCH:BPS" colon-separated pairs,
+# entries separated by pipe "|" for easy splitting in awk.
+#
+# Variable name: _JSON_SAMPLES_<idx>
+#
+# Maximum samples retained: 3600 (1 hour at 1 sample/sec).
+# Older samples are trimmed from the front to enforce the limit.
+# ==============================================================================
+_json_sample_push() {
+    local idx="$1"
+    local bw_str="$2"
+    local ts="${3:-$(date +%s)}"
+    local varname="_JSON_SAMPLES_${idx}"
+
+    # Convert bandwidth string to integer bps for storage
+    local bps
+    bps=$(_spark_bw_to_bps "$bw_str")
+    [[ -z "$bps" || "$bps" == "0" ]] && bps=0
+
+    local existing=""
+    eval "existing=\"\${${varname}:-}\""
+
+    local entry="${ts}:${bps}"
+
+    local updated
+    if [[ -z "$existing" ]]; then
+        updated="$entry"
+    else
+        updated="${existing}|${entry}"
+    fi
+
+    # Trim to 3600 entries (1 hour)
+    local count
+    count=$(printf '%s' "$updated" | tr -cd '|' | wc -c)
+    count=$(( count + 1 ))
+
+    if (( count > 3600 )); then
+        updated=$(printf '%s' "$updated" | cut -d'|' -f$(( count - 3599 ))-)
+    fi
+
+    eval "${varname}=\"\${updated}\""
+}
+
+# ==============================================================================
+# _json_sample_clear  <stream_idx>
+# Resets the per-stream sample buffer to empty.
+# ==============================================================================
+_json_sample_clear() {
+    local idx="$1"
+    local varname="_JSON_SAMPLES_${idx}"
+    eval "${varname}=\"\""
+}
+
+# ==============================================================================
+# _json_sample_get  <stream_idx>
+# Returns the raw sample buffer string for a stream.
+# ==============================================================================
+_json_sample_get() {
+    local idx="$1"
+    local varname="_JSON_SAMPLES_${idx}"
+    local val=""
+    eval "val=\"\${${varname}:-}\""
+    printf '%s' "$val"
+}
+
+# ==============================================================================
+# _json_escape  <string>
+#
+# Escapes a string for safe embedding in a JSON value.
+# Handles: backslash, double-quote, forward-slash, newline, carriage-return,
+#          tab, and non-printable control characters.
+# Compatible with Bash 3.2+ (no printf %q needed).
+# ==============================================================================
+_json_escape() {
+    local s="$1"
+    # Process in order: backslash must be first to avoid double-escaping
+    s="${s//\\/\\\\}"          # \ → \\
+    s="${s//\"/\\\"}"          # " → \"
+    s="${s//$'\n'/\\n}"        # newline → \n
+    s="${s//$'\r'/\\r}"        # carriage return → \r
+    s="${s//$'\t'/\\t}"        # tab → \t
+    # Strip remaining non-printable control characters (0x00-0x1F except \n\r\t)
+    s=$(printf '%s' "$s" | tr -d '\000-\010\013\014\016-\037')
+    printf '%s' "$s"
+}
+
+# ==============================================================================
+# _json_export_write
+#
+# Writes a structured JSON results file for the current test session.
+#
+# FILE NAMING:
+#   prism_<SESSION_ID>.json
+#   Saved in JSON_EXPORT_DIR (directory of the running script).
+#
+# SCHEMA:
+# {
+#   "schema_version": "1.0",
+#   "session": {
+#     "id":        "20260425-143022-a3f1",
+#     "name":      "baseline-Q1",
+#     "tags":      ["pre-change", "wan"],
+#     "note":      "Before firewall change",
+#     "started":   1745000000,
+#     "finished":  1745000120,
+#     "duration_sec": 120,
+#     "host":      "emea-edge-madrid",
+#     "user":      "root",
+#     "os":        "Linux 5.15.0-101-generic",
+#     "iperf3":    "3.16.0",
+#     "iperf3_bin": "/usr/bin/iperf3",
+#     "mode":      "client"
+#   },
+#   "streams": [
+#     {
+#       "stream":      1,
+#       "proto":       "TCP",
+#       "target":      "10.0.0.1",
+#       "port":        5201,
+#       "bandwidth":   "unlimited",
+#       "duration_sec": 60,
+#       "dscp_name":   "EF",
+#       "dscp_val":    46,
+#       "parallel":    1,
+#       "bidir":       false,
+#       "reverse":     false,
+#       "bind_ip":     "10.0.0.2",
+#       "vrf":         "",
+#       "ramp_enabled": false,
+#       "status":      "DONE",
+#       "summary": {
+#         "sender_bw":    "940.12 Mbps",
+#         "receiver_bw":  "938.50 Mbps",
+#         "retransmits":  0,
+#         "jitter_ms":    "",
+#         "loss_pct":     "",
+#         "rtt_min_ms":   "1.100",
+#         "rtt_avg_ms":   "1.234",
+#         "rtt_max_ms":   "1.890",
+#         "rtt_jitter_ms":"0.123",
+#         "rtt_loss_pct": "0%",
+#         "rtt_samples":  60,
+#         "cwnd_min_kb":  "90.1",
+#         "cwnd_max_kb":  "128.0",
+#         "cwnd_avg_kb":  "110.5",
+#         "cwnd_final_kb":"125.0"
+#       },
+#       "samples": [
+#         {"t": 1745000000, "bps": 985400320},
+#         {"t": 1745000001, "bps": 987234560}
+#       ]
+#     }
+#   ]
+# }
+#
+# Parameters:
+#   $1  mode  — "client" | "loopback" | "mtp"
+#
+# Returns:
+#   Prints the full path of the written file to stdout.
+#   Appends the path to JSON_EXPORT_FILES[].
+# ==============================================================================
+_json_export_write() {
+    local mode="${1:-client}"
+
+    # Require at least a session ID to have been generated
+    [[ -z "$SESSION_ID" ]] && return 0
+    [[ "$JSON_EXPORT_ENABLED" -ne 1 ]] && return 0
+
+    local finished_ts
+    finished_ts=$(date +%s)
+
+    local duration_sec=$(( finished_ts - ${SESSION_RUN_TS:-$finished_ts} ))
+    local iperf3_ver="${IPERF3_MAJOR}.${IPERF3_MINOR}.${IPERF3_PATCH}"
+    local host_name
+    host_name=$(hostname 2>/dev/null || printf 'unknown')
+    local os_info
+    os_info=$(uname -sr 2>/dev/null || printf 'unknown')
+
+    # Construct output file path
+    local outfile="${JSON_EXPORT_DIR}/prism_${SESSION_ID}.json"
+
+    # ------------------------------------------------------------------
+    # Build tags JSON array
+    # ------------------------------------------------------------------
+    local tags_json="[]"
+    if [[ -n "$SESSION_TAGS" ]]; then
+        local -a tag_arr=()
+        local IFS_SAVE="$IFS"
+        IFS=' ' read -ra tag_arr <<< "$SESSION_TAGS"
+        IFS="$IFS_SAVE"
+        if (( ${#tag_arr[@]} > 0 )); then
+            tags_json="["
+            local t
+            for t in "${tag_arr[@]}"; do
+                tags_json+="\"$(_json_escape "$t")\","
+            done
+            tags_json="${tags_json%,}]"
+        fi
+    fi
+
+    # ------------------------------------------------------------------
+    # Begin writing JSON — use a temporary file to ensure atomicity.
+    # We write to <outfile>.tmp then rename to <outfile> so that a
+    # Ctrl+C during writing never leaves a partial JSON file.
+    # ------------------------------------------------------------------
+    local tmpfile="${outfile}.tmp"
+
+    # Open the JSON document
+    {
+        printf '{\n'
+        printf '  "schema_version": "1.0",\n'
+
+        # ── session block ────────────────────────────────────────────
+        printf '  "session": {\n'
+        printf '    "id":           "%s",\n'  "$(_json_escape "$SESSION_ID")"
+        printf '    "name":         "%s",\n'  "$(_json_escape "${SESSION_NAME:-}")"
+        printf '    "tags":         %s,\n'    "$tags_json"
+        printf '    "note":         "%s",\n'  "$(_json_escape "${SESSION_NOTE:-}")"
+        printf '    "started":      %s,\n'    "${SESSION_RUN_TS:-0}"
+        printf '    "finished":     %s,\n'    "$finished_ts"
+        printf '    "duration_sec": %s,\n'    "$duration_sec"
+        printf '    "host":         "%s",\n'  "$(_json_escape "$host_name")"
+        printf '    "user":         "%s",\n'  "$(_json_escape "${USER:-unknown}")"
+        printf '    "os":           "%s",\n'  "$(_json_escape "$os_info")"
+        printf '    "iperf3":       "%s",\n'  "$(_json_escape "$iperf3_ver")"
+        printf '    "iperf3_bin":   "%s",\n'  "$(_json_escape "${IPERF3_BIN:-}")"
+        printf '    "mode":         "%s"\n'   "$(_json_escape "$mode")"
+        printf '  },\n'
+
+        # ── streams array ────────────────────────────────────────────
+        printf '  "streams": [\n'
+
+        local i
+        for (( i=0; i<STREAM_COUNT; i++ )); do
+            local sn=$(( i + 1 ))
+
+            # Stream configuration fields
+            local st_proto="${S_PROTO[$i]:-TCP}"
+            local st_target="${S_TARGET[$i]:-}"
+            local st_port="${S_PORT[$i]:-0}"
+            local st_bw="${S_BW[$i]:-unlimited}"
+            local st_dur="${S_DURATION[$i]:-0}"
+            local st_dscp_name="${S_DSCP_NAME[$i]:-}"
+            local st_dscp_val="${S_DSCP_VAL[$i]:--1}"
+            local st_parallel="${S_PARALLEL[$i]:-1}"
+            local st_bidir="${S_BIDIR[$i]:-0}"
+            local st_reverse="${S_REVERSE[$i]:-0}"
+            local st_bind="${S_BIND[$i]:-}"
+            local st_vrf="${S_VRF[$i]:-}"
+            local st_ramp="${S_RAMP_ENABLED[$i]:-0}"
+            local st_status="${S_STATUS_CACHE[$i]:-UNKNOWN}"
+
+            # Normalize post-cleanup states
+            case "$st_status" in
+                CLEANED|CLEANUP_PENDING) st_status="DONE" ;;
+            esac
+
+            # Boolean values
+            local bidir_bool="false"
+            [[ "$st_bidir"   == "1" ]] && bidir_bool="true"
+            local reverse_bool="false"
+            [[ "$st_reverse" == "1" ]] && reverse_bool="true"
+            local ramp_bool="false"
+            [[ "$st_ramp"    == "1" ]] && ramp_bool="true"
+
+            # Duration: 0 means unlimited
+            local dur_display="$st_dur"
+            [[ "$st_dur" == "0" ]] && dur_display=0
+
+            # Summary fields
+            local sum_sbw="${RESULT_SENDER_BW[$i]:-N/A}"
+            local sum_rbw="${RESULT_RECEIVER_BW[$i]:-N/A}"
+            local sum_rtx="${RESULT_RTX[$i]:-0}"
+            local sum_jit="${RESULT_JITTER[$i]:-}"
+            local sum_loss="${RESULT_LOSS_PCT[$i]:-}"
+
+            # RTT fields
+            local rtt_min="${S_RTT_MIN[$i]:-}"
+            local rtt_avg="${S_RTT_AVG[$i]:-}"
+            local rtt_max="${S_RTT_MAX[$i]:-}"
+            local rtt_jit="${S_RTT_JITTER[$i]:-}"
+            local rtt_loss="${S_RTT_LOSS[$i]:-}"
+            local rtt_samp="${S_RTT_SAMPLES[$i]:-0}"
+            [[ "$rtt_min"  == "---" || "$rtt_min"  == "???" ]] && rtt_min=""
+            [[ "$rtt_avg"  == "---" || "$rtt_avg"  == "???" ]] && rtt_avg=""
+            [[ "$rtt_max"  == "---" || "$rtt_max"  == "???" ]] && rtt_max=""
+            [[ "$rtt_jit"  == "---" || "$rtt_jit"  == "???" ]] && rtt_jit=""
+            [[ "$rtt_loss" == "---" || "$rtt_loss" == "???" ]] && rtt_loss=""
+
+            # CWND fields
+            local cwnd_min="${S_CWND_MIN[$i]:-}"
+            local cwnd_max="${S_CWND_MAX[$i]:-}"
+            local cwnd_fin="${S_CWND_FINAL[$i]:-}"
+            local cwnd_avg
+            cwnd_avg=$(_cwnd_avg "$i" 2>/dev/null || printf '')
+            [[ "$cwnd_min" == "---" ]] && cwnd_min=""
+            [[ "$cwnd_max" == "---" ]] && cwnd_max=""
+            [[ "$cwnd_fin" == "---" ]] && cwnd_fin=""
+            [[ "$cwnd_avg" == "---" ]] && cwnd_avg=""
+
+            # RTX: only meaningful for TCP
+            [[ "$st_proto" == "UDP" ]] && sum_rtx=""
+
+            # Separator between stream objects
+            [[ $i -gt 0 ]] && printf '    ,\n'
+
+            printf '    {\n'
+            printf '      "stream":       %d,\n'    "$sn"
+            printf '      "proto":        "%s",\n'  "$(_json_escape "$st_proto")"
+            printf '      "target":       "%s",\n'  "$(_json_escape "$st_target")"
+            printf '      "port":         %s,\n'    "$st_port"
+            printf '      "bandwidth":    "%s",\n'  "$(_json_escape "$st_bw")"
+            printf '      "duration_sec": %s,\n'    "$dur_display"
+            printf '      "dscp_name":    "%s",\n'  "$(_json_escape "$st_dscp_name")"
+            printf '      "dscp_val":     %s,\n'    "$st_dscp_val"
+            printf '      "parallel":     %s,\n'    "$st_parallel"
+            printf '      "bidir":        %s,\n'    "$bidir_bool"
+            printf '      "reverse":      %s,\n'    "$reverse_bool"
+            printf '      "bind_ip":      "%s",\n'  "$(_json_escape "$st_bind")"
+            printf '      "vrf":          "%s",\n'  "$(_json_escape "$st_vrf")"
+            printf '      "ramp_enabled": %s,\n'    "$ramp_bool"
+            printf '      "status":       "%s",\n'  "$(_json_escape "$st_status")"
+
+            # summary sub-object
+            printf '      "summary": {\n'
+            printf '        "sender_bw":     "%s",\n'  "$(_json_escape "$sum_sbw")"
+            printf '        "receiver_bw":   "%s",\n'  "$(_json_escape "$sum_rbw")"
+            printf '        "retransmits":   "%s",\n'  "$(_json_escape "$sum_rtx")"
+            printf '        "jitter_ms":     "%s",\n'  "$(_json_escape "$sum_jit")"
+            printf '        "loss_pct":      "%s",\n'  "$(_json_escape "$sum_loss")"
+            printf '        "rtt_min_ms":    "%s",\n'  "$(_json_escape "$rtt_min")"
+            printf '        "rtt_avg_ms":    "%s",\n'  "$(_json_escape "$rtt_avg")"
+            printf '        "rtt_max_ms":    "%s",\n'  "$(_json_escape "$rtt_max")"
+            printf '        "rtt_jitter_ms": "%s",\n'  "$(_json_escape "$rtt_jit")"
+            printf '        "rtt_loss_pct":  "%s",\n'  "$(_json_escape "$rtt_loss")"
+            printf '        "rtt_samples":   %s,\n'    "$rtt_samp"
+            printf '        "cwnd_min_kb":   "%s",\n'  "$(_json_escape "$cwnd_min")"
+            printf '        "cwnd_max_kb":   "%s",\n'  "$(_json_escape "$cwnd_max")"
+            printf '        "cwnd_avg_kb":   "%s",\n'  "$(_json_escape "$cwnd_avg")"
+            printf '        "cwnd_final_kb": "%s"\n'   "$(_json_escape "$cwnd_fin")"
+            printf '      },\n'
+
+            # samples array — per-second bandwidth time-series
+            printf '      "samples": [\n'
+            local sample_buf
+            sample_buf=$(_json_sample_get "$i")
+            if [[ -n "$sample_buf" ]]; then
+                local first_sample=1
+                local entry
+                # Split on pipe — each entry is "epoch:bps"
+                local IFS_SAVE="$IFS"
+                IFS='|'
+                local -a sample_entries
+                read -ra sample_entries <<< "$sample_buf"
+                IFS="$IFS_SAVE"
+                local entry
+                for entry in "${sample_entries[@]}"; do
+                    [[ -z "$entry" ]] && continue
+                    local e_ts e_bps
+                    e_ts="${entry%%:*}"
+                    e_bps="${entry##*:}"
+                    [[ -z "$e_ts"  || ! "$e_ts"  =~ ^[0-9]+$ ]] && continue
+                    [[ -z "$e_bps" || ! "$e_bps" =~ ^[0-9]+$ ]] && continue
+                    if [[ $first_sample -eq 0 ]]; then
+                        printf ',\n'
+                    fi
+                    printf '        {"t":%s,"bps":%s}' "$e_ts" "$e_bps"
+                    first_sample=0
+                done
+                printf '\n'
+            fi
+            printf '      ]\n'   # end samples
+            printf '    }\n'     # end stream object
+        done
+
+        printf '  ]\n'   # end streams array
+        printf '}\n'     # end root object
+
+    } > "$tmpfile" 2>/dev/null
+
+    # ------------------------------------------------------------------
+    # Atomic rename: tmp → final
+    # ------------------------------------------------------------------
+    if mv "$tmpfile" "$outfile" 2>/dev/null; then
+        JSON_EXPORT_FILES+=("$outfile")
+        printf '%b  JSON results exported → %b%s%b\n' \
+            "$GREEN" "$BOLD" "$outfile" "$NC"
+        printf '%b  Schema: session + %d stream(s) + per-second samples%b\n' \
+            "$DIM" "$STREAM_COUNT" "$NC"
+    else
+        rm -f "$tmpfile" 2>/dev/null
+        printf '%b  WARNING: Could not write JSON export to %s%b\n' \
+            "$YELLOW" "$outfile" "$NC"
+    fi
+}
+
+# ==============================================================================
+# _json_export_prompt_delete
+#
+# Called during cleanup (Ctrl+C, Ctrl+Z trap, or exit) when one or more
+# JSON export files exist.
+#
+# Displays a formatted list of all JSON files created this session and
+# asks the operator whether to delete them.
+#
+# Behavior:
+#   Y / yes  → delete all files, print confirmation for each
+#   N / no   → keep all files, print their paths
+#   Enter    → default to KEEP (safe default — never auto-delete data)
+#
+# Uses tty_echo() so output goes directly to the terminal even when
+# stdout is redirected.
+# ==============================================================================
+_json_export_prompt_delete() {
+    [[ ${#JSON_EXPORT_FILES[@]} -eq 0 ]] && return 0
+
+    local sep
+    sep=$(rpt '=' $(( COLS - 2 )))
+
+    tty_echo ""
+    tty_echo "${BOLD}${CYAN}+${sep}+${NC}"
+    tty_echo "${BOLD}${CYAN}  JSON Export Files — Cleanup${NC}"
+    tty_echo "${BOLD}${CYAN}+${sep}+${NC}"
+    tty_echo ""
+    tty_echo "  The following JSON results file(s) were created this session:"
+    tty_echo ""
+
+    local f sz
+    for f in "${JSON_EXPORT_FILES[@]}"; do
+        if [[ -f "$f" ]]; then
+            sz=$(wc -c < "$f" 2>/dev/null | tr -d ' ')
+            tty_echo "    ${CYAN}${f}${NC}  ${DIM}(${sz:-?} bytes)${NC}"
+        else
+            tty_echo "    ${YELLOW}${f}${NC}  ${DIM}(already removed)${NC}"
+        fi
+    done
+
+    tty_echo ""
+    tty_echo "  ${BOLD}Delete these JSON file(s)?${NC}"
+    tty_echo "    ${BOLD}${RED}Y${NC}  Delete all listed files"
+    tty_echo "    ${BOLD}${GREEN}N${NC}  Keep all files  ${DIM}(default — press Enter)${NC}"
+    tty_echo ""
+
+    local answer=""
+    # Read from /dev/tty so we get input even during signal handling
+    if [[ -t 0 ]]; then
+        read -r -p "  Choice [N]: " answer </dev/tty 2>/dev/null || answer="N"
+    else
+        answer="N"
+    fi
+    answer="${answer:-N}"
+
+    tty_echo ""
+
+    case "${answer^^}" in
+        Y|YES)
+            tty_echo "  ${BOLD}Deleting JSON export file(s)...${NC}"
+            tty_echo ""
+            local deleted=0 failed=0
+            for f in "${JSON_EXPORT_FILES[@]}"; do
+                if [[ ! -f "$f" ]]; then
+                    tty_echo "    ${YELLOW}[SKIP  ]${NC}  ${f}  (already removed)"
+                    continue
+                fi
+                if rm -f "$f" 2>/dev/null; then
+                    tty_echo "    ${GREEN}[DELETED]${NC}  ${f}"
+                    (( deleted++ ))
+                else
+                    tty_echo "    ${RED}[FAILED ]${NC}  ${f}  (could not delete — check permissions)"
+                    (( failed++ ))
+                fi
+            done
+            tty_echo ""
+            if (( deleted > 0 )); then
+                tty_echo "  ${GREEN}✓ ${deleted} file(s) deleted successfully.${NC}"
+            fi
+            if (( failed > 0 )); then
+                tty_echo "  ${RED}✗ ${failed} file(s) could not be deleted.${NC}"
+                tty_echo "  ${DIM}  Check file permissions in: ${JSON_EXPORT_DIR}${NC}"
+            fi
+            # Clear the tracking array
+            JSON_EXPORT_FILES=()
+            ;;
+
+        *)
+            tty_echo "  ${CYAN}JSON file(s) kept.${NC}"
+            tty_echo ""
+            tty_echo "  ${DIM}Files are located in: ${JSON_EXPORT_DIR}${NC}"
+            tty_echo "  ${DIM}You can process them with jq:${NC}"
+            local f
+            for f in "${JSON_EXPORT_FILES[@]}"; do
+                [[ -f "$f" ]] && \
+                    tty_echo "    ${DIM}jq '.session,.streams[].summary' ${f}${NC}"
+            done
+            ;;
+    esac
+
+    tty_echo ""
+    tty_echo "${BOLD}${CYAN}+${sep}+${NC}"
+    tty_echo ""
+}
 
 # ==============================================================================
 # _generate_session_id
@@ -3628,6 +4162,11 @@ cleanup() {
         tty_echo "    ${YELLOW}[INFO ]${NC}  Temp dir not found or already removed"
     fi
 
+    # ── JSON Export Files cleanup prompt ───────────────────────────────
+    # Called here so it runs on Ctrl+C, Ctrl+Z trap, and normal exit.
+    # The prompt reads from /dev/tty so it works even during signal handling.
+    _json_export_prompt_delete
+
     tty_echo ""; tty_echo "${BOLD}${CYAN}+${sep}+${NC}"
     tty_echo "  ${GREEN}Processes stopped : ${killed}${NC}"
     tty_echo "  ${CYAN}Already exited    : ${already}${NC}"
@@ -3644,6 +4183,7 @@ _trap_tstp() {
     tty_echo "${BOLD}${YELLOW}  PRISM [Ctrl+Z blocked]${NC}  Backgrounding will orphan iperf3 processes."
     tty_echo "${YELLOW}  Use Ctrl+C to stop cleanly.${NC}"
 }
+
 _trap_exit() { local ec=$?; (( CLEANUP_DONE == 0 )) && cleanup "exit (code ${ec})"; }
 
 register_traps() {
@@ -9142,11 +9682,14 @@ _render_client_frame() {
             spark_rx=$(_spark_render "r" "$i")
         fi
 
-        # ── TX sparkline ──────────────────────────────────────────────────
+        # ── TX sparkline ─────────────────────────────────
         local spark_tx
         spark_tx=$(_spark_render "c" "$i")
         if [[ "$st" == "CONNECTED" && "$bw_tx" != "---" ]]; then
             _spark_push "c" "$i" "$bw_tx"
+            # Collect per-second sample for JSON export
+            [[ "$JSON_EXPORT_ENABLED" -eq 1 ]] && \
+                _json_sample_push "$i" "$bw_tx" "$(date +%s)"
         fi
 
         # ── Time remaining ────────────────────────────────────────────────
@@ -11816,6 +12359,7 @@ run_mixed_traffic_mode() {
 
     confirm_proceed "Launch ${STREAM_COUNT} mixed traffic stream(s)?" || return 0
     _prompt_session_name
+    [[ -n "$SESSION_ID" ]] && JSON_EXPORT_ENABLED=1
 
     # ── Step 6: Pre-flight, MTU discovery, and launch ─────────────────────
     apply_netem
@@ -11862,12 +12406,15 @@ run_mixed_traffic_mode() {
     parse_final_results
     display_results_table
     _session_append_history "mtp"
+    _json_export_write "mtp"
     offer_log_view
 
     local _ci
     for (( _ci=0; _ci<STREAM_COUNT; _ci++ )); do
         _cleanup_stream_files "$_ci"
+        _json_sample_clear "$_ci"
     done
+    JSON_EXPORT_ENABLED=0
 }
 
 
@@ -11889,6 +12436,7 @@ run_client_mode() {
     show_stream_summary "client"
     confirm_proceed "Launch ${n} stream(s)?" || return
     _prompt_session_name
+    [[ -n "$SESSION_ID" ]] && JSON_EXPORT_ENABLED=1
     apply_netem
 
     echo ""
@@ -11940,13 +12488,16 @@ run_client_mode() {
     parse_final_results
     display_results_table
     _session_append_history "client"
+    _json_export_write "client"
     offer_log_view
 
     # Phase 2: delete log files now that results have been read and displayed
     local _ci
     for (( _ci=0; _ci<STREAM_COUNT; _ci++ )); do
         _cleanup_stream_files "$_ci"
+        _json_sample_clear "$_ci"
     done
+    JSON_EXPORT_ENABLED=0
 }
 
 run_loopback_mode() {
@@ -12027,6 +12578,7 @@ run_loopback_mode() {
     show_stream_summary "client"
     confirm_proceed "Launch loopback test?" || return
     _prompt_session_name
+    [[ -n "$SESSION_ID" ]] && JSON_EXPORT_ENABLED=1
     echo ""; launch_servers; echo ""; wait_for_servers
     echo ""; launch_clients
     echo ""; printf '%b\n' "${GREEN}  Running. Opening dashboard...${NC}"; sleep 1
@@ -12035,13 +12587,16 @@ run_loopback_mode() {
     parse_final_results
     display_results_table
     _session_append_history "loopback"
+    _json_export_write "loopback"
     offer_log_view
 
     # Phase 2: delete log files after results are displayed
     local _ci
     for (( _ci=0; _ci<STREAM_COUNT; _ci++ )); do
         _cleanup_stream_files "$_ci"
+        _json_sample_clear "$_ci"
     done
+    JSON_EXPORT_ENABLED=0
 }
 
 # ---------------------------------------------------------------------------
@@ -12898,7 +13453,7 @@ show_main_menu() {
     # Title — uses _mh_center with _visible_len so BOLD/NC bytes are
     # excluded from the centering calculation.
     local _title
-    _title="${BOLD}PRISM${NC}  ${DIM}Performance Real-time iPerf3 Stream Manager${NC}  ${BOLD}v8.3.6${NC}"
+    _title="${BOLD}PRISM${NC}  ${DIM}Performance Real-time iPerf3 Stream Manager${NC}  ${BOLD}v8.3.7${NC}"
     _mh_center "$_title"
 
     _mh_rule "+" "=" "+"
@@ -13003,6 +13558,13 @@ main_menu() {
                 if (( BASH_MAJOR >= 4 )); then
                     PMTU_RESULTS=(); PMTU_STATUS=(); PMTU_RECOMMEND=()
                 fi
+                JSON_EXPORT_ENABLED=0
+                JSON_EXPORT_FILES=()
+                # Also clear any leftover sample buffers
+                local _jci
+                for (( _jci=0; _jci<STREAM_COUNT; _jci++ )); do
+                    _json_sample_clear "$_jci"
+                done
                 ;;
             4)
                 build_vrf_maps; get_interface_list; run_loopback_mode; echo ""
@@ -13033,6 +13595,13 @@ main_menu() {
                 S_RAMP_BW_CURRENT=(); S_RAMP_BW_TARGET=()
                 S_RAMP_IFACE=();   S_RAMP_TC_ACTIVE=()
                 S_RAMP_TIMELINE_SNAPSHOT=()
+                JSON_EXPORT_ENABLED=0
+                JSON_EXPORT_FILES=()
+                # Also clear any leftover sample buffers
+                local _jci
+                for (( _jci=0; _jci<STREAM_COUNT; _jci++ )); do
+                    _json_sample_clear "$_jci"
+                done
                 ;;
 
             5)
@@ -13065,6 +13634,14 @@ main_menu() {
                 if (( BASH_MAJOR >= 4 )); then
                     PMTU_RESULTS=(); PMTU_STATUS=(); PMTU_RECOMMEND=()
                 fi
+                JSON_EXPORT_ENABLED=0
+                JSON_EXPORT_FILES=()
+                # Also clear any leftover sample buffers
+                local _jci
+                for (( _jci=0; _jci<STREAM_COUNT; _jci++ )); do
+                    _json_sample_clear "$_jci"
+                done
+
                 ;;
             6)
                 echo ""; show_dscp_table
