@@ -2,7 +2,7 @@
 # =============================================================================
 # PRISM — Performance Real-time iPerf3 Stream Manager
 # Enterprise-grade multi-stream traffic orchestration with live QoS dashboard
-# Version: 8.3.8
+# Version: 8.3.9
 # Author : Waqas Daar (waqasdaar@gmail.com)
 # =============================================================================
 
@@ -4421,13 +4421,24 @@ cleanup() {
     [[ $CLEANUP_DONE -eq 1 ]] && return 0
     CLEANUP_DONE=1
     local sn="${1:-EXIT}"
-    printf '\033[?25h' >/dev/tty 2>/dev/null; printf '\n' >/dev/tty 2>/dev/null
+
+    # ── Ensure cursor is on a clean line before printing cleanup output ──
+    # printf '\n' to /dev/tty guarantees we start at column 0 even if the
+    # last character written to the terminal was not a newline.
+    printf '\n' >/dev/tty 2>/dev/null
+
+    # ── Restore cursor visibility (defensive — signal may fire mid-render) ─
+    printf '\033[?25h' >/dev/tty 2>/dev/null
+
     local sep; sep=$(rpt '=' $(( COLS - 2 )))
+    tty_echo ""
     tty_echo "${BOLD}${CYAN}+${sep}+${NC}"
     tty_echo "${BOLD}${CYAN}  PRISM — Cleanup  [signal: ${sn}]${NC}"
     tty_echo "${BOLD}${CYAN}+${sep}+${NC}"
+
     local killed=0 already=0
 
+    # ── Client stream teardown ────────────────────────────────────────────
     if (( ${#STREAM_PIDS[@]} > 0 )); then
         tty_echo ""; tty_echo "${BOLD}  Client Streams:${NC}"
         local i
@@ -4435,27 +4446,33 @@ cleanup() {
             local pid="${STREAM_PIDS[$i]}"
             local lbl="stream $((i+1)) [${S_PROTO[$i]:-?}->${S_TARGET[$i]:-?}:${S_PORT[$i]:-?}]"
             if [[ -z "$pid" || "$pid" == "0" ]]; then
-                tty_echo "    ${YELLOW}[SKIP ]${NC}  $lbl  -- no PID"; continue
+                tty_echo "    ${YELLOW}[SKIP ]${NC}  $lbl  -- no PID"
+                continue
             fi
             if kill -0 "$pid" 2>/dev/null; then
                 kill -TERM "$pid" 2>/dev/null
                 local w=0
-                while kill -0 "$pid" 2>/dev/null && (( w < 6 )); do sleep 0.5; (( w++ )); done
+                while kill -0 "$pid" 2>/dev/null && (( w < 6 )); do
+                    sleep 0.5; (( w++ ))
+                done
                 if kill -0 "$pid" 2>/dev/null; then
-                    kill -KILL "$pid" 2>/dev/null; wait "$pid" 2>/dev/null
+                    kill -KILL "$pid" 2>/dev/null
+                    wait "$pid" 2>/dev/null
                     tty_echo "    ${RED}[KILLED]${NC}  PID $pid  $lbl"
                 else
                     wait "$pid" 2>/dev/null
                     tty_echo "    ${GREEN}[STOP  ]${NC}  PID $pid  $lbl"
-                fi; (( killed++ ))
+                fi
+                (( killed++ ))
             else
                 wait "$pid" 2>/dev/null
-                tty_echo "    ${CYAN}[DONE  ]${NC}  PID $pid  $lbl  (already exited)"; (( already++ ))
+                tty_echo "    ${CYAN}[DONE  ]${NC}  PID $pid  $lbl  (already exited)"
+                (( already++ ))
             fi
         done
     fi
 
-    # Terminate parallel RTT ping processes
+    # ── RTT ping teardown ─────────────────────────────────────────────────
     if (( ${#PING_PIDS[@]} > 0 )); then
         tty_echo ""; tty_echo "${BOLD}  RTT Ping Processes:${NC}"
         local i
@@ -4470,7 +4487,7 @@ cleanup() {
         done
     fi
 
-    # ──— Terminate bidirectional reverse processes ────
+    # ── Bidir reverse process teardown ────────────────────────────────────
     if (( ${#BIDIR_PIDS[@]} > 0 )); then
         tty_echo ""; tty_echo "${BOLD}  Bidirectional RX Processes:${NC}"
         local i
@@ -4488,6 +4505,7 @@ cleanup() {
         done
     fi
 
+    # ── Server listener teardown ──────────────────────────────────────────
     if (( ${#SERVER_PIDS[@]} > 0 )); then
         tty_echo ""; tty_echo "${BOLD}  Server Listeners:${NC}"
         local i
@@ -4495,26 +4513,33 @@ cleanup() {
             local pid="${SERVER_PIDS[$i]}"
             local lbl="listener $((i+1)) [port ${SRV_PORT[$i]:-?} bind ${SRV_BIND[$i]:-0.0.0.0}]"
             if [[ -z "$pid" || "$pid" == "0" ]]; then
-                tty_echo "    ${YELLOW}[SKIP ]${NC}  $lbl  -- no PID"; continue
+                tty_echo "    ${YELLOW}[SKIP ]${NC}  $lbl  -- no PID"
+                continue
             fi
             if kill -0 "$pid" 2>/dev/null; then
                 kill -TERM "$pid" 2>/dev/null
                 local w=0
-                while kill -0 "$pid" 2>/dev/null && (( w < 6 )); do sleep 0.5; (( w++ )); done
+                while kill -0 "$pid" 2>/dev/null && (( w < 6 )); do
+                    sleep 0.5; (( w++ ))
+                done
                 if kill -0 "$pid" 2>/dev/null; then
-                    kill -KILL "$pid" 2>/dev/null; wait "$pid" 2>/dev/null
+                    kill -KILL "$pid" 2>/dev/null
+                    wait "$pid" 2>/dev/null
                     tty_echo "    ${RED}[KILLED]${NC}  PID $pid  $lbl"
                 else
                     wait "$pid" 2>/dev/null
                     tty_echo "    ${GREEN}[STOP  ]${NC}  PID $pid  $lbl"
-                fi; (( killed++ ))
+                fi
+                (( killed++ ))
             else
                 wait "$pid" 2>/dev/null
-                tty_echo "    ${CYAN}[DONE  ]${NC}  PID $pid  $lbl  (already exited)"; (( already++ ))
+                tty_echo "    ${CYAN}[DONE  ]${NC}  PID $pid  $lbl  (already exited)"
+                (( already++ ))
             fi
         done
     fi
 
+    # ── tc netem teardown ─────────────────────────────────────────────────
     if (( ${#NETEM_IFACES[@]} > 0 )); then
         tty_echo ""; tty_echo "${BOLD}  tc netem:${NC}"
         local iface
@@ -4528,14 +4553,18 @@ cleanup() {
         done
     fi
 
+    # ── Temporary file deletion ───────────────────────────────────────────
     tty_echo ""; tty_echo "${BOLD}  Temporary Files:${NC}"
     if [[ -n "$TMPDIR" && -d "$TMPDIR" ]]; then
         local fc=0
         while IFS= read -r -d '' fp; do
-            local fsz; fsz=$(wc -c < "$fp" 2>/dev/null); fsz="${fsz// /}"
-            tty_echo "    ${CYAN}[DEL]${NC}  $fp  (${fsz:-0} bytes)"; (( fc++ ))
+            local fsz; fsz=$(wc -c < "$fp" 2>/dev/null)
+            fsz="${fsz// /}"
+            tty_echo "    ${CYAN}[DEL]${NC}  $fp  (${fsz:-0} bytes)"
+            (( fc++ ))
         done < <(find "$TMPDIR" -maxdepth 3 -type f -print0 2>/dev/null)
-        (( fc == 0 )) && tty_echo "    ${YELLOW}[INFO ]${NC}  No files in $TMPDIR"
+        (( fc == 0 )) && \
+            tty_echo "    ${YELLOW}[INFO ]${NC}  No files in $TMPDIR"
         rm -rf "$TMPDIR" 2>/dev/null \
             && tty_echo "    ${GREEN}[REMOVED]${NC}  $TMPDIR" \
             || tty_echo "    ${RED}[ERROR  ]${NC}  Cannot remove $TMPDIR"
@@ -4543,24 +4572,71 @@ cleanup() {
         tty_echo "    ${YELLOW}[INFO ]${NC}  Temp dir not found or already removed"
     fi
 
-    # ── JSON Export Files cleanup prompt ───────────────────────────────
-    # Called here so it runs on Ctrl+C, Ctrl+Z trap, and normal exit.
-    # The prompt reads from /dev/tty so it works even during signal handling.
+    # ── JSON export cleanup prompt ────────────────────────────────────────
     _json_export_prompt_delete
 
-    tty_echo ""; tty_echo "${BOLD}${CYAN}+${sep}+${NC}"
+    # ── Summary ───────────────────────────────────────────────────────────
+    tty_echo ""
+    tty_echo "${BOLD}${CYAN}+${sep}+${NC}"
     tty_echo "  ${GREEN}Processes stopped : ${killed}${NC}"
     tty_echo "  ${CYAN}Already exited    : ${already}${NC}"
     tty_echo "${BOLD}${GREEN}  Cleanup complete. All resources released.${NC}"
-    tty_echo "${BOLD}${CYAN}+${sep}+${NC}"; tty_echo ""
+    tty_echo "${BOLD}${CYAN}+${sep}+${NC}"
+    tty_echo ""
 }
 
-_trap_int()  { printf '\n'>/dev/tty 2>/dev/null; tty_echo "${BOLD}${YELLOW}  PRISM [SIGINT]  Ctrl+C — stopping...${NC}";           cleanup "SIGINT (Ctrl+C)"; exit 130; }
-_trap_term() { printf '\n'>/dev/tty 2>/dev/null; tty_echo "${BOLD}${YELLOW}  PRISM [SIGTERM] Stopping...${NC}";                    cleanup "SIGTERM";         exit 143; }
-_trap_quit() { printf '\n'>/dev/tty 2>/dev/null; tty_echo "${BOLD}${YELLOW}  PRISM [SIGQUIT] Ctrl+\\ — stopping...${NC}";          cleanup "SIGQUIT";         exit 131; }
-_trap_hup()  { printf '\n'>/dev/tty 2>/dev/null; tty_echo "${BOLD}${YELLOW}  PRISM [SIGHUP]  Terminal closed — stopping...${NC}";  cleanup "SIGHUP";          exit 129; }
+# =============================================================================
+# _trap_int / _trap_term / _trap_quit / _trap_hup
+#
+# FIX: Before printing the "PRISM [SIGINT]" message, move the cursor below
+# the last rendered dashboard frame so the signal message never overlaps
+# the TUI borders. Uses _LAST_FRAME_LINE_COUNT (set by run_dashboard after
+# each render tick) to know exactly how far down to move.
+#
+# The cursor-restore + cursor-down sequence must go to /dev/tty directly
+# (not through tty_echo which adds a newline) so it is a single atomic
+# write that cannot be interleaved with dashboard output.
+# =============================================================================
+
+_trap_cursor_exit() {
+    # Restore to the saved anchor, then move down past the frame.
+    # If _LAST_FRAME_LINE_COUNT is 0 or unset, just emit two newlines
+    # as a safe fallback so the prompt is always on a clean line.
+    local _lines="${_LAST_FRAME_LINE_COUNT:-0}"
+    if (( _lines > 0 )); then
+        # Restore anchor → move down → erase to end of screen → newline
+        printf '\033[u\033[%dB\033[J\033[?25h\n' "$_lines" >/dev/tty 2>/dev/null
+    else
+        printf '\033[?25h\n\n' >/dev/tty 2>/dev/null
+    fi
+}
+
+_trap_int()  {
+    _trap_cursor_exit
+    tty_echo "${BOLD}${YELLOW}  PRISM [SIGINT]  Ctrl+C — stopping...${NC}"
+    cleanup "SIGINT (Ctrl+C)"
+    exit 130
+}
+_trap_term() {
+    _trap_cursor_exit
+    tty_echo "${BOLD}${YELLOW}  PRISM [SIGTERM] Stopping...${NC}"
+    cleanup "SIGTERM"
+    exit 143
+}
+_trap_quit() {
+    _trap_cursor_exit
+    tty_echo "${BOLD}${YELLOW}  PRISM [SIGQUIT] Ctrl+\\ — stopping...${NC}"
+    cleanup "SIGQUIT"
+    exit 131
+}
+_trap_hup()  {
+    _trap_cursor_exit
+    tty_echo "${BOLD}${YELLOW}  PRISM [SIGHUP]  Terminal closed — stopping...${NC}"
+    cleanup "SIGHUP"
+    exit 129
+}
 _trap_tstp() {
-    printf '\n'>/dev/tty 2>/dev/null
+    _trap_cursor_exit
     tty_echo "${BOLD}${YELLOW}  PRISM [Ctrl+Z blocked]${NC}  Backgrounding will orphan iperf3 processes."
     tty_echo "${YELLOW}  Use Ctrl+C to stop cleanly.${NC}"
 }
@@ -7051,9 +7127,11 @@ write_launch_script() {
 }
 
 launch_servers() {
-    SERVER_PIDS=(); SRV_PREV_STATE=(); SRV_BW_CACHE=()
+    SERVER_PIDS=()
+    SRV_PREV_STATE=()
+    SRV_BW_CACHE=()
 
-    # ── Pre-launch VRF/bind consistency validation (server) ───────────────
+    # ── Pre-launch VRF/bind consistency validation (server) ──────────────
     if [[ "$OS_TYPE" == "linux" ]]; then
         get_interface_list
         local _vi
@@ -7078,7 +7156,6 @@ launch_servers() {
                     "bind IP ${_vbind} is in GRT." \
                     "Clearing VRF '${_vvrf}' to prevent bad file descriptor.${NC}"
                 SRV_VRF[$_vi]=""
-
             elif [[ -n "$_vvrf" && "$_vactual" != "GRT" && \
                     "$_vactual" != "$_vvrf" ]]; then
                 printf '%b\n' \
@@ -7086,7 +7163,6 @@ launch_servers() {
                     "bind IP ${_vbind} belongs to VRF '${_vactual}'," \
                     "not '${_vvrf}'. Correcting VRF.${NC}"
                 SRV_VRF[$_vi]="$_vactual"
-
             elif [[ -z "$_vvrf" && "$_vactual" != "GRT" && \
                     -n "$_vactual" ]]; then
                 printf '%b\n' \
@@ -7100,16 +7176,34 @@ launch_servers() {
 
     local i
     for (( i=0; i<SERVER_COUNT; i++ )); do
-        local sn=$(( i + 1 )) sf="${TMPDIR}/server_${sn}.sh" lf="${TMPDIR}/server_${sn}.log"
+        # ── FIX: compute sn FIRST, before any filename is constructed ──
+        local sn=$(( i + 1 ))
+
+        # ── Filenames now always use the correct 1-based index ──────────
+        local sf="${TMPDIR}/server_${sn}.sh"
+        local lf="${TMPDIR}/server_${sn}.log"
+
+        # Persist log and script paths before attempting launch so that
+        # cleanup() can find them even if write_launch_script fails.
+        SRV_LOGFILE[$i]="$lf"
+        SRV_SCRIPT[$i]="$sf"
+
         if ! write_launch_script "$sf" "$(build_server_command "$i")"; then
-            printf '%b\n' "${RED}  [ERROR] Cannot write script for server ${sn}.${NC}"
-            SERVER_PIDS+=(0); SRV_LOGFILE[$i]="$lf"
-            SRV_PREV_STATE+=(""); SRV_BW_CACHE+=("---"); continue
+            printf '%b\n' \
+                "${RED}  [ERROR] Cannot write script for server ${sn}.${NC}"
+            SERVER_PIDS+=(0)
+            SRV_PREV_STATE+=("")
+            SRV_BW_CACHE+=("---")
+            continue
         fi
-        SRV_SCRIPT[$i]="$sf"; SRV_LOGFILE[$i]="$lf"
+
         bash "$sf" > "$lf" 2>&1 &
         local pid=$!
-        SERVER_PIDS+=("$pid"); SRV_PREV_STATE+=(""); SRV_BW_CACHE+=("---")
+
+        SERVER_PIDS+=("$pid")
+        SRV_PREV_STATE+=("")
+        SRV_BW_CACHE+=("---")
+
         printf '%b[STARTED]%b  server %d  PID %-6d  port %s\n' \
             "$GREEN" "$NC" "$sn" "$pid" "${SRV_PORT[$i]}"
     done
@@ -10049,7 +10143,7 @@ _needs_target_line() {
 }
 
 # =============================================================================
-# _render_client_frame  (v8.3.8 — alignment-fixed)
+# _render_client_frame
 #
 # FIXES APPLIED:
 #   1. TX/RX label widths are fixed at exactly 5 visible chars ("↑ TX " / "↓ RX ")
@@ -10815,18 +10909,10 @@ _render_server_frame() {
     bline '='
 }
 
-# ---------------------------------------------------------------------------
-# run_dashboard
-#
-# Main dashboard render loop.  Uses the exact line counters above to
-# pre-reserve vertical space on the first tick and to reposition the
-# cursor correctly on every subsequent tick.
-# ---------------------------------------------------------------------------
-
 # ==============================================================================
 # run_dashboard  <mode>
 #
-# Main dashboard render loop for PRISM v8.3.7.
+# Main dashboard render loop for PRISM.
 #
 # MODES:
 #   client  (default) — renders _render_client_frame, shows stream BW,
@@ -11301,33 +11387,30 @@ run_dashboard() {
         fi
 
     done
-    # ═══════════════════════════════════════════════════════════════════════════
-    # End of render loop
-    # ═══════════════════════════════════════════════════════════════════════════
+    # ── End of render loop ────────────────────────────────────────────────
 
-    # ── Restore terminal state ─────────────────────────────────────────────────
-    printf '\033[?25h'      # always restore cursor visibility on exit
+    # ── Restore terminal state ────────────────────────────────────────────
+    # Always restore cursor visibility, regardless of how the loop ended.
+    printf '\033[?25h'
 
-    # ── Move cursor below the entire rendered output ──────────────────────────
-    # Restore to the top-of-frame anchor, then advance downward by _last_total
-    # lines. This guarantees that subsequent output (results table, log viewer,
-    # cleanup messages) starts on a clean line below all dashboard content and
-    # does not overwrite or interleave with it.
-    printf '\033[u'
+    # ── Move cursor below the entire rendered output ──────────────────────
+    # Restore to the frame anchor, advance downward by _last_total lines,
+    # then erase to end of screen.
+    #
+    # This must happen even when the loop was interrupted by a signal trap
+    # (CLEANUP_DONE=1) so that subsequent cleanup output starts on a clean
+    # line rather than overwriting the dashboard borders.
+    #
+    # Guard: if _last_total is 0 (e.g. the loop never completed one full
+    # render) fall back to emitting two blank lines.
     if (( _last_total > 0 )); then
-        printf '\033[%dB' "$_last_total"
+        printf '\033[u\033[%dB' "$_last_total"
+    else
+        printf '\033[u'
     fi
+    printf '\033[J\n'
 
-    # Erase from the cursor to end of screen to clean up any ghost content left
-    # from a frame that was taller than the final render (e.g. FQDN target lines
-    # that disappeared after streams completed).
-    printf '\033[J'
-    printf '\n'
-
-    # ── Display buffered stream cleanup event log ──────────────────────────────
-    # _cleanup_stream_procs writes timestamped events to this log file rather
-    # than stdout (since stdout belongs to the dashboard during rendering). Now
-    # that the dashboard has exited we flush them to the terminal.
+    # ── Flush buffered stream cleanup event log ───────────────────────────
     local _log_file="/tmp/iperf3_streams_events.log"
     if [[ -f "$_log_file" ]]; then
         printf '\n'
@@ -14297,7 +14380,7 @@ show_main_menu() {
     # Title — uses _mh_center with _visible_len so BOLD/NC bytes are
     # excluded from the centering calculation.
     local _title
-    _title="${BOLD}PRISM${NC}  ${DIM}Performance Real-time iPerf3 Stream Manager${NC}  ${BOLD}v8.3.8${NC}"
+    _title="${BOLD}PRISM${NC}  ${DIM}Performance Real-time iPerf3 Stream Manager${NC}  ${BOLD}v8.3.9${NC}"
     _mh_center "$_title"
 
     _mh_rule "+" "=" "+"
