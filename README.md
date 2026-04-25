@@ -1205,3 +1205,21 @@ mkdir -p ~/.config/prism
 ls -la ~/.config/prism/
 ```
 Ensure the user running PRISM has write access to their home directory.
+
+## Known Limitations
+|          **Limitation**          |                                                                  **Detail**                                                                 |                               Workaround / Roadmap                              |
+|:--------------------------------:|:-------------------------------------------------------------------------------------------------------------------------------------------:|:-------------------------------------------------------------------------------:|
+| IPv6 not supported               | IPv6 targets, AAAA DNS records, and /proc/net/tcp6 connection probing are not implemented                                                   | Planned for a future release                                                    |
+| macOS VRF                        | ip vrf exec is a Linux kernel feature. All macOS streams use the Global Routing Table                                                       | No workaround on macOS                                                          |
+| macOS tc / netem                 | Traffic shaping (tc tbf) and network impairment (tc netem) require Linux iproute2                                                           | Use a Linux VM or container                                                     |
+| Bidir requires iperf3 ≥ 3.7      | --bidir was introduced in iperf3 3.7. Older clients fall back to two separate processes, which is less accurate                             | Upgrade iperf3 on both endpoints                                                |
+| DSCP verify on loopback          | TOS is not reliably preserved on 127.0.0.1. DSCP verification is suppressed for loopback targets                                            | Use a physical or virtual Ethernet interface                                    |
+| Terminal width minimum           | Some TUI elements require at least 60 columns to render without truncation                                                                  | Widen the terminal before running                                               |
+| Ctrl+Z blocked                   | Backgrounding PRISM is prevented to avoid orphaned iperf3 and tc processes                                                                  | Use Ctrl+C to stop then relaunch                                                |
+| TCP ramp requires root           | tc tbf kernel shaping requires CAP_NET_ADMIN. UDP ramp via iperf3 -b stepping works without root                                            | Run as root for TCP ramp                                                        |
+| RTT sparkline                    | The 10-second sparkline shows bandwidth only. RTT over time is a numeric summary but not a graph                                            | Planned for a future release                                                    |
+| Single NIC concurrency           | All streams share one NIC egress queue. Physical link speed limits total aggregate bandwidth regardless of stream count                     | Use multiple interfaces or a higher-capacity link                               |
+| Remote server management         | PRISM starts local iperf3 servers (Server Mode / Loopback Mode) but does not manage remote servers                                          | Start the remote iperf3 server manually or via SSH before running a client test |
+| Bash 3.2 assoc-array shims       | macOS ships with Bash 3.2 which lacks declare -A. PRISM provides shims for PMTU and VRF maps. Very large VRF tables may be slow on Bash 3.2 | Upgrade to Bash 5 via brew install bash on macOS                                |
+| Single dashboard tick = 1 second | The dashboard refresh rate is fixed at approximately 1 second. Sub-second bandwidth fluctuations are not individually visible               | Use iperf3 raw log files for sub-second analysis                                |
+| JSON sample limit                | The per-stream bandwidth ring buffer retains a maximum of 3600 samples (1 hour at 1 sample/second). Older samples are discarded             | For tests longer than 1 hour, analyse the raw iperf3 log file                   |
