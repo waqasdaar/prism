@@ -79,6 +79,7 @@
   - [Path MTU shows UNKNOWN for all targets](#path-mtu-shows-unknown-for-all-targets)
   - [JSON export file not created](#json-export-file-not-created)
   - [Session history not written](#session-history-not-written)
+- [Known Limitations](#known-limitations)
 ---
 
 ## Introduction
