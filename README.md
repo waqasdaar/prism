@@ -679,4 +679,104 @@ jq 'select(.name | startswith("wan-baseline")) | .results[].sender_bw' \
     ~/.config/prism/session_history.json
 ```
 
+## Dashboard Reference
+
+The live client dashboard is redrawn once per second using ANSI cursor anchoring (`\033[s` save / `\033[u` restore). It never scrolls — it overwrites in place to eliminate flicker.
+
+### Full annotated layout
+
+```
++==============================================================================+
+|                        PRISM — Live Dashboard                                |
++==============================================================================+
+|  Active: 2   Connected: 2   Done: 0   Failed: 0   Elapsed: 00:14            |
++==============================================================================+
+| #  Proto  Target           Port   Bandwidth     Last 10s    Time  DSCP Status|
++------------------------------------------------------------------------------+
+ 1  TCP    ──────────────   5201   940.12 Mbps   ▅▆▇████▇▆   00:46   EF  CONNECTED
+           ↳ iperf3.moji.fr (163.172.189.215)
+   RTT  min   1.100ms  avg   1.234ms  max   2.100ms  jitter  0.123ms  loss  0%  (46 smpl)
+   cwnd  cur  128.0KB  min   90.5KB  max  132.0KB  avg  115.3KB
+   ramp ▁▂▃▄▅▆▇████████████████████▇▅▃  ↑ HOLD       cur  940M  tgt  1G
+   [████████████████░░░░░░░░░░░░░░░░] 62%
++------------------------------------------------------------------------------+
+ 2  UDP    10.0.0.2          5004   999.87 Kbps   ▆▇████▇▆▅   00:46  AF41 CONNECTED
+← RX       998.21 Kbps   ▆▇████▇▆▅                                  CONNECTED
+   RTT  min   0.800ms  avg   0.923ms  max   1.100ms  jitter  0.045ms  loss  0%  (46 smpl)
++==============================================================================+
+|  Ctrl+C to stop all streams  |  [v/p] DSCP verify                           |
++==============================================================================+
+```
+
+#### Column reference
+
+| **Column** |                       **Description**                       |
+|:----------:|:-----------------------------------------------------------:|
+| #          | Stream number (1-based)                                     |
+| Proto      | TCP or UDP                                                  |
+| Target     | Destination IP. FQDN targets appear on a dedicated ↳ line   |
+| Port       | Destination port number                                     |
+| Bandwidth  | Current per-interval bandwidth (updated every second)       |
+| Last 10s   | 10-second bandwidth sparkline (Unicode blocks ▁▂▃▄▅▆▇█)     |
+| Time       | Countdown to stream end; inf for unlimited duration streams |
+| DSCP       | Configured DSCP class name (e.g. EF, AF41, CS1)             |
+
+#### Stream lifecycle states
+
+|  **State** | **Colour** |                 **Meaning**                 |
+|:----------:|:----------:|:-------------------------------------------:|
+| STARTING   | Yellow     | iperf3 process launched, no log output yet  |
+| CONNECTING | Yellow     | Process alive, TCP handshake in progress    |
+| CONNECTED  | Green      | Active data transfer confirmed              |
+| DONE       | Cyan       | Stream completed normally                   |
+| FAILED     | Red        | Connection refused, timeout, or DNS failure |
+| CLEANING…  | Yellow     | Post-completion process teardown running    |
+| ── DONE ── | Dim        | Cleanup complete, permanent tombstone row   |
+
+#### Sub-rows (per stream, conditionally displayed)
+
+|  **Sub-row** |     **Display Condition**     |                   **Content**                  |
+|:------------:|:-----------------------------:|:----------------------------------------------:|
+| ↳ FQDN (IP)  | FQDN target or IP > 15 chars  | Full resolved hostname and IP                  |
+| → TX label   | Bidir enabled                 | Labels the TX direction row                    |
+| ← RX row     | Bidir enabled                 | Reverse direction bandwidth and sparkline      |
+| RTT row      | Non-loopback stream           | min / avg / max / jitter / loss / sample count |
+| cwnd row     | TCP, non-loopback, ≥ 1 sample | cur / min / max / avg in KBytes                |
+| ramp row     | Ramp profile enabled          | Timeline curve, phase name, cur/tgt rate       |
+| Progress bar | Fixed duration, not failed    | Unicode fill bar with percentage               |
+
+#### Sparkline character map
+
+The 10-second sparkline encodes relative bandwidth using Unicode block characters that fill each cell from the bottom up:
+
+| **Character** | **Unicode** | **Level** |             **Meaning**            |
+|:-------------:|:-----------:|:---------:|:----------------------------------:|
+| ·             | U+00B7      | 0         | No data / buffer empty             |
+| ▁             | U+2581      | 1         | Very low (≤ 12.5% of window range) |
+| ▂             | U+2582      | 2         | Low                                |
+| ▃             | U+2583      | 3         | Below mid                          |
+| ▄             | U+2584      | 4         | Mid (stable traffic flat-line)     |
+| ▅             | U+2585      | 5         | Above mid                          |
+| ▆             | U+2586      | 6         | High                               |
+| ▇             | U+2587      | 7         | Very high                          |
+| █             | U+2588      | 8         | Maximum for this window            |
+
+The sparkline uses dynamic range normalisation: the full height always reflects the min-to-max range of the 10-second window, making even small fluctuations visible.
+
+### Keyboard shortcuts during the dashboard
+
+| **Key** |        **Mode**       |                **Action**               |
+|:-------:|:---------------------:|:---------------------------------------:|
+| v or p  | Client (non-loopback) | Open DSCP marking verification overlay  |
+| c       | Server                | Open server-side packet capture overlay |
+| Ctrl+C  | Both                  | Stop all streams and exit cleanly       |
+| Ctrl+Z  | Both                  | Blocked — would orphan iperf3 processes |
+
+### Completed and failed stream panels
+
+When streams finish, PRISM renders additional panels below the main dashboard frame:
+
+**Completed Streams panel** — appears as streams reach `DONE` state, showing final sender and receiver bandwidth for each stream.
+
+**Failed Streams panel** — appears if any stream reaches `FAILED` state, showing the error message (e.g. "Connection refused", "No route to host").
 
