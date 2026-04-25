@@ -10048,14 +10048,30 @@ _needs_target_line() {
     return 1
 }
 
+# =============================================================================
+# _render_client_frame  (v8.3.8 — alignment-fixed)
+#
+# FIXES APPLIED:
+#   1. TX/RX label widths are fixed at exactly 5 visible chars ("↑ TX " / "↓ RX ")
+#      and subtracted from the available row width so bleft() padding stays correct.
+#   2. RTT and CWND rows use bleft() with a plain-text prefix that has a known
+#      fixed visible width, keeping the right border flush.
+#   3. Progress bar indent is computed from the actual column widths rather than
+#      a hard-coded constant so it always sits under the Bandwidth column.
+#   4. The DONE/CLEANED tombstone row uses printf -v to build the full plain-text
+#      string before passing to bleft(), giving vlen() a clean input.
+#   5. Column widths are defined once as named constants and referenced everywhere
+#      so a single change propagates to header, data rows, and sub-rows.
+# =============================================================================
+
 _render_client_frame() {
 
-    # ── Disable errexit for the entire render function ────────────────────
-    # set -e triggers on (( expr )) when expr evaluates to 0 (false), and
-    # on other commands that return non-zero in normal operation.
-    # The render function is purely presentational — it must never exit
-    # early due to a non-zero return code from any sub-expression.
-    # We save the current errexit state and restore it at the end.
+    # ------------------------------------------------------------------
+    # Disable errexit for the entire render function.
+    # Arithmetic (( expr )) returns 1 when expr == 0, which kills the
+    # script under set -e. The render function is purely presentational
+    # and must never exit early.
+    # ------------------------------------------------------------------
     local _old_errexit=0
     [[ $- == *e* ]] && _old_errexit=1
     set +e
@@ -10063,7 +10079,9 @@ _render_client_frame() {
     local now; now=$(date +%s)
     local i
 
-    # ── Per-tick probes ────────────────────────────────────────────────────
+    # ------------------------------------------------------------------
+    # Per-tick probes
+    # ------------------------------------------------------------------
     for (( i=0; i<STREAM_COUNT; i++ )); do
         probe_client_status "$i"
         local _pst="${S_STATUS_CACHE[$i]:-STARTING}"
@@ -10078,7 +10096,9 @@ _render_client_frame() {
         esac
     done
 
-    # ── Stream counters ────────────────────────────────────────────────────
+    # ------------------------------------------------------------------
+    # Stream counters
+    # ------------------------------------------------------------------
     local nc=0 ni=0 ns=0 nd=0 nf=0 n_cleaned=0
     for (( i=0; i<STREAM_COUNT; i++ )); do
         case "${S_STATUS_CACHE[$i]}" in
@@ -10092,127 +10112,184 @@ _render_client_frame() {
     done
     local act=$(( nc + ni + ns ))
     local fts="${S_START_TS[0]:-0}"
-    if (( fts == 0 )); then fts="$now"; fi
+    (( fts == 0 )) && fts="$now"
     local efmt; efmt=$(format_seconds $(( now - fts )))
 
-    # ── Column widths ──────────────────────────────────────────────────────
-    local C_SN=3 C_PROTO=5 C_TARGET=15 C_PORT=5
-    local C_BW=13 C_SPARK=10 C_TIME=6 C_DSCP=4 C_STAT=9
-    local ROW_FMT
-    ROW_FMT="%-${C_SN}s %-${C_PROTO}s %-${C_TARGET}s %${C_PORT}s %-${C_BW}s %-${C_SPARK}s %${C_TIME}s %${C_DSCP}s %-${C_STAT}s"
+    # ------------------------------------------------------------------
+    # Column layout — ALL widths defined here as named constants.
+    # Every data row, sub-row, and the column header reference these
+    # same constants so alignment is guaranteed to be consistent.
+    #
+    #   C_SN     =  2   stream number    "1 "
+    #   C_PROTO  =  5   protocol         "TCP  "
+    #   C_TARGET = 15   target IP/FQDN placeholder
+    #   C_PORT   =  5   port             " 5201"
+    #   C_BW     = 13   bandwidth        "204.00 Mbps  "
+    #   C_SPARK  = 10   sparkline        "▅█▅█▅█▅▅▅▁"
+    #   C_TIME   =  6   time remaining   "00:27 "
+    #   C_DSCP   =  4   DSCP name        "EF  "
+    #   C_STAT   =  9   status           "CONNECTED"
+    #
+    # Row prefix for bidir label:
+    #   _PFX_W   =  5   "↑ TX " or "↓ RX " or "     " (5 visible chars)
+    #
+    # Box inner width = COLS - 2  (the two border pipes are not counted)
+    # ------------------------------------------------------------------
+    local C_SN=2
+    local C_PROTO=5
+    local C_TARGET=15
+    local C_PORT=5
+    local C_BW=13
+    local C_SPARK=10
+    local C_TIME=6
+    local C_DSCP=4
+    local C_STAT=9
+    local _PFX_W=5     # visible width of the "↑ TX " / "↓ RX " prefix
 
+    # Pre-compute the total visible width of one data row (no prefix) so
+    # we can verify it fits inside the box and compute sub-row indents.
+    #
+    # Layout per row inside the box (between the two border pipes):
+    #   " " + SN + " " + PROTO + " " + TARGET + " " + PORT
+    #   + " " + BW + " " + SPARK + " " + TIME + " " + DSCP + " " + STAT + " "
+    #   = 1 + C_SN + 1 + C_PROTO + 1 + C_TARGET + 1 + C_PORT
+    #     + 1 + C_BW + 1 + C_SPARK + 1 + C_TIME + 1 + C_DSCP + 1 + C_STAT + 1
+    #   = 10 gaps + sum(column widths)
+    local _INNER=$(( COLS - 2 ))
+    local _COL_SUM=$(( C_SN + C_PROTO + C_TARGET + C_PORT + \
+                       C_BW + C_SPARK + C_TIME + C_DSCP + C_STAT ))
+    # gaps: one space before each column + one trailing space = 10 total
+    local _ROW_VISIBLE=$(( _COL_SUM + 10 ))
+
+    # Indent used by sub-rows (RTT, CWND, ramp, progress bar).
+    # RTT/CWND/ramp: align their label flush with the left edge of the
+    # Bandwidth column so they read as belonging to the stream above.
+    #
+    #   indent = 1(border-space) + C_SN+1 + C_PROTO+1 + C_TARGET+1 + C_PORT+1
+    #          = 1 + (C_SN+1) + (C_PROTO+1) + (C_TARGET+1) + (C_PORT+1)
+    local _SUBROW_INDENT=$(( 1 + C_SN+1 + C_PROTO+1 + C_TARGET+1 + C_PORT+1 ))
+
+    # For bidir streams the prefix "↑ TX " or "↓ RX " occupies _PFX_W
+    # visible characters at the start of the row. The stream-number
+    # column is therefore inset by _PFX_W positions.
+    # bleft() pads the total string to fill _INNER. We build the
+    # complete row as a single string and let bleft() do one measurement.
+
+    # ------------------------------------------------------------------
+    # Check whether any stream has a fixed duration (needed to decide
+    # whether to print the progress-bar sub-row and the sub-header line)
+    # ------------------------------------------------------------------
     local has_fixed_dur=0
     for (( i=0; i<STREAM_COUNT; i++ )); do
-        if (( S_DURATION[$i] > 0 )); then
-            has_fixed_dur=1
-            break
-        fi
+        if (( S_DURATION[$i] > 0 )); then has_fixed_dur=1; break; fi
     done
 
-    # ── Header ────────────────────────────────────────────────────────────
+    # ------------------------------------------------------------------
+    # Header
+    # ------------------------------------------------------------------
     bline '='
     bcenter "${BOLD}${CYAN}PRISM — Live Dashboard${NC}"
     bline '='
-    bleft "$(printf \
-        '  Active:%-3d  Connected:%-3d  Done:%-3d  Failed:%-3d  Elapsed:%s' \
-        "$act" "$nc" "$nd" "$nf" "$efmt")"
+
+    # Counter row — use printf -v to build plain text first so vlen()
+    # sees clean ASCII (no embedded format strings).
+    local _ctr_plain
+    printf -v _ctr_plain \
+        "  Active:%-2d   Connected:%-2d   Done:%-2d   Failed:%-2d   Elapsed:%s" \
+        "$act" "$nc" "$nd" "$nf" "$efmt"
+    bleft "$_ctr_plain"
     bline '='
-    # shellcheck disable=SC2059
-    bleft "${BOLD}$(printf "$ROW_FMT" \
-        '#' 'Proto' 'Target' 'Port' 'Bandwidth' 'Last 10s' \
-        'Time' 'DSCP' 'Status')${NC}"
+
+    # Column header — built from the same constants as data rows.
+    # printf -v builds the plain-text string; bleft() adds ANSI bold
+    # and pads to box width.
+    local _hdr_plain
+    printf -v _hdr_plain \
+        " %-*s %-*s %-*s %*s %-*s %-*s %*s %-*s %-*s" \
+        "$C_SN"     "#" \
+        "$C_PROTO"  "Proto" \
+        "$C_TARGET" "Target" \
+        "$C_PORT"   "Port" \
+        "$C_BW"     "Bandwidth" \
+        "$C_SPARK"  "Last 10s" \
+        "$C_TIME"   "Time" \
+        "$C_DSCP"   "DSCP" \
+        "$C_STAT"   "Status"
+    bleft "${BOLD}${_hdr_plain}${NC}"
     bline '-'
 
-    # ── Per-stream rows ────────────────────────────────────────────────────
+    # ------------------------------------------------------------------
+    # Per-stream rows
+    # ------------------------------------------------------------------
     for (( i=0; i<STREAM_COUNT; i++ )); do
         local sn=$(( i + 1 ))
         local st="${S_STATUS_CACHE[$i]:-STARTING}"
         local lf="${S_LOGFILE[$i]:-}"
 
-        # ── CLEANED / CLEANUP_PENDING tombstone ───────────────────────────
+        # ==============================================================
+        # CLEANED / CLEANUP_PENDING tombstone
+        # Build the entire row as plain text so bleft() gets a single
+        # clean string to measure with vlen().
+        # ==============================================================
         if [[ "$st" == "CLEANED" || "$st" == "CLEANUP_PENDING" ]]; then
-            local tgt_c="${S_TARGET[$i]:-?}"
-            if (( ${#tgt_c} > C_TARGET )); then
-                tgt_c="${tgt_c:0:$(( C_TARGET-1 ))}~"
-            fi
+            local tgt_t="${S_TARGET[$i]:-?}"
+            (( ${#tgt_t} > C_TARGET )) && tgt_t="${tgt_t:0:$(( C_TARGET-1 ))}~"
+
+            local _tomb_plain
+            printf -v _tomb_plain \
+                " %-*s %-*s %-*s %*s %-*s %-*s %*s %-*s" \
+                "$C_SN"     "$sn" \
+                "$C_PROTO"  "${S_PROTO[$i]}" \
+                "$C_TARGET" "$tgt_t" \
+                "$C_PORT"   "${S_PORT[$i]}" \
+                "$C_BW"     "---" \
+                "$C_SPARK"  "··········" \
+                "$C_TIME"   "------" \
+                "$C_DSCP"   "---"
+
             if [[ "$st" == "CLEANUP_PENDING" ]]; then
-                local plain_pending
-                plain_pending=$(printf \
-                    "%-${C_SN}s %-${C_PROTO}s %-${C_TARGET}s %${C_PORT}s %-${C_BW}s %-${C_SPARK}s %${C_TIME}s %${C_DSCP}s " \
-                    "$sn" "${S_PROTO[$i]}" "$tgt_c" "${S_PORT[$i]}" \
-                    "---" "··········" "--:--" "---")
-                bleft "${YELLOW}${plain_pending}$(printf '%-*s' "$C_STAT" "CLEANING…")${NC}"
+                bleft "${YELLOW}${_tomb_plain} $(printf '%-*s' "$C_STAT" "CLEANING…")${NC}"
             else
-                local plain_cleaned
-                plain_cleaned=$(printf \
-                    "%-${C_SN}s %-${C_PROTO}s %-${C_TARGET}s %${C_PORT}s %-${C_BW}s %-${C_SPARK}s %${C_TIME}s %${C_DSCP}s " \
-                    "$sn" "${S_PROTO[$i]}" "$tgt_c" "${S_PORT[$i]}" \
-                    "---" "··········" "------" "---")
-                bleft "${DIM}${plain_cleaned}$(printf '%-*s' "$C_STAT" "── DONE ──")${NC}"
+                bleft "${DIM}${_tomb_plain} $(printf '%-*s' "$C_STAT" "── DONE ──")${NC}"
             fi
-            if (( i < STREAM_COUNT - 1 )); then bline '-'; fi
+
+            (( i < STREAM_COUNT - 1 )) && bline '-'
             continue
         fi
 
-        # ── TX bandwidth ──────────────────────────────────────────────────
+        # ==============================================================
+        # Live bandwidth (TX direction)
+        # ==============================================================
         local bw_tx="---"
         if [[ "$st" == "CONNECTED" ]]; then
             if [[ "${S_BIDIR[$i]:-0}" == "1" ]] && (( BIDIR_SUPPORTED == 1 )); then
+                # --bidir: prefer [TX-C] tagged lines
                 if [[ -f "$lf" && -s "$lf" ]]; then
                     bw_tx=$(grep -E '\]\[TX-C\]' "$lf" 2>/dev/null \
                         | grep -E '[0-9.]+-[0-9.]+[[:space:]]+sec' \
                         | grep -vE '[[:space:]](sender|receiver)[[:space:]]*$' \
                         | tail -1 \
                         | awk '{
-                            for (i=1;i<=NF;i++) {
-                                if ($i=="bits/sec"  ||
-                                    $i=="Kbits/sec" || $i=="kbits/sec" ||
-                                    $i=="Mbits/sec" || $i=="mbits/sec" ||
-                                    $i=="Gbits/sec" || $i=="gbits/sec") {
-                                    if (i>1 && $(i-1)+0>0) {
-                                        val=$(i-1)+0; unit=$i
-                                        if (unit~/[Gg]/) bps=val*1e9
-                                        else if (unit~/[Mm]/) bps=val*1e6
-                                        else if (unit~/[Kk]/) bps=val*1e3
-                                        else bps=val
-                                        if      (bps>=1e9) printf "%.2f Gbps",bps/1e9
-                                        else if (bps>=1e6) printf "%.2f Mbps",bps/1e6
-                                        else if (bps>=1e3) printf "%.2f Kbps",bps/1e3
-                                        else               printf "%.0f bps",bps
-                                        exit
-                                    }
+                            for(i=1;i<=NF;i++){
+                                if($i~/[KMGkmg]?bits\/sec/ && i>1 && $(i-1)+0>0){
+                                    v=$(i-1)+0; u=$i
+                                    if(u~/[Gg]/) b=v*1e9
+                                    else if(u~/[Mm]/) b=v*1e6
+                                    else if(u~/[Kk]/) b=v*1e3
+                                    else b=v
+                                    if(b>=1e9) printf "%.2f Gbps",b/1e9
+                                    else if(b>=1e6) printf "%.2f Mbps",b/1e6
+                                    else if(b>=1e3) printf "%.2f Kbps",b/1e3
+                                    else printf "%.0f bps",b
+                                    exit
                                 }
                             }
                         }')
                     [[ -z "$bw_tx" ]] && bw_tx="---"
                 fi
+                # Fallback to any interval line
                 if [[ "$bw_tx" == "---" && -f "$lf" && -s "$lf" ]]; then
-                    bw_tx=$(grep -E '^\[[[:space:]]*[0-9]+\][[:space:]]+[0-9.]+-[0-9.]+[[:space:]]+sec' \
-                        "$lf" 2>/dev/null \
-                        | grep -vE '[[:space:]](sender|receiver)[[:space:]]*$' \
-                        | tail -1 \
-                        | awk '{
-                            for (i=1;i<=NF;i++) {
-                                if ($i=="bits/sec"  ||
-                                    $i=="Kbits/sec" || $i=="kbits/sec" ||
-                                    $i=="Mbits/sec" || $i=="mbits/sec" ||
-                                    $i=="Gbits/sec" || $i=="gbits/sec") {
-                                    if (i>1 && $(i-1)+0>0) {
-                                        val=$(i-1)+0; unit=$i
-                                        if (unit~/[Gg]/) bps=val*1e9
-                                        else if (unit~/[Mm]/) bps=val*1e6
-                                        else if (unit~/[Kk]/) bps=val*1e3
-                                        else bps=val
-                                        if      (bps>=1e9) printf "%.2f Gbps",bps/1e9
-                                        else if (bps>=1e6) printf "%.2f Mbps",bps/1e6
-                                        else if (bps>=1e3) printf "%.2f Kbps",bps/1e3
-                                        else               printf "%.0f bps",bps
-                                        exit
-                                    }
-                                }
-                            }
-                        }')
-                    [[ -z "$bw_tx" ]] && bw_tx="---"
+                    bw_tx=$(parse_live_bandwidth_from_log "$lf")
                 fi
             else
                 bw_tx=$(parse_live_bandwidth_from_log "$lf")
@@ -10220,39 +10297,47 @@ _render_client_frame() {
         fi
         [[ "$st" == "DONE" ]] && bw_tx="${S_FINAL_SENDER_BW[$i]:-N/A}"
 
-        # ── RX bandwidth (bidir only) ─────────────────────────────────────
+        # ==============================================================
+        # RX bandwidth (bidir only)
+        # ==============================================================
         local bw_rx="${S_BIDIR_BW[$i]:-???}"
+
+        # ==============================================================
+        # TX sparkline
+        # ==============================================================
+        local spark_tx; spark_tx=$(_spark_render "c" "$i")
+        if [[ "$st" == "CONNECTED" && "$bw_tx" != "---" ]]; then
+            _spark_push "c" "$i" "$bw_tx"
+            [[ "$JSON_EXPORT_ENABLED" -eq 1 ]] && \
+                _json_sample_push "$i" "$bw_tx" "$(date +%s)"
+        fi
+
+        # ==============================================================
+        # RX sparkline (bidir only)
+        # ==============================================================
         local spark_rx=""
         if [[ "${S_BIDIR[$i]:-0}" == "1" ]]; then
             spark_rx=$(_spark_render "r" "$i")
         fi
 
-        # ── TX sparkline ─────────────────────────────────
-        local spark_tx
-        spark_tx=$(_spark_render "c" "$i")
-        if [[ "$st" == "CONNECTED" && "$bw_tx" != "---" ]]; then
-            _spark_push "c" "$i" "$bw_tx"
-            # Collect per-second sample for JSON export
-            [[ "$JSON_EXPORT_ENABLED" -eq 1 ]] && \
-                _json_sample_push "$i" "$bw_tx" "$(date +%s)"
-        fi
-
-        # ── Time remaining ────────────────────────────────────────────────
-        local td="--:--"
+        # ==============================================================
+        # Time remaining / progress
+        # ==============================================================
+        local td="------"
         local sts="${S_START_TS[$i]:-0}"
-        if (( sts == 0 )); then sts="$now"; fi
-        local dur="${S_DURATION[$i]:-10}"
+        (( sts == 0 )) && sts="$now"
+        local dur="${S_DURATION[$i]:-0}"
         local stream_elapsed=$(( now - sts ))
         local show_bar=0
 
         case "$st" in
             CONNECTED|STARTING|CONNECTING)
                 if (( dur == 0 )); then
-                    td="inf"
+                    td="  inf "
                     show_bar=0
                 else
                     local rem=$(( dur - stream_elapsed ))
-                    if (( rem < 0 )); then rem=0; fi
+                    (( rem < 0 )) && rem=0
                     td=$(format_seconds "$rem")
                     show_bar=1
                 fi
@@ -10270,16 +10355,20 @@ _render_client_frame() {
                 ;;
         esac
 
-        # ── DSCP display ──────────────────────────────────────────────────
+        # ==============================================================
+        # DSCP display
+        # ==============================================================
         local dscp_disp="---"
-        [[ -n "${S_DSCP_NAME[$i]}" ]] && dscp_disp="${S_DSCP_NAME[$i]}"
-        if [[ "$dscp_disp" == "---" && -n "${S_DSCP_VAL[$i]}" ]]; then
-            if (( S_DSCP_VAL[$i] >= 0 )); then
-                dscp_disp="${S_DSCP_VAL[$i]}"
-            fi
+        if [[ -n "${S_DSCP_NAME[$i]}" ]]; then
+            dscp_disp="${S_DSCP_NAME[$i]}"
+        elif [[ -n "${S_DSCP_VAL[$i]}" ]] && (( S_DSCP_VAL[$i] >= 0 )); then
+            dscp_disp="${S_DSCP_VAL[$i]}"
         fi
+        (( ${#dscp_disp} > C_DSCP )) && dscp_disp="${dscp_disp:0:$(( C_DSCP-1 ))}~"
 
-        # ── Status colour ─────────────────────────────────────────────────
+        # ==============================================================
+        # Status colour
+        # ==============================================================
         local sb sc
         case "$st" in
             CONNECTED)  sb="CONNECTED"  sc="$GREEN"  ;;
@@ -10290,106 +10379,96 @@ _render_client_frame() {
             *)          sb="$st"        sc="$NC"     ;;
         esac
 
-        # ── Field truncation ──────────────────────────────────────────────
-        local tgt="${S_TARGET[$i]:-?}"
+        # ==============================================================
+        # Truncate variable-width fields to their column caps
+        # ==============================================================
         local bw_tx_disp="$bw_tx"
-        if (( ${#tgt}        > C_TARGET )); then tgt="${tgt:0:$(( C_TARGET-1 ))}~"; fi
-        if (( ${#bw_tx_disp} > C_BW     )); then bw_tx_disp="${bw_tx_disp:0:$(( C_BW-1 ))}~"; fi
-        if (( ${#dscp_disp}  > C_DSCP   )); then dscp_disp="${dscp_disp:0:$(( C_DSCP-1 ))}~"; fi
+        local bw_rx_disp="${bw_rx:-???}"
+        (( ${#bw_tx_disp} > C_BW     )) && bw_tx_disp="${bw_tx_disp:0:$(( C_BW-1 ))}~"
+        (( ${#bw_rx_disp} > C_BW     )) && bw_rx_disp="${bw_rx_disp:0:$(( C_BW-1 ))}~"
 
-        # ── TX row ───────────────────────────────────────────────────────────
-        # Layout strategy:
-        #   When the target fits in C_TARGET (15 chars) → classic single row
-        #   When the target is an FQDN or too long      → two-row display:
-        #     Row 1: sn proto [target truncated] port bw spark time dscp status
-        #     Row 2:     ↳ Full target string (full inner width available)
-        #
-        # The two-row approach gives FQDNs full untruncated visibility while
-        # keeping the dashboard compact for standard IPv4 targets.
-        # ─────────────────────────────────────────────────────────────────────
-
-        local tx_label=""
-        if [[ "${S_BIDIR[$i]:-0}" == "1" ]]; then
-            tx_label="${GREEN}↑ TX${NC} "
-        fi
-
-        # Determine whether this stream needs a dedicated target line
+        # ==============================================================
+        # Determine whether this stream needs a dedicated FQDN target
+        # line (two-row display)
+        # ==============================================================
         local _use_target_line=0
         _needs_target_line "$i" && _use_target_line=1
 
-        # Resolve the target display string
         local tgt="${S_TARGET[$i]:-?}"
         local tgt_full="${S_TARGET_DISPLAY[$i]:-$tgt}"
 
+        # ==============================================================
+        # Build the TX (main data) row
+        #
+        # For bidir streams the row starts with "↑ TX " (5 visible chars).
+        # For non-bidir streams the row starts with 5 spaces so the
+        # stream-number column lands at the same horizontal position.
+        #
+        # We build the fixed-width plain-text portion with printf -v,
+        # then concatenate the coloured status and pass the whole thing
+        # to bleft(). bleft() uses vlen() to measure the visible length
+        # and adds right-padding to reach the box inner width.
+        # ==============================================================
+        local _tgt_col_val
         if (( _use_target_line == 1 )); then
-            # ── Two-row display ───────────────────────────────────────────
-            # Row 1: omit the target column — replace with dashes as placeholder
-            # so the operator can see something is there while reading row 2.
-            # All other columns are printed at their normal widths.
+            # Target column shows a dash-line placeholder when the full
+            # FQDN appears on a dedicated second row.
+            _tgt_col_val="$(rpt '─' "$C_TARGET")"
+        else
+            _tgt_col_val="$tgt"
+            (( ${#_tgt_col_val} > C_TARGET )) && \
+                _tgt_col_val="${_tgt_col_val:0:$(( C_TARGET-1 ))}~"
+        fi
 
-            # Compact target placeholder shown on Row 1
-            local tgt_placeholder="──────────────"
-            if (( ${#tgt_placeholder} > C_TARGET )); then
-                tgt_placeholder="${tgt_placeholder:0:$C_TARGET}"
-            fi
+        local _row_plain
+        printf -v _row_plain \
+            " %-*s %-*s %-*s %*s %-*s %-*s %*s %-*s" \
+            "$C_SN"     "$sn" \
+            "$C_PROTO"  "${S_PROTO[$i]}" \
+            "$C_TARGET" "$_tgt_col_val" \
+            "$C_PORT"   "${S_PORT[$i]}" \
+            "$C_BW"     "$bw_tx_disp" \
+            "$C_SPARK"  "$spark_tx" \
+            "$C_TIME"   "$td" \
+            "$C_DSCP"   "$dscp_disp"
 
-            local plain_tx_fqdn
-            plain_tx_fqdn=$(printf \
-                "%-${C_SN}s %-${C_PROTO}s %-${C_TARGET}s %${C_PORT}s %-${C_BW}s %-${C_SPARK}s %${C_TIME}s %${C_DSCP}s " \
-                "$sn" "${S_PROTO[$i]}" "$tgt_placeholder" "${S_PORT[$i]}" \
-                "$bw_tx_disp" "$spark_tx" "$td" "$dscp_disp")
-            bleft "${tx_label}${plain_tx_fqdn}${sc}$(printf '%-*s' "$C_STAT" "$sb")${NC}"
+        if [[ "${S_BIDIR[$i]:-0}" == "1" ]]; then
+            # Bidir TX row: "↑ TX " prefix (5 visible chars, printed in green)
+            bleft "${GREEN}↑ TX${NC} ${_row_plain} ${sc}$(printf '%-*s' "$C_STAT" "$sb")${NC}"
+        else
+            # Standard row: 5-space indent keeps alignment identical to bidir rows
+            bleft "     ${_row_plain} ${sc}$(printf '%-*s' "$C_STAT" "$sb")${NC}"
+        fi
 
-            # Row 2: full target line — uses the entire inner width of the box
-            # Format:   "   ↳ iperf3.moji.fr (93.184.216.34)"
-            # The indent matches the sn+proto columns so it reads as belonging
-            # to the stream above it.
-            local _tgt_indent=$(( C_SN + 1 + C_PROTO + 1 ))
-            local _tgt_prefix
-            _tgt_prefix=$(printf '%*s%b↳%b ' \
-                "$_tgt_indent" "" \
-                "$CYAN" "$NC")
-
-            # Available width for the target string on row 2:
-            # inner = COLS - 2
-            # used  = indent + "↳ " (2 visible chars)
-            # available = inner - indent - 2
-            local _tgt_avail=$(( COLS - 2 - _tgt_indent - 2 ))
-            [[ $_tgt_avail -lt 20 ]] && _tgt_avail=20
+        # ==============================================================
+        # FQDN target line (two-row display)
+        # Printed immediately after the TX row when the target is an
+        # FQDN or a long IP that would not fit in C_TARGET columns.
+        # ==============================================================
+        if (( _use_target_line == 1 )); then
+            # Indent the "↳" marker to the same horizontal position as
+            # the Target column: 1(border) + _PFX_W + 1 + C_SN + 1 + C_PROTO + 1
+            local _tgt_marker_indent=$(( 1 + _PFX_W + 1 + C_SN + 1 + C_PROTO + 1 ))
+            local _tgt_avail=$(( _INNER - _tgt_marker_indent - 3 ))
+            (( _tgt_avail < 20 )) && _tgt_avail=20
 
             local tgt_line_str="$tgt_full"
-
-            # Truncate only as an absolute last resort — the dedicated line
-            # is specifically designed to avoid truncation. Only truncate if
-            # the terminal is pathologically narrow (< 60 cols).
             if (( ${#tgt_line_str} > _tgt_avail )); then
                 tgt_line_str="${tgt_line_str:0:$(( _tgt_avail - 1 ))}~"
             fi
 
+            local _tgt_prefix
+            _tgt_prefix="$(rpt ' ' $(( _tgt_marker_indent )))${CYAN}↳${NC} "
             bleft "${_tgt_prefix}${DIM}${tgt_line_str}${NC}"
-
-        else
-            # ── Standard single-row display ───────────────────────────────
-            # Classic behaviour for short IPv4 targets.
-            if (( ${#tgt} > C_TARGET )); then
-                tgt="${tgt:0:$(( C_TARGET - 1 ))}~"
-            fi
-
-            local plain_tx
-            plain_tx=$(printf \
-                "%-${C_SN}s %-${C_PROTO}s %-${C_TARGET}s %${C_PORT}s %-${C_BW}s %-${C_SPARK}s %${C_TIME}s %${C_DSCP}s " \
-                "$sn" "${S_PROTO[$i]}" "$tgt" "${S_PORT[$i]}" \
-                "$bw_tx_disp" "$spark_tx" "$td" "$dscp_disp")
-            bleft "${tx_label}${plain_tx}${sc}$(printf '%-*s' "$C_STAT" "$sb")${NC}"
         fi
 
-        # ── RX row (bidir only) ───────────────────────────────────────────
+        # ==============================================================
+        # RX row (bidir only)
+        # Uses the same column layout as the TX row but with a "↓ RX "
+        # prefix and only Bandwidth + Sparkline + Status filled in.
+        # All other columns are blank strings padded to their widths.
+        # ==============================================================
         if [[ "${S_BIDIR[$i]:-0}" == "1" ]]; then
-            local bw_rx_disp="$bw_rx"
-            if (( ${#bw_rx_disp} > C_BW )); then
-                bw_rx_disp="${bw_rx_disp:0:$(( C_BW-1 ))}~"
-            fi
-
             local rx_st="STARTING"
             local rx_lf="${BIDIR_LOGFILES[$i]:-}"
             if (( BIDIR_SUPPORTED == 1 )); then
@@ -10397,14 +10476,13 @@ _render_client_frame() {
                     CONNECTED|CONNECTING|STARTING)
                         if [[ -f "$rx_lf" && -s "$rx_lf" ]]; then
                             if grep -qE \
-                                '\]\[RX-C\].*[0-9.]+-[0-9.]+|\]\[RX\].*[0-9.]+-[0-9.]+|^\[RX-C\].*[0-9.]+-[0-9.]+' \
+                                '\]\[RX-C\].*[0-9.]+-[0-9.]+' \
                                 "$rx_lf" 2>/dev/null; then
                                 rx_st="CONNECTED"
                             else
                                 rx_st="CONNECTING"
                             fi
-                        fi
-                        ;;
+                        fi ;;
                     DONE)   rx_st="DONE"   ;;
                     FAILED) rx_st="FAILED" ;;
                     *)      rx_st="$st"    ;;
@@ -10414,26 +10492,89 @@ _render_client_frame() {
             case "$rx_st" in
                 CONNECTED)  rx_sc="$GREEN"  ;;
                 CONNECTING) rx_sc="$YELLOW" ;;
-                STARTING)   rx_sc="$YELLOW" ;;
                 DONE)       rx_sc="$CYAN"   ;;
                 FAILED)     rx_sc="$RED"    ;;
                 *)          rx_sc="$DIM"    ;;
             esac
-            local plain_rx
-            plain_rx=$(printf \
-                "%-${C_SN}s %-${C_PROTO}s %-${C_TARGET}s %${C_PORT}s %-${C_BW}s %-${C_SPARK}s %${C_TIME}s %${C_DSCP}s " \
-                "" "" "" "" "$bw_rx_disp" "$spark_rx" "" "")
-            bleft "${CYAN}↓ RX${NC} ${plain_rx}${rx_sc}$(printf '%-*s' "$C_STAT" "$rx_st")${NC}"
+
+            # RX row: blank out SN, Proto, Target, Port, Time, DSCP columns
+            local _rx_plain
+            printf -v _rx_plain \
+                " %-*s %-*s %-*s %*s %-*s %-*s %*s %-*s" \
+                "$C_SN"     "" \
+                "$C_PROTO"  "" \
+                "$C_TARGET" "" \
+                "$C_PORT"   "" \
+                "$C_BW"     "$bw_rx_disp" \
+                "$C_SPARK"  "$spark_rx" \
+                "$C_TIME"   "" \
+                "$C_DSCP"   ""
+
+            bleft "${CYAN}↓ RX${NC} ${_rx_plain} ${rx_sc}$(printf '%-*s' "$C_STAT" "$rx_st")${NC}"
         fi
 
-        # ── RTT row (non-loopback streams only) ───────────────────────────
+        # ==============================================================
+        # RTT row
+        # Fixed layout with 5-space indent (same as non-bidir rows) so
+        # it always aligns under the stream it belongs to.
+        # All numeric fields are formatted to fixed widths so the
+        # min/avg/max/jitter columns line up across multiple streams.
+        # ==============================================================
         local stream_tgt="${S_TARGET[$i]:-}"
         if [[ ! "$stream_tgt" =~ ^127\. && "$stream_tgt" != "::1" ]]; then
-            local rtt_str; rtt_str=$(_rtt_display "$i")
-            bleft "$rtt_str"
+            local rtt_min="${S_RTT_MIN[$i]:-}"
+            local rtt_avg="${S_RTT_AVG[$i]:-}"
+            local rtt_max="${S_RTT_MAX[$i]:-}"
+            local rtt_jit="${S_RTT_JITTER[$i]:-}"
+            local rtt_loss="${S_RTT_LOSS[$i]:-}"
+            local rtt_cnt="${S_RTT_SAMPLES[$i]:-0}"
+
+            if [[ -z "$rtt_avg" || "$rtt_avg" == "---" || "$rtt_cnt" == "0" ]]; then
+                # Waiting for first sample
+                bleft "     ${DIM}  RTT  Waiting for samples...${NC}"
+            else
+                # Format each field to a fixed visible width
+                local f_min f_avg f_max f_jit f_loss f_cnt
+                f_min=$(printf '%8.3f' "$rtt_min"  2>/dev/null || printf '%8s' "$rtt_min")
+                f_avg=$(printf '%8.3f' "$rtt_avg"  2>/dev/null || printf '%8s' "$rtt_avg")
+                f_max=$(printf '%8.3f' "$rtt_max"  2>/dev/null || printf '%8s' "$rtt_max")
+                f_jit=$(printf '%8.3f' "$rtt_jit"  2>/dev/null || printf '%8s' "$rtt_jit")
+                f_loss=$(printf '%5s'  "$rtt_loss")
+                f_cnt=$(printf '%5d'   "$rtt_cnt"  2>/dev/null || printf '%5s' "$rtt_cnt")
+
+                # Colour average RTT by magnitude
+                local avg_col="$GREEN"
+                local avg_int
+                avg_int=$(printf '%.0f' "$rtt_avg" 2>/dev/null || printf '9999')
+                if   (( avg_int > 150 )); then avg_col="$RED"
+                elif (( avg_int > 50  )); then avg_col="$YELLOW"
+                elif (( avg_int > 10  )); then avg_col="$CYAN"
+                fi
+
+                # Colour loss
+                local loss_col="$GREEN"
+                local loss_num
+                loss_num=$(printf '%s' "$rtt_loss" | tr -d '%')
+                local loss_int
+                loss_int=$(printf '%.0f' "${loss_num:-0}" 2>/dev/null || printf '0')
+                (( loss_int > 0 )) && loss_col="$RED"
+
+                # Build the RTT line as a single bleft() call.
+                # "     " = 5-space indent matching non-bidir row start.
+                # Each "label value unit" group has a fixed total width.
+                bleft "     ${DIM}RTT${NC}"\
+"  ${DIM}min${NC} ${GREEN}${f_min}${NC}${DIM}ms${NC}"\
+"  ${DIM}avg${NC} ${avg_col}${f_avg}${NC}${DIM}ms${NC}"\
+"  ${DIM}max${NC} ${YELLOW}${f_max}${NC}${DIM}ms${NC}"\
+"  ${DIM}jitter${NC} ${CYAN}${f_jit}${NC}${DIM}ms${NC}"\
+"  ${DIM}loss${NC} ${loss_col}${f_loss}${NC}"\
+"  ${DIM}(${f_cnt} smpl)${NC}"
+            fi
         fi
 
-        # ── CWND inline row (TCP non-loopback streams with data) ──────────
+        # ==============================================================
+        # CWND inline row (TCP non-loopback, at least 1 sample)
+        # ==============================================================
         if [[ "${S_PROTO[$i]:-TCP}" == "TCP" ]] && \
            [[ ! "$stream_tgt" =~ ^127\. && "$stream_tgt" != "::1" ]] && \
            [[ "${S_CWND_SAMPLES[$i]:-0}" != "0" ]]; then
@@ -10443,76 +10584,79 @@ _render_client_frame() {
             local cw_max="${S_CWND_MAX[$i]:----}"
             local cw_avg; cw_avg=$(_cwnd_avg "$i")
 
-            # Fixed-width numeric fields — 6 chars each (e.g. " 94.6")
-            # The label+field pairs are assembled as plain text first so
-            # vlen() padding in bleft() counts visible chars correctly.
-            local f_cur f_min f_max f_avg
-            f_cur=$(printf '%6s' "$cw_cur")
-            f_min=$(printf '%6s' "$cw_min")
-            f_max=$(printf '%6s' "$cw_max")
-            f_avg=$(printf '%6s' "$cw_avg")
+            local f_cur f_min_cw f_max_cw f_avg_cw
+            f_cur=$(printf    '%7s' "$cw_cur")
+            f_min_cw=$(printf '%7s' "$cw_min")
+            f_max_cw=$(printf '%7s' "$cw_max")
+            f_avg_cw=$(printf '%7s' "$cw_avg")
 
-            # Colour the current value by magnitude
+            # Colour by magnitude
             local cw_col="$GREEN"
             local cw_int
             cw_int=$(printf '%.0f' "$cw_cur" 2>/dev/null || printf '0')
-            if   (( cw_int < 10  )); then cw_col="$RED"
-            elif (( cw_int < 50  )); then cw_col="$YELLOW"
-            elif (( cw_int < 200 )); then cw_col="$CYAN"
+            if   (( cw_int <  10  )); then cw_col="$RED"
+            elif (( cw_int <  50  )); then cw_col="$YELLOW"
+            elif (( cw_int < 200  )); then cw_col="$CYAN"
             fi
 
-            bleft "  ${DIM}cwnd${NC}  ${DIM}cur${NC} ${cw_col}${f_cur}${NC}${DIM}KB${NC}  ${DIM}min${NC} ${CYAN}${f_min}${NC}${DIM}KB${NC}  ${DIM}max${NC} ${YELLOW}${f_max}${NC}${DIM}KB${NC}  ${DIM}avg${NC} ${f_avg}${DIM}KB${NC}"
+            bleft "     ${DIM}cwnd${NC}"\
+"  ${DIM}cur${NC} ${cw_col}${f_cur}${NC}${DIM}KB${NC}"\
+"  ${DIM}min${NC} ${CYAN}${f_min_cw}${NC}${DIM}KB${NC}"\
+"  ${DIM}max${NC} ${YELLOW}${f_max_cw}${NC}${DIM}KB${NC}"\
+"  ${DIM}avg${NC} ${f_avg_cw}${DIM}KB${NC}"
         fi
 
-        # ── Ramp timeline row (ramp-enabled streams only) ─────────────────
+        # ==============================================================
+        # Ramp timeline row (ramp-enabled streams only)
+        # ==============================================================
         if [[ "${S_RAMP_ENABLED[$i]:-0}" == "1" ]]; then
             local ramp_phase="${S_RAMP_PHASE[$i]:-RAMPUP}"
             local ramp_bw_cur="${S_RAMP_BW_CURRENT[$i]:----}"
             local ramp_tgt="${S_RAMP_BW_TARGET[$i]:----}"
-            local ramp_up_s="${S_RAMP_UP[$i]:-0}"
-            local ramp_dn_s="${S_RAMP_DOWN[$i]:-0}"
 
-            # Phase colour and label
             local ramp_phase_col ramp_phase_lbl
             case "$ramp_phase" in
-                RAMPUP)   ramp_phase_col="$GREEN";  ramp_phase_lbl="↑ RAMP UP"   ;;
-                HOLD)     ramp_phase_col="$CYAN";   ramp_phase_lbl="→ HOLD"      ;;
+                RAMPUP)   ramp_phase_col="$GREEN";  ramp_phase_lbl="↑ RAMP UP  " ;;
+                HOLD)     ramp_phase_col="$CYAN";   ramp_phase_lbl="— HOLD     " ;;
                 RAMPDOWN) ramp_phase_col="$YELLOW"; ramp_phase_lbl="↓ RAMP DOWN" ;;
-                DONE)     ramp_phase_col="$DIM";    ramp_phase_lbl="✓ DONE"      ;;
-                *)        ramp_phase_col="$DIM";    ramp_phase_lbl="  ---"        ;;
+                DONE)     ramp_phase_col="$DIM";    ramp_phase_lbl="✓ DONE     " ;;
+                *)        ramp_phase_col="$DIM";    ramp_phase_lbl="  ---      " ;;
             esac
 
-            # Render 30-char timeline curve
             local ramp_curve
             ramp_curve=$(_ramp_timeline_render "$i" 30)
 
-            # Build the ramp row as plain text for bleft alignment.
-            # Layout:  "  ramp [TIMELINE30] PHASE     cur:XXXX tgt:XXXX"
-            # All labels are fixed-width so the row never misaligns.
-            local ramp_phase_fixed
-            ramp_phase_fixed=$(printf '%-11s' "$ramp_phase_lbl")
+            local ramp_cur_f ramp_tgt_f
+            ramp_cur_f=$(printf '%6s' "$ramp_bw_cur")
+            ramp_tgt_f=$(printf '%6s' "$ramp_tgt")
 
-            local ramp_cur_fixed ramp_tgt_fixed
-            ramp_cur_fixed=$(printf '%6s' "$ramp_bw_cur")
-            ramp_tgt_fixed=$(printf '%6s' "$ramp_tgt")
-
-            bleft "  ${DIM}ramp${NC} ${ramp_phase_col}${ramp_curve}${NC} ${ramp_phase_col}${ramp_phase_fixed}${NC}  ${DIM}cur${NC} ${ramp_phase_col}${ramp_cur_fixed}${NC}  ${DIM}tgt${NC} ${ramp_tgt_fixed}"
+            bleft "     ${DIM}ramp${NC} ${ramp_phase_col}${ramp_curve}${NC}"\
+" ${ramp_phase_col}${ramp_phase_lbl}${NC}"\
+"  ${DIM}cur${NC} ${ramp_phase_col}${ramp_cur_f}${NC}"\
+"  ${DIM}tgt${NC} ${ramp_tgt_f}"
         fi
 
-        # ── Progress bar row (fixed-duration non-FAILED streams only) ─────
-        if (( show_bar == 1 )) && (( has_fixed_dur == 1 )); then
+        # ==============================================================
+        # Progress bar row (fixed-duration non-FAILED streams only)
+        # Indented to align under the Bandwidth column.
+        # ==============================================================
+        if (( show_bar == 1 )); then
             local bar_str; bar_str=$(_render_progress_bar "$stream_elapsed" "$dur")
-            local bar_indent=$(( C_SN + 1 + C_PROTO + 1 + C_TARGET + 1 + C_PORT + 1 ))
+            # Indent = 5(prefix) + 1 + C_SN + 1 + C_PROTO + 1 + C_TARGET + 1 + C_PORT + 1
+            local bar_indent=$(( _PFX_W + 1 + C_SN + 1 + C_PROTO + 1 + C_TARGET + 1 + C_PORT + 1 ))
             bleft "$(printf '%*s' "$bar_indent" '')${bar_str}"
         fi
 
-        # ── Per-stream separator (between streams, not after last) ────────
-        if (( i < STREAM_COUNT - 1 )); then
-            bline '-'
-        fi
-    done
+        # ==============================================================
+        # Per-stream separator (between streams, not after the last)
+        # ==============================================================
+        (( i < STREAM_COUNT - 1 )) && bline '-'
 
-    # ── Footer ────────────────────────────────────────────────────────────
+    done  # end per-stream loop
+
+    # ------------------------------------------------------------------
+    # Footer
+    # ------------------------------------------------------------------
     bline '='
     if _all_streams_loopback; then
         bleft "  ${YELLOW}Ctrl+C${NC} to stop all streams"
@@ -10521,16 +10665,15 @@ _render_client_frame() {
     fi
     bline '='
 
-    # ── Notification banner (always exactly 1 line) ───────────────────────
-    # Always prints exactly one line — blank when no notification,
-    # highlighted when a cleanup event has been logged.
+    # ------------------------------------------------------------------
+    # Notification banner — always exactly 1 line
+    # ------------------------------------------------------------------
     local _notify_msg
     _notify_msg="$(_assoc_get G_LAST_NOTIFY 0 2>/dev/null)"
     if [[ -n "$_notify_msg" ]]; then
         local _max_len=$(( COLS - 4 ))
-        if (( ${#_notify_msg} > _max_len )); then
+        (( ${#_notify_msg} > _max_len )) && \
             _notify_msg="${_notify_msg:0:${_max_len}}…"
-        fi
         local _padded
         printf -v _padded "%-${COLS}s" "  ${_notify_msg}"
         printf '\033[1;97;42m%s\033[0m\033[K\n' "$_padded"
@@ -10538,16 +10681,10 @@ _render_client_frame() {
         printf '\033[K\n'
     fi
 
-    # ── Restore errexit state ─────────────────────────────────────────────
-    # Must happen BEFORE returning so the caller's set -e state is intact.
-    if (( _old_errexit == 1 )); then set -e; fi
-
-    # ── _LAST_FRAME_LINE_COUNT is NOT set here ────────────────────────────
-    # run_dashboard calculates the line count after calling this function
-    # using _count_client_frame_lines_for_state + CWND extra rows.
-    # Keeping the count calculation outside this function eliminates the
-    # risk of the subshell call to _count_client_frame_lines_for_state
-    # being affected by a transitional set -e / set +e state.
+    # ------------------------------------------------------------------
+    # Restore errexit state
+    # ------------------------------------------------------------------
+    (( _old_errexit == 1 )) && set -e
 }
 
 _render_server_frame() {
