@@ -231,3 +231,64 @@ sudo ./prism.sh
 # will display [ WARN ] or [ OFF ] in the Capability Matrix
 ./prism.sh
 ```
+
+## Quick Start
+
+### Loopback self-test (no remote server needed)
+
+The fastest way to confirm PRISM works on your system. No remote infrastructure required.
+```bash
+sudo ./prism.sh
+```
+
+1. Select **`4`** — Loopback Test
+2. Streams: `1`
+3. Protocol: `TCP`
+4. Duration: `10`
+5. Accept all other defaults by pressing Enter
+
+PRISM will start a local iperf3 server on `127.0.0.1:5201`, connect a client, display the live dashboard for 10 seconds, and print the final results table. Expected output:
+
+```
+All 1 stream(s) completed successfully.
+```
+
+### Basic client test (remote iperf3 server required)
+
+```bash
+# On the remote server host:
+iperf3 -s -p 5201
+
+# On the PRISM host:
+sudo ./prism.sh
+```
+* Select **`3`** — Client Mode
+* Streams: `1`
+* Protocol: `TCP`
+* Target: `192.168.1.100` _(or an FQDN such as `iperf3.moji.fr`)_
+* Port: `5201`
+* Bandwidth: _(press Enter for unlimited)_
+* Duration: `30`
+* Accept all other defaults
+
+## Pre-flight capability check
+
+Every time **PRISM** launches it displays the Capability Matrix showing which features are available on your system:
+
+```
++==============================================================================+
+|             PRISM  PRE-FLIGHT CAPABILITY MATRIX                              |
++------------------------------------------------------------------------------+
+| Feature                | Status   | Requirement / Note                      |
+|------------------------|----------|-----------------------------------------|
+| TCP Ramp-Up (TBF)      | [  OK  ] | root + tc (iproute2) confirmed          |
+| Bidir Streams          | [  OK  ] | iperf3 v3.16.0 supports --bidir         |
+| VRF Orchestration      | [  OK  ] | root + kernel VRF support confirmed     |
+| DSCP Verification      | [  OK  ] | root + tcpdump confirmed                |
+| TCP CWND Tracking      | [  OK  ] | Standard iperf3 verbose log parsing     |
+| Mixed Traffic (MTP)    | [  OK  ] | iperf3 + awk confirmed                  |
+| FQDN Resolution        | [  OK  ] | FQDN resolution via getent              |
++==============================================================================+
+```
+
+
