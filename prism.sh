@@ -180,6 +180,18 @@ _init_ansi_lengths() {
     _LEN_NC=${#NC}
 }
 
+# =============================================================================
+# SIGNAL DEFERRAL GLOBALS
+#
+# _RENDER_LOCK  : set to 1 while a frame is being written to stdout.
+#                 Signal handlers check this and set _DEFERRED_SIGNAL
+#                 instead of acting immediately.
+# _DEFERRED_SIGNAL : name of the signal that fired during a locked render.
+#                 Checked and dispatched at the end of each tick.
+# =============================================================================
+_RENDER_LOCK=0
+_DEFERRED_SIGNAL=""
+
 # ==============================================================================
 # _init_colors
 #
@@ -4586,68 +4598,106 @@ cleanup() {
 }
 
 # =============================================================================
-# _trap_int / _trap_term / _trap_quit / _trap_hup
+# _trap_cursor_exit
 #
-# FIX: Before printing the "PRISM [SIGINT]" message, move the cursor below
-# the last rendered dashboard frame so the signal message never overlaps
-# the TUI borders. Uses _LAST_FRAME_LINE_COUNT (set by run_dashboard after
-# each render tick) to know exactly how far down to move.
+# Moves the terminal cursor to a clean line below the last rendered dashboard
+# frame before any cleanup text is printed.
 #
-# The cursor-restore + cursor-down sequence must go to /dev/tty directly
-# (not through tty_echo which adds a newline) so it is a single atomic
-# write that cannot be interleaved with dashboard output.
+# Uses _LAST_FRAME_LINE_COUNT (updated after every render tick by run_dashboard)
+# to calculate the exact downward distance from the saved frame anchor.
+#
+# Sequence:
+#   \033[u   — restore cursor to saved frame anchor (top of dashboard)
+#   \033[NB  — move down N lines (past the full frame)
+#   \033[J   — erase from cursor to end of screen (remove ghost content)
+#   \033[?25h — restore cursor visibility
+#   \n       — one blank line before cleanup text
+#
+# Goes directly to /dev/tty so it works even when stdout is redirected.
 # =============================================================================
 
 _trap_cursor_exit() {
-    # Restore to the saved anchor, then move down past the frame.
-    # If _LAST_FRAME_LINE_COUNT is 0 or unset, just emit two newlines
-    # as a safe fallback so the prompt is always on a clean line.
     local _lines="${_LAST_FRAME_LINE_COUNT:-0}"
     if (( _lines > 0 )); then
-        # Restore anchor → move down → erase to end of screen → newline
         printf '\033[u\033[%dB\033[J\033[?25h\n' "$_lines" >/dev/tty 2>/dev/null
     else
         printf '\033[?25h\n\n' >/dev/tty 2>/dev/null
     fi
 }
 
-_trap_int()  {
+# =============================================================================
+# _trap_int / _trap_term / _trap_quit / _trap_hup
+#
+# If a render is in progress (_RENDER_LOCK=1) the signal is deferred by
+# storing its name in _DEFERRED_SIGNAL. run_dashboard dispatches it at the
+# safe point between ticks.
+#
+# If no render is in progress the signal is handled immediately.
+# =============================================================================
+_trap_int() {
+    if (( _RENDER_LOCK == 1 )); then
+        _DEFERRED_SIGNAL="INT"
+        return
+    fi
     _trap_cursor_exit
     tty_echo "${BOLD}${YELLOW}  PRISM [SIGINT]  Ctrl+C — stopping...${NC}"
     cleanup "SIGINT (Ctrl+C)"
     exit 130
 }
+
 _trap_term() {
+    if (( _RENDER_LOCK == 1 )); then
+        _DEFERRED_SIGNAL="TERM"
+        return
+    fi
     _trap_cursor_exit
     tty_echo "${BOLD}${YELLOW}  PRISM [SIGTERM] Stopping...${NC}"
     cleanup "SIGTERM"
     exit 143
 }
+
 _trap_quit() {
+    if (( _RENDER_LOCK == 1 )); then
+        _DEFERRED_SIGNAL="QUIT"
+        return
+    fi
     _trap_cursor_exit
     tty_echo "${BOLD}${YELLOW}  PRISM [SIGQUIT] Ctrl+\\ — stopping...${NC}"
     cleanup "SIGQUIT"
     exit 131
 }
-_trap_hup()  {
+
+_trap_hup() {
+    if (( _RENDER_LOCK == 1 )); then
+        _DEFERRED_SIGNAL="HUP"
+        return
+    fi
     _trap_cursor_exit
     tty_echo "${BOLD}${YELLOW}  PRISM [SIGHUP]  Terminal closed — stopping...${NC}"
     cleanup "SIGHUP"
     exit 129
 }
+
 _trap_tstp() {
-    _trap_cursor_exit
+    # Ctrl+Z is always blocked regardless of render state
+    printf '\033[?25h' >/dev/tty 2>/dev/null
     tty_echo "${BOLD}${YELLOW}  PRISM [Ctrl+Z blocked]${NC}  Backgrounding will orphan iperf3 processes."
     tty_echo "${YELLOW}  Use Ctrl+C to stop cleanly.${NC}"
 }
 
-_trap_exit() { local ec=$?; (( CLEANUP_DONE == 0 )) && cleanup "exit (code ${ec})"; }
-
-register_traps() {
-    trap '_trap_exit' EXIT; trap '_trap_int' INT; trap '_trap_term' TERM
-    trap '_trap_quit' QUIT; trap '_trap_hup' HUP; trap '_trap_tstp' TSTP
+_trap_exit() {
+    local ec=$?
+    (( CLEANUP_DONE == 0 )) && cleanup "exit (code ${ec})"
 }
 
+register_traps() {
+    trap '_trap_exit' EXIT
+    trap '_trap_int'  INT
+    trap '_trap_term' TERM
+    trap '_trap_quit' QUIT
+    trap '_trap_hup'  HUP
+    trap '_trap_tstp' TSTP
+}
 # =============================================================================
 # SECTION 5 — INITIALIZATION
 # =============================================================================
@@ -10909,61 +10959,35 @@ _render_server_frame() {
     bline '='
 }
 
-# ==============================================================================
+# =============================================================================
 # run_dashboard  <mode>
 #
-# Main dashboard render loop for PRISM.
+# KEY CHANGES vs previous version:
 #
-# MODES:
-#   client  (default) — renders _render_client_frame, shows stream BW,
-#                        RTT, CWND, ramp timeline, progress bars,
-#                        completed/failed panels, DSCP verify hint.
-#   server            — renders _render_server_frame, shows listener BW,
-#                        sparklines, connection state.
+#   1. _RENDER_LOCK=1 is set immediately before _render_server_frame /
+#      _render_client_frame is called and cleared immediately after.
+#      Signal handlers that fire during this window set _DEFERRED_SIGNAL
+#      instead of acting, so no signal text can be injected mid-frame.
 #
-# FQDN SUPPORT:
-#   Per-stream target line counting now accounts for the dedicated FQDN
-#   display row added when S_TARGET_DISPLAY[$i] differs from S_TARGET[$i]
-#   (i.e. the operator entered a hostname that was resolved to an IPv4).
-#   The inline _fc calculation mirrors _count_client_frame_lines_for_state
-#   exactly — both must be kept in sync.
+#   2. After clearing _RENDER_LOCK, the deferred signal is dispatched
+#      at the safe point between cursor-restore and the keyboard poll.
+#      This guarantees the frame is always complete before any signal
+#      handler output appears on screen.
 #
-# ARCHITECTURE:
-#   1. Pre-reserve vertical space by printing blank lines then jumping back.
-#   2. Save cursor anchor (\033[s) at top of reserved block.
-#   3. Each tick: restore anchor → render frame → jump back → re-save anchor.
-#   4. Non-blocking 0.1 s keyboard poll × 10 = ~1 s per tick.
-#   5. Two-phase stream cleanup state machine:
-#        Phase A (this tick):  DONE/FAILED → CLEANUP_PENDING
-#        Phase B (next tick):  CLEANUP_PENDING → run _cleanup_stream_procs
-#                              → CLEANED
-#   6. Exit when every stream is in a terminal state (CLEANED or FAILED).
+#   3. _LAST_FRAME_LINE_COUNT is updated immediately after the render
+#      lock is released so _trap_cursor_exit always has the correct
+#      frame height even when the signal fires on the very first tick.
 #
-# CURSOR / FLICKER PREVENTION:
-#   - \033[?25l  hides cursor during live rendering
-#   - \033[?25h  restores cursor on exit
-#   - \033[J     erases from cursor to end of screen after each render
-#                so shrinking frames leave no ghost lines
-#   - \033[K     appended by bline/bleft/bcenter to clear to EOL
-#
-# KEYBOARD HANDLERS:
-#   v / p  — DSCP marking verification (client non-loopback mode)
-#   c      — Packet capture / DSCP verification (server mode)
-#
-# CALLED BY:
-#   run_client_mode, run_server_mode, run_loopback_mode,
-#   run_mixed_traffic_mode
-# ==============================================================================
+#   4. The final cursor-repositioning block uses the same
+#      \033[u + \033[NB + \033[J sequence as _trap_cursor_exit so
+#      normal exit and signal exit produce identical clean output.
+# =============================================================================
 run_dashboard() {
     local mode="${1:-client}"
     local count
     [[ "$mode" == "server" ]] && count=$SERVER_COUNT || count=$STREAM_COUNT
 
-    # ── Initialise per-stream cleanup tracking arrays ─────────────────────────
-    # S_CLEANUP_QUEUED tracks the two-phase non-blocking cleanup state:
-    #   0 = not yet queued
-    #   1 = queued (CLEANUP_PENDING set, waiting for Phase B)
-    #   2 = cleanup ran this tick (_cleanup_stream_procs was called)
+    # Initialise per-stream cleanup tracking
     if [[ "$mode" != "server" ]]; then
         local _ci
         for (( _ci=0; _ci<STREAM_COUNT; _ci++ )); do
@@ -10971,11 +10995,7 @@ run_dashboard() {
         done
     fi
 
-    # ── Initial status probe before pre-reservation ───────────────────────────
-    # Run one probe pass before reserving blank lines so the initial _fc
-    # calculation reflects the actual stream states rather than all being
-    # STARTING, which could under-reserve and cause a scroll jump on the
-    # very first tick.
+    # Initial status probe before pre-reservation
     if [[ "$mode" != "server" ]]; then
         local j
         for (( j=0; j<STREAM_COUNT; j++ )); do
@@ -10983,10 +11003,7 @@ run_dashboard() {
         done
     fi
 
-    # ── Calculate pre-reserve line count ──────────────────────────────────────
-    # Use the state-aware counter so the blank block is sized correctly for
-    # the current stream configuration (including FQDN target lines) from
-    # tick zero.
+    # Calculate pre-reserve line count
     local pre_lines
     if [[ "$mode" == "server" ]]; then
         pre_lines=$(_count_server_frame_lines)
@@ -10998,28 +11015,28 @@ run_dashboard() {
     _PREV_DYNAMIC_LINES=0
     local _last_total=$pre_lines
 
-    # ── Reserve vertical space and establish the frame anchor ─────────────────
-    # Print exactly pre_lines blank lines then jump back to the top.
-    # This "claims" the terminal real estate the dashboard will occupy and
-    # prevents the prompt or other output from interfering.
+    # Update the global so _trap_cursor_exit has a valid value from tick 0
+    _LAST_FRAME_LINE_COUNT=$pre_lines
+
+    # Reserve vertical space and establish the frame anchor
     local k
     for (( k=0; k<pre_lines; k++ )); do printf '\n'; done
     printf '\033[%dA' "$pre_lines"
-    printf '\033[s'        # save cursor — this is the frame anchor
-    printf '\033[?25l'     # hide cursor during live rendering
+    printf '\033[s'
+    printf '\033[?25l'
+
+    # Reset deferred signal state
+    _DEFERRED_SIGNAL=""
+    _RENDER_LOCK=0
 
     local _dashboard_running=1
 
-    # ════════════════════════════════════════════════════════════════════════════
+    # =========================================================================
     # Main render loop
-    # ════════════════════════════════════════════════════════════════════════════
+    # =========================================================================
     while (( _dashboard_running == 1 )); do
 
-        # ── Per-tick state probe ───────────────────────────────────────────────
-        # Run probe_client_status here so Phase A (below) sees the latest state
-        # BEFORE the render runs. _render_client_frame also calls
-        # probe_client_status internally; the double call is safe because
-        # probe_client_status is idempotent for terminal states.
+        # ── Per-tick state probe ───────────────────────────────────────────
         if [[ "$mode" != "server" ]]; then
             local j
             for (( j=0; j<STREAM_COUNT; j++ )); do
@@ -11027,10 +11044,7 @@ run_dashboard() {
             done
         fi
 
-        # ── Stream cleanup state machine — Phase A ────────────────────────────
-        # Transition DONE/FAILED → CLEANUP_PENDING so the render function
-        # shows the "CLEANING…" tombstone while Phase B runs cleanup.
-        # Only queue once: skip streams already at state 1 or 2.
+        # ── Phase A: queue finished streams for cleanup ────────────────────
         if [[ "$mode" != "server" ]]; then
             local _si
             for (( _si=0; _si<STREAM_COUNT; _si++ )); do
@@ -11045,52 +11059,31 @@ run_dashboard() {
             done
         fi
 
-        # ── Restore cursor to top of frame ────────────────────────────────────
-        # Every tick redraws from the saved anchor position so the dashboard
-        # overwrites its own previous content rather than scrolling.
+        # ── Restore cursor to top of frame ────────────────────────────────
         printf '\033[u'
 
-        # ── Render the frame ──────────────────────────────────────────────────
-        local fixed_lines
+        # ── RENDER — protected by _RENDER_LOCK ────────────────────────────
+        # Any signal that arrives between the lock set and lock clear is
+        # deferred into _DEFERRED_SIGNAL and dispatched below.
+        _RENDER_LOCK=1
+
         if [[ "$mode" == "server" ]]; then
             _render_server_frame
-            fixed_lines=$(_count_server_frame_lines)
         else
             _render_client_frame
+        fi
 
-            # ── Inline line-count calculation ─────────────────────────────────
-            # CRITICAL: computed in the main shell context (not via a subshell)
-            # so that array variables such as S_CWND_SAMPLES, S_BIDIR,
-            # S_DURATION, S_TARGET_DISPLAY, and S_STATUS_CACHE are read from
-            # the live parent-shell state, not a stale snapshot.
-            #
-            # Variable declarations are placed BEFORE the loop to avoid a Bash
-            # bug where re-declaring 'local' inside a loop body resets the
-            # variable to empty on the second iteration.
-            #
-            # Row anatomy per stream (all conditional on state/protocol):
-            #   +1  TX row                   always
-            #   +1  Target line              FQDN / long target only
-            #   +1  RX row                   bidir streams only
-            #   +1  RTT row                  non-loopback streams only
-            #   +1  CWND inline row          TCP non-loopback with ≥1 sample
-            #   +1  Ramp timeline row        ramp-enabled streams only
-            #   +1  Progress bar row         fixed-duration non-FAILED streams
-            #   +1  Per-stream separator     between streams (not after last)
-            #
-            # Fixed overhead = 11:
-            #   1  top border       (bline '=')
-            #   1  title            (bcenter)
-            #   1  title border     (bline '=')
-            #   1  counters row     (bleft)
-            #   1  counters border  (bline '=')
-            #   1  column header    (bleft)
-            #   1  header underline (bline '-')
-            #   1  bottom border    (bline '=')
-            #   1  hint row         (bleft)
-            #   1  final border     (bline '=')
-            #   1  notification banner (always exactly 1 line)
+        _RENDER_LOCK=0
+        # ── End of protected render ────────────────────────────────────────
 
+        # ── Update exact line count AFTER render ───────────────────────────
+        # Must happen with _RENDER_LOCK=0 so the count is available to
+        # _trap_cursor_exit if a deferred signal is dispatched next.
+        local fixed_lines
+        if [[ "$mode" == "server" ]]; then
+            fixed_lines=$(_count_server_frame_lines)
+        else
+            # Inline _fc calculation (main shell context — not a subshell)
             local _fc=11
             local _fci _fcst _fctgt _fctgt_disp _fctgt_raw
 
@@ -11098,86 +11091,58 @@ run_dashboard() {
                 _fcst="${S_STATUS_CACHE[$_fci]:-STARTING}"
                 _fctgt="${S_TARGET[$_fci]:-}"
 
-                # ── CLEANED / CLEANUP_PENDING tombstone ───────────────────────
-                # These states render as a single compact row — no sub-rows.
                 if [[ "$_fcst" == "CLEANED" || \
                       "$_fcst" == "CLEANUP_PENDING" ]]; then
-                    _fc=$(( _fc + 1 ))      # tombstone row
+                    _fc=$(( _fc + 1 ))
                     if (( _fci < STREAM_COUNT - 1 )); then
-                        _fc=$(( _fc + 1 ))  # per-stream separator
+                        _fc=$(( _fc + 1 ))
                     fi
                     continue
                 fi
 
-                # ── TX row (always present) ───────────────────────────────────
-                _fc=$(( _fc + 1 ))
+                _fc=$(( _fc + 1 ))   # TX row
 
-                # ── Target line — FQDN or long target ─────────────────────────
-                # Added when:
-                #   (a) S_TARGET_DISPLAY[$i] is set AND differs from S_TARGET[$i]
-                #       meaning the operator entered an FQDN that was resolved
-                #   (b) the display string length exceeds C_TARGET=15 chars
-                #
-                # This guard must exactly mirror _needs_target_line() and the
-                # check inside _render_client_frame so all three stay in sync.
                 _fctgt_raw="${S_TARGET[$_fci]:-}"
                 _fctgt_disp="${S_TARGET_DISPLAY[$_fci]:-$_fctgt_raw}"
                 if [[ -n "${S_TARGET_DISPLAY[$_fci]:-}" && \
                       "${S_TARGET_DISPLAY[$_fci]}" != "$_fctgt_raw" ]] || \
                    (( ${#_fctgt_disp} > 15 )); then
-                    _fc=$(( _fc + 1 ))      # dedicated FQDN target line
+                    _fc=$(( _fc + 1 ))   # FQDN target line
                 fi
 
-                # ── RX row — bidirectional streams only ───────────────────────
-                if [[ "${S_BIDIR[$_fci]:-0}" == "1" ]]; then
-                    _fc=$(( _fc + 1 ))
-                fi
+                [[ "${S_BIDIR[$_fci]:-0}" == "1" ]] && \
+                    _fc=$(( _fc + 1 ))   # RX row
 
-                # ── RTT row — non-loopback streams only ───────────────────────
                 if [[ ! "$_fctgt" =~ ^127\. && "$_fctgt" != "::1" ]]; then
-                    _fc=$(( _fc + 1 ))
+                    _fc=$(( _fc + 1 ))   # RTT row
                 fi
 
-                # ── CWND inline row ───────────────────────────────────────────
-                # Guard exactly mirrors the condition in _render_client_frame so
-                # the counter stays in sync.
                 if [[ "${S_PROTO[$_fci]:-TCP}" == "TCP" ]] && \
                    [[ ! "$_fctgt" =~ ^127\. && "$_fctgt" != "::1" ]] && \
                    [[ "${S_CWND_SAMPLES[$_fci]:-0}" != "0" ]]; then
-                    _fc=$(( _fc + 1 ))
+                    _fc=$(( _fc + 1 ))   # CWND row
                 fi
 
-                # ── Ramp timeline row — ramp-enabled streams only ─────────────
-                if [[ "${S_RAMP_ENABLED[$_fci]:-0}" == "1" ]]; then
-                    _fc=$(( _fc + 1 ))
-                fi
+                [[ "${S_RAMP_ENABLED[$_fci]:-0}" == "1" ]] && \
+                    _fc=$(( _fc + 1 ))   # Ramp row
 
-                # ── Progress bar row ──────────────────────────────────────────
-                # Present when stream has a fixed duration AND is not FAILED.
                 if (( S_DURATION[$_fci] > 0 )) && \
                    [[ "$_fcst" != "FAILED" ]]; then
-                    _fc=$(( _fc + 1 ))
+                    _fc=$(( _fc + 1 ))   # Progress bar
                 fi
 
-                # ── Per-stream separator ──────────────────────────────────────
-                # Between streams, not after the last one.
                 if (( _fci < STREAM_COUNT - 1 )); then
-                    _fc=$(( _fc + 1 ))
+                    _fc=$(( _fc + 1 ))   # Per-stream separator
                 fi
             done
 
             fixed_lines=$_fc
-            _LAST_FRAME_LINE_COUNT=$_fc
         fi
 
-        # ── Erase stale content below the current frame ───────────────────────
-        # \033[J clears from the current cursor position to the end of the
-        # screen. This ensures that if the frame shrinks (e.g. a stream
-        # transitions to CLEANED and loses its RTT/CWND/FQDN rows), the now-
-        # unused lines are blanked rather than showing ghost content.
+        # Erase stale content below the current frame
         printf '\033[J'
 
-        # ── Dynamic panels (client mode only) ────────────────────────────────
+        # ── Dynamic panels (client mode only) ─────────────────────────────
         local completed_lines=0 failed_lines=0
         if [[ "$mode" != "server" ]]; then
             completed_lines=$(_count_completed_panel_lines)
@@ -11186,53 +11151,80 @@ run_dashboard() {
             (( failed_lines    > 0 )) && _render_failed_panel
         fi
 
-        # ── DSCP verify hint block ────────────────────────────────────────────
-        # Always prints exactly 3 lines for non-loopback client mode.
-        # Keeping _hint_lines=3 constant from tick 1 eliminates the anchor
-        # drift that occurs when _hint_lines transitions 0→3 on the tick a
-        # stream first becomes CONNECTED.
+        # ── DSCP verify hint block (client non-loopback) ──────────────────
         local _hint_lines=0
         if [[ "$mode" != "server" ]] && ! _all_streams_loopback; then
             local _any_verifiable=0
             local _ji
             for (( _ji=0; _ji<STREAM_COUNT; _ji++ )); do
                 if [[ "${S_STATUS_CACHE[$_ji]}" == "CONNECTED" ]] && \
-                   [[ ! "${S_TARGET[$_ji]:-}" =~ ^127\. ]]        && \
+                   [[ ! "${S_TARGET[$_ji]:-}" =~ ^127\. ]] && \
                    [[ "${S_TARGET[$_ji]:-}" != "::1" ]]; then
                     _any_verifiable=1
                     break
                 fi
             done
-            printf '\033[K\n'                           # line 1: blank
+            printf '\033[K\n'
             if (( _any_verifiable == 1 )); then
                 printf '  %b[v/p]%b  Verify DSCP marking for a stream\033[K\n' \
-                    "$DIM" "$NC"                        # line 2: hint
+                    "$DIM" "$NC"
             else
-                printf '\033[K\n'                       # line 2: blank
+                printf '\033[K\n'
             fi
-            printf '\033[K\n'                           # line 3: blank
+            printf '\033[K\n'
             _hint_lines=3
         fi
 
-        # ── Record total lines and re-anchor cursor ───────────────────────────
-        # _last_total is the number of lines printed since the frame anchor
-        # (\033[s). After printing the frame + panels + hint we jump back by
-        # exactly this many lines and re-save the anchor so the next tick
-        # overwrites everything cleanly.
+        # ── Record total lines printed and re-anchor cursor ────────────────
         local dynamic_lines=$(( completed_lines + failed_lines ))
         _last_total=$(( fixed_lines + dynamic_lines + _hint_lines ))
         _PREV_DYNAMIC_LINES=$(( completed_lines + failed_lines ))
 
+        # Update global BEFORE re-saving anchor so _trap_cursor_exit
+        # always has the correct value when a deferred signal fires.
+        _LAST_FRAME_LINE_COUNT=$_last_total
+
         if (( _last_total > 0 )); then
             printf '\033[%dA' "$_last_total"
         fi
-        printf '\033[s'     # re-save anchor at top of rendered frame
+        printf '\033[s'   # re-save anchor at top of rendered frame
 
-        # ── Stream cleanup state machine — Phase B ────────────────────────────
-        # For every stream that Phase A queued (S_CLEANUP_QUEUED == 1),
-        # run _cleanup_stream_procs now. This happens AFTER the render so the
-        # "CLEANING…" tombstone is visible for at least one full tick before
-        # transitioning to CLEANED.
+        # ── Dispatch deferred signal ───────────────────────────────────────
+        # The render is complete, the cursor is anchored, and
+        # _LAST_FRAME_LINE_COUNT is current. Safe to handle the signal now.
+        if [[ -n "$_DEFERRED_SIGNAL" ]]; then
+            local _sig="$_DEFERRED_SIGNAL"
+            _DEFERRED_SIGNAL=""
+            _RENDER_LOCK=0
+            case "$_sig" in
+                INT)
+                    _trap_cursor_exit
+                    tty_echo "${BOLD}${YELLOW}  PRISM [SIGINT]  Ctrl+C — stopping...${NC}"
+                    cleanup "SIGINT (Ctrl+C)"
+                    exit 130
+                    ;;
+                TERM)
+                    _trap_cursor_exit
+                    tty_echo "${BOLD}${YELLOW}  PRISM [SIGTERM] Stopping...${NC}"
+                    cleanup "SIGTERM"
+                    exit 143
+                    ;;
+                QUIT)
+                    _trap_cursor_exit
+                    tty_echo "${BOLD}${YELLOW}  PRISM [SIGQUIT] Ctrl+\\ — stopping...${NC}"
+                    cleanup "SIGQUIT"
+                    exit 131
+                    ;;
+                HUP)
+                    _trap_cursor_exit
+                    tty_echo "${BOLD}${YELLOW}  PRISM [SIGHUP]  Terminal closed — stopping...${NC}"
+                    cleanup "SIGHUP"
+                    exit 129
+                    ;;
+            esac
+        fi
+
+        # ── Phase B: run cleanup for queued streams ────────────────────────
         if [[ "$mode" != "server" ]]; then
             local _si
             for (( _si=0; _si<STREAM_COUNT; _si++ )); do
@@ -11244,72 +11236,40 @@ run_dashboard() {
             done
         fi
 
-        # ── Exit condition (client mode) ──────────────────────────────────────
-        # The dashboard exits when every stream has reached a terminal state.
-        # State exit eligibility:
-        #   CLEANED          → always eligible
-        #   FAILED           → always eligible
-        #   CLEANUP_PENDING  → eligible only when queued=2 (cleanup ran)
-        #   DONE             → force to CLEANED if queued=2 (safety net);
-        #                      re-queue if queued=0; not eligible otherwise
-        #   anything else    → not finished, loop continues
+        # ── Exit condition (client mode) ───────────────────────────────────
         if [[ "$mode" != "server" ]]; then
             local _all_finished=1
             local j
             for (( j=0; j<STREAM_COUNT; j++ )); do
                 local _jst="${S_STATUS_CACHE[$j]:-STARTING}"
                 case "$_jst" in
-                    CLEANED|FAILED)
-                        # Terminal states — no action needed
-                        ;;
+                    CLEANED|FAILED) ;;
                     CLEANUP_PENDING)
-                        # Eligible only if cleanup already ran this tick
-                        if [[ "${S_CLEANUP_QUEUED[$j]:-0}" != "2" ]]; then
+                        [[ "${S_CLEANUP_QUEUED[$j]:-0}" != "2" ]] && \
                             _all_finished=0
-                        fi
                         ;;
                     DONE)
                         if [[ "${S_CLEANUP_QUEUED[$j]:-0}" == "2" ]]; then
-                            # _cleanup_stream_procs ran but CLEANED was not set
-                            # (e.g. early return via the RETURN trap).
-                            # Force CLEANED so the loop can exit.
                             S_STATUS_CACHE[$j]="CLEANED"
                         else
-                            # Cleanup not attempted yet — trigger Phase A as a
-                            # safety net in case it was skipped.
-                            if [[ "${S_CLEANUP_QUEUED[$j]:-0}" == "0" ]]; then
+                            [[ "${S_CLEANUP_QUEUED[$j]:-0}" == "0" ]] && {
                                 S_CLEANUP_QUEUED[$j]="1"
                                 S_STATUS_CACHE[$j]="CLEANUP_PENDING"
-                            fi
+                            }
                             _all_finished=0
                         fi
                         ;;
-                    *)
-                        _all_finished=0
-                        break
-                        ;;
+                    *) _all_finished=0; break ;;
                 esac
             done
-
-            if (( _all_finished == 1 )); then
-                _dashboard_running=0
-            fi
+            (( _all_finished == 1 )) && _dashboard_running=0
         fi
 
-        # ── Non-blocking keyboard poll (~1 s per tick) ────────────────────────
-        # The poll is split into 10 × 0.1 s slices so the dashboard refreshes
-        # approximately once per second while remaining responsive to
-        # keypresses. Each slice checks _dashboard_running and CLEANUP_DONE so
-        # the loop exits immediately on stream completion or signal rather than
-        # waiting out the full second.
+        # ── Non-blocking keyboard poll (~1 s per tick) ────────────────────
         local key_pressed="" key_lower=""
         local tick_slice
         for (( tick_slice=0; tick_slice<10; tick_slice++ )); do
-
-            # Short-circuit: exit poll immediately if loop should stop
-            if (( _dashboard_running == 0 )); then
-                break
-            fi
+            (( _dashboard_running == 0 )) && break
 
             if IFS= read -r -s -n 1 -t 0.1 \
                    key_pressed </dev/tty 2>/dev/null; then
@@ -11320,54 +11280,79 @@ run_dashboard() {
             key_pressed=""
             key_lower=""
 
-            # Check for signal-triggered cleanup between slices
-            if (( CLEANUP_DONE == 1 )); then
-                _dashboard_running=0
+            # Check for deferred signal between slices
+            if [[ -n "$_DEFERRED_SIGNAL" ]]; then
                 break
             fi
+
+            (( CLEANUP_DONE == 1 )) && {
+                _dashboard_running=0
+                break
+            }
         done
 
-        # Exit immediately if a signal handler set CLEANUP_DONE mid-poll
-        if (( CLEANUP_DONE == 1 )); then
-            _dashboard_running=0
-            continue
+        # Dispatch any signal that arrived during the keyboard poll
+        if [[ -n "$_DEFERRED_SIGNAL" ]]; then
+            local _sig="$_DEFERRED_SIGNAL"
+            _DEFERRED_SIGNAL=""
+            _RENDER_LOCK=0
+            case "$_sig" in
+                INT)
+                    _trap_cursor_exit
+                    tty_echo "${BOLD}${YELLOW}  PRISM [SIGINT]  Ctrl+C — stopping...${NC}"
+                    cleanup "SIGINT (Ctrl+C)"
+                    exit 130
+                    ;;
+                TERM)
+                    _trap_cursor_exit
+                    tty_echo "${BOLD}${YELLOW}  PRISM [SIGTERM] Stopping...${NC}"
+                    cleanup "SIGTERM"
+                    exit 143
+                    ;;
+                QUIT)
+                    _trap_cursor_exit
+                    tty_echo "${BOLD}${YELLOW}  PRISM [SIGQUIT] Ctrl+\\ — stopping...${NC}"
+                    cleanup "SIGQUIT"
+                    exit 131
+                    ;;
+                HUP)
+                    _trap_cursor_exit
+                    tty_echo "${BOLD}${YELLOW}  PRISM [SIGHUP]  Terminal closed — stopping...${NC}"
+                    cleanup "SIGHUP"
+                    exit 129
+                    ;;
+            esac
         fi
 
-        # ── DSCP verify keypress handler (client mode, v or p) ────────────────
-        # Temporarily suspend the dashboard, run the interactive DSCP capture
-        # tool, then re-establish the frame anchor so rendering resumes from
-        # the correct position.
+        (( CLEANUP_DONE == 1 )) && { _dashboard_running=0; continue; }
+
+        # ── DSCP verify keypress handler ───────────────────────────────────
         if [[ "$mode" != "server" ]]   && \
            ! _all_streams_loopback     && \
            [[ "$key_lower" == "v" || "$key_lower" == "p" ]]; then
 
-            printf '\033[?25h'                  # show cursor
-            printf '\033[%dB' "$_last_total"    # move below frame
+            printf '\033[?25h'
+            printf '\033[%dB' "$_last_total"
             _dscp_verify_interactive
 
-            # Re-probe all streams after returning from the overlay
             local j
             for (( j=0; j<STREAM_COUNT; j++ )); do
                 probe_client_status "$j"
             done
 
-            # Recalculate pre-reserve size for the re-established anchor.
-            # This accounts for any FQDN target lines that may now be visible.
             local new_pre
             new_pre=$(_count_client_frame_lines_for_state)
             FRAME_LINES=$new_pre
+            _LAST_FRAME_LINE_COUNT=$new_pre
 
             for (( k=0; k<new_pre; k++ )); do printf '\n'; done
             printf '\033[%dA' "$new_pre"
             printf '\033[s'
-            printf '\033[?25l'                  # hide cursor again
-
+            printf '\033[?25l'
             _last_total=$new_pre
         fi
 
-        # ── Packet capture keypress handler (server mode, c) ──────────────────
-        # Same suspend/resume pattern as the DSCP verify handler above, but
-        # calls the server-side capture interactive function instead.
+        # ── Packet capture keypress handler (server mode) ─────────────────
         if [[ "$mode" == "server" ]] && [[ "$key_lower" == "c" ]]; then
 
             printf '\033[?25h'
@@ -11377,40 +11362,34 @@ run_dashboard() {
             local new_pre
             new_pre=$(_count_server_frame_lines)
             FRAME_LINES=$new_pre
+            _LAST_FRAME_LINE_COUNT=$new_pre
 
             for (( k=0; k<new_pre; k++ )); do printf '\n'; done
             printf '\033[%dA' "$new_pre"
             printf '\033[s'
             printf '\033[?25l'
-
             _last_total=$new_pre
         fi
 
     done
-    # ── End of render loop ────────────────────────────────────────────────
+    # =========================================================================
+    # End of render loop
+    # =========================================================================
 
-    # ── Restore terminal state ────────────────────────────────────────────
-    # Always restore cursor visibility, regardless of how the loop ended.
+    # ── Restore terminal state ─────────────────────────────────────────────
     printf '\033[?25h'
 
-    # ── Move cursor below the entire rendered output ──────────────────────
-    # Restore to the frame anchor, advance downward by _last_total lines,
-    # then erase to end of screen.
-    #
-    # This must happen even when the loop was interrupted by a signal trap
-    # (CLEANUP_DONE=1) so that subsequent cleanup output starts on a clean
-    # line rather than overwriting the dashboard borders.
-    #
-    # Guard: if _last_total is 0 (e.g. the loop never completed one full
-    # render) fall back to emitting two blank lines.
+    # ── Move cursor cleanly below the rendered output ──────────────────────
+    # Restore to the saved anchor then advance past the full frame.
+    # \033[J erases any ghost lines left by a previously taller frame.
     if (( _last_total > 0 )); then
-        printf '\033[u\033[%dB' "$_last_total"
+        printf '\033[u\033[%dB\033[J' "$_last_total"
     else
-        printf '\033[u'
+        printf '\033[u\033[J'
     fi
-    printf '\033[J\n'
+    printf '\n'
 
-    # ── Flush buffered stream cleanup event log ───────────────────────────
+    # ── Flush buffered stream cleanup event log ────────────────────────────
     local _log_file="/tmp/iperf3_streams_events.log"
     if [[ -f "$_log_file" ]]; then
         printf '\n'
