@@ -9,9 +9,7 @@
 
 ---
 
-## Table of Contents
-- [PRISM — Performance Real-time iPerf3 Stream Manager](#prism--performance-real-time-iperf3-stream-manager)
-  - [Table of Contents](#table-of-contents)
+# Table of Contents
   - [Introduction](#introduction)
     - [What makes PRISM different](#what-makes-prism-different)
   - [How It Works](#how-it-works)
