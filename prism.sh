@@ -2,7 +2,7 @@
 # =============================================================================
 # PRISM — Performance Real-time iPerf3 Stream Manager
 # Enterprise-grade multi-stream traffic orchestration with live QoS dashboard
-# Version: 8.3.5
+# Version: 8.3.6
 # Author : Waqas Daar (waqasdaar@gmail.com)
 # =============================================================================
 
@@ -579,9 +579,6 @@ _theme_apply() {
     THEME_CURRENT="$theme"
 
     case "$theme" in
-
-        # ── Dark terminal theme ───────────────────────────────────────────
-        # Standard ANSI colours — bright on dark backgrounds.
         dark)
             RED=$'\033[0;31m'
             GREEN=$'\033[0;32m'
@@ -592,20 +589,6 @@ _theme_apply() {
             DIM=$'\033[2m'
             NC=$'\033[0m'
             ;;
-
-        # ── Light terminal theme ──────────────────────────────────────────
-        # Darker, more saturated variants that remain readable on white or
-        # light-grey terminal backgrounds where the standard colours wash out.
-        #
-        # Colour mapping:
-        #   RED    → bold dark red     (1;31)  — standard red too light
-        #   GREEN  → bold dark green   (0;32)  — same, readable on white
-        #   YELLOW → bold dark yellow  (0;33)  — avoid 1;33 which is near-white
-        #   BLUE   → bold blue         (1;34)  — standard blue readable
-        #   CYAN   → bold dark cyan    (0;36)  — teal, readable on white
-        #   BOLD   → bold              (1)
-        #   DIM    → dark grey         (0;90)  — 2m (dim) invisible on light bg
-        #   NC     → reset
         light)
             RED=$'\033[1;31m'
             GREEN=$'\033[0;32m'
@@ -616,11 +599,6 @@ _theme_apply() {
             DIM=$'\033[0;90m'
             NC=$'\033[0m'
             ;;
-
-        # ── Monochrome / accessibility theme ─────────────────────────────
-        # All colour escape sequences are cleared. Output uses only bold
-        # and dim for structural emphasis. Compatible with screen readers,
-        # high-contrast terminals, and colour-blind users.
         mono)
             RED=''
             GREEN=''
@@ -631,16 +609,128 @@ _theme_apply() {
             DIM=$'\033[2m'
             NC=$'\033[0m'
             ;;
-
         *)
-            # Unknown theme — silently fall back to dark
             _theme_apply "dark"
             return
             ;;
     esac
 
-    # Reinitialise ANSI byte-length counters so vlen() stays accurate
-    _init_ansi_lengths
+    # ----------------------------------------------------------------
+    # Sync both color variable sets and recompute all _LEN_* constants.
+    # This replaces the previous _init_ansi_lengths call which only
+    # updated Set B lengths and left Set A (R G Y B C etc.) stale.
+    # ----------------------------------------------------------------
+    _theme_sync
+}
+
+# ==============================================================================
+# _theme_sync
+#
+# Synchronises BOTH color variable sets after a theme change so every
+# part of the TUI uses the same colors.
+#
+# PRISM uses two parallel naming conventions inherited from different
+# development phases:
+#
+#   Set A (short names):  R G Y B M C W  BOLD DIM UL NC
+#                         BR BG BY BB BM BC BW
+#                         BOLD_R BOLD_G BOLD_Y BOLD_C BOLD_W
+#   Set B (long names):   RED GREEN YELLOW BLUE CYAN  BOLD DIM NC
+#
+# _theme_apply updates Set B only. This function copies Set B into Set A
+# so both sets always hold the same values after any theme change.
+#
+# Called by: _theme_apply (at the end), and main() after _theme_load.
+# ==============================================================================
+_theme_sync() {
+
+    # ------------------------------------------------------------------
+    # Copy Set B → Set A
+    # BOLD, DIM, NC are shared names so no copy needed for those.
+    # ------------------------------------------------------------------
+    R="$RED"
+    G="$GREEN"
+    Y="$YELLOW"
+    B="$BLUE"
+    C="$CYAN"
+    W="${W:-$'\033[37m'}"    # white — not in Set B, keep existing
+
+    # Bright variants — derive from Set B values where possible
+    # For dark theme: use bright ANSI variants
+    # For light/mono: keep same as standard (brightness handled by base color)
+    case "${THEME_CURRENT:-dark}" in
+        dark)
+            BR=$'\033[91m'   # Bright Red
+            BG=$'\033[92m'   # Bright Green
+            BY=$'\033[93m'   # Bright Yellow
+            BB=$'\033[94m'   # Bright Blue
+            BM=$'\033[95m'   # Bright Magenta
+            BC=$'\033[96m'   # Bright Cyan
+            BW=$'\033[97m'   # Bright White
+            BOLD_R=$'\033[1;31m'
+            BOLD_G=$'\033[1;32m'
+            BOLD_Y=$'\033[1;33m'
+            BOLD_C=$'\033[1;36m'
+            BOLD_W=$'\033[1;37m'
+            M=$'\033[35m'
+            UL=$'\033[4m'
+            ;;
+        light)
+            BR="$RED"        # Already bold/dark from _theme_apply
+            BG="$GREEN"
+            BY="$YELLOW"
+            BB="$BLUE"
+            BM=$'\033[0;35m'
+            BC="$CYAN"
+            BW=$'\033[0;37m'
+            BOLD_R=$'\033[1;31m'
+            BOLD_G=$'\033[0;32m'
+            BOLD_Y=$'\033[0;33m'
+            BOLD_C=$'\033[0;36m'
+            BOLD_W=$'\033[1;37m'
+            M=$'\033[0;35m'
+            UL=$'\033[4m'
+            ;;
+        mono)
+            BR="" BG="" BY="" BB="" BM="" BC="" BW=""
+            BOLD_R="" BOLD_G="" BOLD_Y="" BOLD_C="" BOLD_W=""
+            M="" UL=""
+            R="" G="" Y="" B="" C="" W=""
+            ;;
+    esac
+
+    # ------------------------------------------------------------------
+    # Recompute ALL _LEN_* byte-length constants for the new values.
+    # This keeps vlen() and _visible_len() accurate after a theme switch.
+    # ------------------------------------------------------------------
+    _LEN_R=${#R};       _LEN_G=${#G};       _LEN_Y=${#Y}
+    _LEN_B=${#B};       _LEN_M=${#M};       _LEN_C=${#C}
+    _LEN_W=${#W};       _LEN_BOLD=${#BOLD}; _LEN_DIM=${#DIM}
+    _LEN_UL=${#UL};     _LEN_NC=${#NC}
+    _LEN_BR=${#BR};     _LEN_BG=${#BG};     _LEN_BY=${#BY}
+    _LEN_BB=${#BB};     _LEN_BM=${#BM};     _LEN_BC=${#BC}
+    _LEN_BW=${#BW}
+    _LEN_BOLD_R=${#BOLD_R}; _LEN_BOLD_G=${#BOLD_G}; _LEN_BOLD_Y=${#BOLD_Y}
+    _LEN_BOLD_C=${#BOLD_C}; _LEN_BOLD_W=${#BOLD_W}
+    _LEN_RED=$_LEN_R
+    _LEN_GREEN=$_LEN_G; _LEN_YELLOW=$_LEN_Y
+    _LEN_BLUE=$_LEN_B;  _LEN_CYAN=$_LEN_C
+
+    # Safety guards — ensure no _LEN_* is zero in color mode
+    if [[ "${_COLORS_ENABLED:-1}" -eq 1 && \
+          "${THEME_CURRENT:-dark}" != "mono" ]]; then
+        [[ $_LEN_NC   -eq 0 ]] && _LEN_NC=4
+        [[ $_LEN_BOLD -eq 0 ]] && _LEN_BOLD=4
+        [[ $_LEN_DIM  -eq 0 ]] && _LEN_DIM=4
+        [[ $_LEN_UL   -eq 0 ]] && _LEN_UL=4
+        [[ $_LEN_R    -eq 0 ]] && _LEN_R=5
+        [[ $_LEN_G    -eq 0 ]] && _LEN_G=5
+        [[ $_LEN_Y    -eq 0 ]] && _LEN_Y=5
+        [[ $_LEN_B    -eq 0 ]] && _LEN_B=5
+        [[ $_LEN_C    -eq 0 ]] && _LEN_C=5
+        [[ $_LEN_RED  -eq 0 ]] && _LEN_RED=5
+        _LEN_RED=$_LEN_R
+    fi
 }
 
 # ---------------------------------------------------------------------------
@@ -656,6 +746,71 @@ _theme_name_display() {
         mono)  printf '%b' "${BOLD}Mono${NC}  ${DIM}(no colour, accessibility mode)${NC}" ;;
         *)     printf '%s' "$1" ;;
     esac
+}
+
+# ==============================================================================
+# _show_theme_swatch
+#
+# Prints a color swatch line using the currently active color variables.
+# Called immediately after a theme is applied so the user can visually
+# confirm the change took effect in their terminal.
+#
+# The swatch shows every color token using the ACTUAL escape codes that
+# are now stored in R/G/Y/B/C/BOLD/DIM/NC after _theme_sync ran.
+# If the theme applied correctly the user will see distinct colors.
+# If all tokens look the same the terminal does not support that theme.
+# ==============================================================================
+_show_theme_swatch() {
+    local theme="${1:-$THEME_CURRENT}"
+    local inner=$(( COLS - 2 ))
+
+    printf '+%s+\n' "$(rpt '-' $inner)"
+
+    local label="  Active theme: ${BOLD}${theme}${NC}  |  Color swatch:  "
+    local label_vlen
+    label_vlen=$(_visible_len "$label")
+
+    # Build the swatch tokens — each is 3 visible chars + 2 spaces
+    local swatch=""
+    case "$theme" in
+        dark|light)
+            swatch+="${R}${BOLD}RED${NC}  "
+            swatch+="${G}${BOLD}GRN${NC}  "
+            swatch+="${Y}${BOLD}YLW${NC}  "
+            swatch+="${B}${BOLD}BLU${NC}  "
+            swatch+="${C}${BOLD}CYN${NC}  "
+            swatch+="${BOLD}BLD${NC}  "
+            swatch+="${DIM}DIM${NC}"
+            ;;
+        mono)
+            swatch+="${BOLD}BOLD${NC}  "
+            swatch+="${DIM}DIM${NC}  "
+            swatch+="plain"
+            ;;
+    esac
+
+    local swatch_vlen
+    swatch_vlen=$(_visible_len "$swatch")
+
+    local total_vlen=$(( label_vlen + swatch_vlen ))
+    local rpad=$(( inner - total_vlen ))
+    [[ $rpad -lt 0 ]] && rpad=0
+
+    printf "|%b%s%b%b%s%b%s|\n"    \
+        ""     "$label"   ""        \
+        ""     "$swatch"  ""        \
+        "$(rpt ' ' $rpad)"
+
+    printf '+%s+\n' "$(rpt '-' $inner)"
+    echo ""
+
+    # Confirmation message
+    printf "  %b✓ Theme \"%s\" is now active.%b\n" \
+        "$G" "$theme" "$NC"
+    printf "  %bIf the swatch above shows no color change, your terminal\n" \
+        "$DIM"
+    printf "  may not support the requested color scheme.%b\n\n" \
+        "$NC"
 }
 
 # ---------------------------------------------------------------------------
@@ -820,19 +975,19 @@ show_theme_menu() {
     while true; do
         read -r -p "  Select [1-5]: " sel </dev/tty
         case "$sel" in
-            1) _theme_apply "dark";  _theme_save "dark"
-               printf '\n  Dark theme applied and saved.\n\n'
-               sleep 0.5; return 0 ;;
-            2) _theme_apply "light"; _theme_save "light"
-               printf '\n  Light theme applied and saved.\n\n'
-               sleep 0.5; return 0 ;;
-            3) _theme_apply "mono";  _theme_save "mono"
-               printf '\n  Monochrome theme applied and saved.\n\n'
-               sleep 0.5; return 0 ;;
+            1) _theme_apply "dark";  _theme_sync; _theme_save "dark"
+                _show_theme_swatch "dark"
+                sleep 1; return 0 ;;
+            2) _theme_apply "light"; _theme_sync; _theme_save "light"
+                _show_theme_swatch "light"
+                sleep 1; return 0 ;;
+            3) _theme_apply "mono";  _theme_sync; _theme_save "mono"
+                _show_theme_swatch "mono"
+                sleep 1; return 0 ;;
             4) local auto; auto=$(_theme_detect_default)
-               _theme_apply "$auto"; _theme_save "$auto"
-               printf '\n  Auto-detected: %s. Applied and saved.\n\n' "$auto"
-               sleep 0.5; return 0 ;;
+                _theme_apply "$auto"; _theme_sync; _theme_save "$auto"
+                _show_theme_swatch "$auto"
+                sleep 1; return 0 ;;
             5|""|q|Q) return 0 ;;
             *) printf '  Enter 1-5.\n' ;;
         esac
@@ -12143,7 +12298,7 @@ show_main_menu() {
     # Title — uses _mh_center with _visible_len so BOLD/NC bytes are
     # excluded from the centering calculation.
     local _title
-    _title="${BOLD}PRISM${NC}  ${DIM}Performance Real-time iPerf3 Stream Manager${NC}  ${BOLD}v8.3.5${NC}"
+    _title="${BOLD}PRISM${NC}  ${DIM}Performance Real-time iPerf3 Stream Manager${NC}  ${BOLD}v8.3.6${NC}"
     _mh_center "$_title"
 
     _mh_rule "+" "=" "+"
@@ -12159,13 +12314,11 @@ show_main_menu() {
     (( IS_ROOT )) && _root_text="${GREEN}root${NC}" || _root_text="${YELLOW}non-root${NC}"
 
     local _status_line
-    _status_line="| ${DIM}User${NC}  ${_root_text}"
+    _status_line=" ${DIM}User${NC}  ${_root_text}"
     _status_line+="  ${DIM}·${NC}  Theme  ${DIM}${THEME_CURRENT:-dark}${NC}"
     _status_line+="  ${DIM}·${NC}  OS  ${DIM}${OS_TYPE}${NC}"
 
-    _mh_left " ${_iperf_line}"
     _mh_left "${_status_line}"
-
     _mh_rule "+" "=" "+"
 
     # ------------------------------------------------------------------
@@ -12338,6 +12491,7 @@ main() {
     _init_ansi_lengths
     _build_session_header
     _theme_load
+    _theme_sync
     register_traps
     init_tmpdir
     find_iperf3
