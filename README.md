@@ -329,3 +329,30 @@ Menu options explained
 | 6 — DSCP Reference  | Displays the complete DSCP / TOS mapping table with PHB classes and use cases, without running a test.                                                                                                                                                |
 | 7 — Colour Theme    | Switches between Dark, Light, and Mono terminal themes. The selection is persisted to ~/.config/prism/theme and reloaded on next launch. A live colour swatch confirms the change.                                                                    |
 | 8 — Exit            | Terminates all active iperf3 and ping processes, removes tc qdiscs,  deletes temporary files, and prompts about JSON export file retention  before exiting.                                                                                           |
+
+## Implemented Use Cases
+
+### Use Case 1 — Basic TCP Throughput Benchmark
+
+**Scenario:** Measure maximum TCP throughput between two hosts on a LAN or WAN link.
+
+```
+Menu:       3 — Client Mode
+Streams:    1
+Protocol:   TCP
+Target:     192.168.1.100
+Port:       5201
+Bandwidth:  (unlimited — press Enter)
+Duration:   30
+DSCP:       (none — press Enter)
+Parallel:   1
+Bidir:      No
+```
+
+**What you get:**
+
+* Live per-second bandwidth with 10-second sparkline
+* RTT (min / avg / max / jitter / loss) from a parallel ping process
+* TCP CWND curve showing congestion window growth over time
+* Final sender and receiver bandwidth summary
+* JSON export file with per-second bandwidth samples
