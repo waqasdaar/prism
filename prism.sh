@@ -1087,6 +1087,600 @@ _LAST_FRAME_LINE_COUNT=0   # set by run_dashboard after each render
 SESSION_HEADER=""
 
 # ==============================================================================
+# TEST SESSION NAMING
+# Populated interactively before each test run via _prompt_session_name().
+# All fields are plain ASCII — no ANSI codes — safe for log files and JSON.
+#
+# SESSION_NAME     : free-text label e.g. "baseline-Q1" or "post-change"
+# SESSION_TAGS     : space-separated tags e.g. "pre-change production wan"
+# SESSION_ID       : auto-generated unique ID: YYYYMMDD-HHMMSS-<4hex>
+# SESSION_NOTE     : optional single-line operator note
+# SESSION_RUN_TS   : epoch timestamp when the session was launched
+# SESSION_HISTORY_FILE : path to the per-host JSON history file
+# ==============================================================================
+SESSION_NAME=""
+SESSION_TAGS=""
+SESSION_ID=""
+SESSION_NOTE=""
+SESSION_RUN_TS=""
+SESSION_HISTORY_FILE="${HOME}/.config/prism/session_history.json"
+
+# ==============================================================================
+# _generate_session_id
+#
+# Generates a unique session identifier in the format:
+#   YYYYMMDD-HHMMSS-XXXX
+#   where XXXX is a 4-character hex suffix derived from $RANDOM.
+#
+# The ID is deterministic-friendly (datestamp prefix) and collision-resistant
+# (hex suffix) without requiring uuidgen or external tools.
+#
+# Examples:
+#   20260425-143022-a3f1
+#   20260425-143022-8c2d
+# ==============================================================================
+_generate_session_id() {
+    local datestamp
+    datestamp=$(date +'%Y%m%d-%H%M%S')
+    local hex_suffix
+    hex_suffix=$(printf '%04x' $(( RANDOM * RANDOM % 65536 )))
+    printf '%s-%s' "$datestamp" "$hex_suffix"
+}
+
+# ==============================================================================
+# _prompt_session_name
+#
+# Displays an interactive session naming panel before a test run.
+# The operator can:
+#   - Enter a free-text session name (or press Enter to use the auto-generated
+#     ID as the name)
+#   - Enter comma or space-separated tags (e.g. pre-change, production, wan)
+#   - Enter an optional one-line note
+#   - Skip all fields with Enter for a fully unnamed session
+#
+# All inputs are sanitized:
+#   - Name: alphanumeric, hyphens, underscores, dots, spaces (max 64 chars)
+#   - Tags: each tag alphanumeric + hyphens + underscores (max 8 tags)
+#   - Note: printable ASCII only (max 120 chars)
+#
+# Populates globals:
+#   SESSION_NAME     SESSION_TAGS     SESSION_ID
+#   SESSION_NOTE     SESSION_RUN_TS
+#
+# Called by: run_client_mode, run_server_mode, run_loopback_mode,
+#            run_mixed_traffic_mode — immediately before launch.
+# ==============================================================================
+_prompt_session_name() {
+    local inner=$(( COLS - 2 ))
+    SESSION_ID=$(_generate_session_id)
+    SESSION_RUN_TS=$(date +%s)
+
+    # ------------------------------------------------------------------
+    # Header
+    # ------------------------------------------------------------------
+    printf '\n'
+    printf '+%s+\n' "$(rpt '=' $inner)"
+
+    # Centered title using _visible_len for ANSI-safe centering
+    local _title="${BOLD}Test Session Naming${NC}  ${DIM}(optional — press Enter to skip each field)${NC}"
+    local _title_vlen
+    _title_vlen=$(_visible_len "$_title")
+    local _tlpad=$(( (inner - _title_vlen) / 2 ))
+    local _trpad=$(( inner - _title_vlen - _tlpad ))
+    [[ $_tlpad -lt 0 ]] && _tlpad=0
+    [[ $_trpad -lt 0 ]] && _trpad=0
+    printf "|%s%b%s|\n" "$(rpt ' ' $_tlpad)" "$_title" "$(rpt ' ' $_trpad)"
+
+    printf '+%s+\n' "$(rpt '=' $inner)"
+
+    # ------------------------------------------------------------------
+    # Auto-generated ID display
+    # ------------------------------------------------------------------
+    local id_line="  ${DIM}Session ID:${NC}  ${CYAN}${BOLD}${SESSION_ID}${NC}"
+    local id_vlen
+    id_vlen=$(_visible_len "$id_line")
+    local id_rpad=$(( inner - id_vlen ))
+    [[ $id_rpad -lt 0 ]] && id_rpad=0
+    printf "|%b%s|\n" "$id_line" "$(rpt ' ' $id_rpad)"
+
+    printf '+%s+\n' "$(rpt '-' $inner)"
+
+    # ------------------------------------------------------------------
+    # Tag suggestion helper
+    # ------------------------------------------------------------------
+    local tag_examples="  ${DIM}Suggested tags:  pre-change  post-change  baseline  regression"
+    local tag_examples2="${NC}${DIM}                  production  staging  wan  datacenter  loopback${NC}"
+    local te1_vlen
+    te1_vlen=$(_visible_len "$tag_examples")
+    local te2_vlen
+    te2_vlen=$(_visible_len "$tag_examples2")
+    local te1_rpad=$(( inner - te1_vlen ))
+    local te2_rpad=$(( inner - te2_vlen ))
+    [[ $te1_rpad -lt 0 ]] && te1_rpad=0
+    [[ $te2_rpad -lt 0 ]] && te2_rpad=0
+    printf "|%b%s|\n" "$tag_examples"  "$(rpt ' ' $te1_rpad)"
+    printf "|%b%s|\n" "$tag_examples2" "$(rpt ' ' $te2_rpad)"
+
+    printf '+%s+\n' "$(rpt '-' $inner)"
+    printf '\n'
+
+    # ------------------------------------------------------------------
+    # Field 1: Session Name
+    # ------------------------------------------------------------------
+    local raw_name=""
+    printf "  %b%s%b\n" "${BOLD}" "Session Name" "${NC}"
+    printf "  %b%s%b\n" "${DIM}" \
+        "Free-text label for this test run. Used in reports and history." "${NC}"
+    printf "  %b%s%b\n" "${DIM}" \
+        "Examples: baseline-Q1  post-firewall-change  WAN-link-test-2026" "${NC}"
+    printf '\n'
+
+    while true; do
+        read -r -p "  Name [${SESSION_ID}]: " raw_name </dev/tty
+        raw_name="${raw_name:-}"
+
+        # Empty → use auto-generated ID as name
+        if [[ -z "$raw_name" ]]; then
+            SESSION_NAME="$SESSION_ID"
+            printf "  %b→ Using auto-generated ID as session name.%b\n" \
+                "$DIM" "$NC"
+            break
+        fi
+
+        # Sanitize: allow alphanumeric, hyphen, underscore, dot, space
+        local sanitized
+        sanitized=$(printf '%s' "$raw_name" \
+            | sed 's/[^a-zA-Z0-9._/ -]//g' \
+            | sed 's/^[[:space:]]*//' \
+            | sed 's/[[:space:]]*$//')
+
+        # Enforce max length of 64 chars
+        if (( ${#sanitized} > 64 )); then
+            sanitized="${sanitized:0:64}"
+            printf "  %bName truncated to 64 characters.%b\n" "$YELLOW" "$NC"
+        fi
+
+        if [[ -z "$sanitized" ]]; then
+            printf "  %bName contains no valid characters. Using auto-generated ID.%b\n" \
+                "$YELLOW" "$NC"
+            SESSION_NAME="$SESSION_ID"
+            break
+        fi
+
+        SESSION_NAME="$sanitized"
+        printf "  %b✓ Name set to: %b%s%b\n" "$GREEN" "$BOLD" "$SESSION_NAME" "$NC"
+        break
+    done
+
+    printf '\n'
+
+    # ------------------------------------------------------------------
+    # Field 2: Tags
+    # ------------------------------------------------------------------
+    local raw_tags=""
+    printf "  %b%s%b\n" "${BOLD}" "Tags" "${NC}"
+    printf "  %b%s%b\n" "${DIM}" \
+        "Space or comma-separated keywords. Max 8 tags, each max 32 chars." "${NC}"
+    printf '\n'
+
+    read -r -p "  Tags [none]: " raw_tags </dev/tty
+    raw_tags="${raw_tags:-}"
+
+    SESSION_TAGS=""
+    if [[ -n "$raw_tags" ]]; then
+        # Normalize: replace commas with spaces, collapse whitespace
+        local normalized_tags
+        normalized_tags=$(printf '%s' "$raw_tags" \
+            | tr ',' ' ' \
+            | tr -s ' ')
+
+        local -a tag_array=()
+        local tag
+        # Read each whitespace-separated word as a tag
+        local IFS_SAVE="$IFS"
+        IFS=' '
+        read -ra tag_array <<< "$normalized_tags"
+        IFS="$IFS_SAVE"
+
+        local valid_tags=()
+        local skipped=0
+        for tag in "${tag_array[@]}"; do
+            # Sanitize tag: alphanumeric, hyphens, underscores only
+            local clean_tag
+            clean_tag=$(printf '%s' "$tag" \
+                | sed 's/[^a-zA-Z0-9_-]//g')
+            [[ -z "$clean_tag" ]] && continue
+
+            # Enforce max tag length
+            if (( ${#clean_tag} > 32 )); then
+                clean_tag="${clean_tag:0:32}"
+            fi
+
+            # Enforce max 8 tags
+            if (( ${#valid_tags[@]} >= 8 )); then
+                (( skipped++ ))
+                continue
+            fi
+
+            valid_tags+=("$clean_tag")
+        done
+
+        if (( ${#valid_tags[@]} > 0 )); then
+            SESSION_TAGS="${valid_tags[*]}"
+            printf "  %b✓ Tags set: %b" "$GREEN" "$BOLD"
+            local t
+            for t in "${valid_tags[@]}"; do
+                printf "[%s] " "$t"
+            done
+            printf "%b\n" "$NC"
+            if (( skipped > 0 )); then
+                printf "  %b%d tag(s) skipped (limit 8).%b\n" \
+                    "$YELLOW" "$skipped" "$NC"
+            fi
+        else
+            printf "  %bNo valid tags extracted.%b\n" "$DIM" "$NC"
+        fi
+    else
+        printf "  %b→ No tags set.%b\n" "$DIM" "$NC"
+    fi
+
+    printf '\n'
+
+    # ------------------------------------------------------------------
+    # Field 3: Note
+    # ------------------------------------------------------------------
+    local raw_note=""
+    printf "  %b%s%b\n" "${BOLD}" "Note" "${NC}"
+    printf "  %b%s%b\n" "${DIM}" \
+        "Optional one-line operator note. Max 120 printable characters." "${NC}"
+    printf '\n'
+
+    read -r -p "  Note [none]: " raw_note </dev/tty
+    raw_note="${raw_note:-}"
+
+    SESSION_NOTE=""
+    if [[ -n "$raw_note" ]]; then
+        # Strip non-printable characters
+        local clean_note
+        clean_note=$(printf '%s' "$raw_note" \
+            | tr -cd '[:print:]' \
+            | sed 's/^[[:space:]]*//' \
+            | sed 's/[[:space:]]*$//')
+
+        if (( ${#clean_note} > 120 )); then
+            clean_note="${clean_note:0:120}"
+            printf "  %bNote truncated to 120 characters.%b\n" "$YELLOW" "$NC"
+        fi
+
+        if [[ -n "$clean_note" ]]; then
+            SESSION_NOTE="$clean_note"
+            printf "  %b✓ Note set.%b\n" "$GREEN" "$NC"
+        else
+            printf "  %bNote contains no printable characters. Skipped.%b\n" \
+                "$DIM" "$NC"
+        fi
+    else
+        printf "  %b→ No note set.%b\n" "$DIM" "$NC"
+    fi
+
+    printf '\n'
+
+    # ------------------------------------------------------------------
+    # Summary confirmation box
+    # ------------------------------------------------------------------
+    printf '+%s+\n' "$(rpt '=' $inner)"
+
+    local sum_title="${BOLD}Session Summary${NC}"
+    local sum_vlen
+    sum_vlen=$(_visible_len "$sum_title")
+    local sum_lpad=$(( (inner - sum_vlen) / 2 ))
+    local sum_rpad=$(( inner - sum_vlen - sum_lpad ))
+    [[ $sum_lpad -lt 0 ]] && sum_lpad=0
+    [[ $sum_rpad -lt 0 ]] && sum_rpad=0
+    printf "|%s%b%s|\n" "$(rpt ' ' $sum_lpad)" "$sum_title" "$(rpt ' ' $sum_rpad)"
+
+    printf '+%s+\n' "$(rpt '-' $inner)"
+
+    # Helper: print a summary field row
+    # Layout: "|  LABEL_COL  VALUE ... |"
+    local _FL=12   # fixed label column width
+    _sum_row() {
+        local lbl="$1"
+        local val="$2"
+        local val_color="${3:-$NC}"
+        local row_plain
+        row_plain=$(printf '  %-*s  %s' "$_FL" "$lbl" "$val")
+        local row_vlen=${#row_plain}
+        local row_rpad=$(( inner - row_vlen - 1 ))
+        [[ $row_rpad -lt 0 ]] && row_rpad=0
+        printf "|  %-*s  %b%s%b%s|\n" \
+            "$_FL" "$lbl" \
+            "$val_color" "$val" "$NC" \
+            "$(rpt ' ' $row_rpad)"
+    }
+
+    _sum_row "ID"      "$SESSION_ID"    "$CYAN"
+    _sum_row "Name"    "$SESSION_NAME"  "$BOLD"
+    _sum_row "Tags"    "${SESSION_TAGS:-none}"  "$YELLOW"
+    _sum_row "Note"    "${SESSION_NOTE:-none}"  "$DIM"
+    _sum_row "Started" "$(date +'%Y-%m-%d %H:%M:%S')"  "$DIM"
+
+    printf '+%s+\n' "$(rpt '=' $inner)"
+    printf '\n'
+}
+
+# ==============================================================================
+# _session_append_history
+#
+# Appends a completed test session record to the per-host JSON history file.
+#
+# Called by: run_client_mode, run_loopback_mode, run_mixed_traffic_mode
+#            immediately AFTER display_results_table() so final BW values
+#            are available.
+#
+# JSON record format (one object per line for easy grep/jq processing):
+# {
+#   "id":        "20260425-143022-a3f1",
+#   "name":      "baseline-Q1",
+#   "tags":      ["pre-change", "wan"],
+#   "note":      "Before firewall policy update",
+#   "started":   1745000000,
+#   "finished":  1745000120,
+#   "host":      "emea-edge-madrid",
+#   "user":      "root",
+#   "os":        "Linux 5.15.0-101-generic",
+#   "iperf3":    "3.16.0",
+#   "mode":      "client",
+#   "streams":   2,
+#   "results": [
+#     {
+#       "stream": 1,
+#       "proto":  "TCP",
+#       "target": "10.0.0.1",
+#       "port":   5201,
+#       "dscp":   "EF",
+#       "sender_bw":   "940.12 Mbps",
+#       "receiver_bw": "938.50 Mbps",
+#       "rtt_avg_ms":  "1.234",
+#       "loss_pct":    "0%",
+#       "status":      "DONE"
+#     }
+#   ]
+# }
+#
+# The file is a JSON Lines file (one complete JSON object per line).
+# This format is directly consumable by jq, Python json.loads(), and
+# any log aggregation tool without requiring a JSON array wrapper.
+#
+# Parameters:
+#   $1  mode   — "client" | "server" | "loopback" | "mtp"
+# ==============================================================================
+_session_append_history() {
+    local mode="${1:-client}"
+
+    # Skip if no session was named (SESSION_ID is empty)
+    [[ -z "$SESSION_ID" ]] && return 0
+
+    local finished_ts
+    finished_ts=$(date +%s)
+
+    local iperf3_ver="${IPERF3_MAJOR}.${IPERF3_MINOR}.${IPERF3_PATCH}"
+    local host_name
+    host_name=$(hostname 2>/dev/null || printf 'unknown')
+    local os_info
+    os_info=$(uname -sr 2>/dev/null || printf 'unknown')
+
+    # ------------------------------------------------------------------
+    # Build tags JSON array
+    # ------------------------------------------------------------------
+    local tags_json="[]"
+    if [[ -n "$SESSION_TAGS" ]]; then
+        local -a tag_arr=()
+        local t
+        local IFS_SAVE="$IFS"
+        IFS=' '
+        read -ra tag_arr <<< "$SESSION_TAGS"
+        IFS="$IFS_SAVE"
+        if (( ${#tag_arr[@]} > 0 )); then
+            tags_json="["
+            for t in "${tag_arr[@]}"; do
+                # Escape any double-quotes in tag (defensive)
+                local safe_t="${t//\"/\\\"}"
+                tags_json+="\"${safe_t}\","
+            done
+            # Remove trailing comma and close array
+            tags_json="${tags_json%,}]"
+        fi
+    fi
+
+    # ------------------------------------------------------------------
+    # Escape a string for JSON embedding
+    # Handles: backslash, double-quote, newline, tab
+    # ------------------------------------------------------------------
+    _json_str() {
+        local s="$1"
+        # Escape backslash first, then double-quote, then control chars
+        s="${s//\\/\\\\}"
+        s="${s//\"/\\\"}"
+        s="${s//$'\n'/\\n}"
+        s="${s//$'\t'/\\t}"
+        printf '%s' "$s"
+    }
+
+    local safe_name;  safe_name=$(_json_str "${SESSION_NAME:-}")
+    local safe_note;  safe_note=$(_json_str "${SESSION_NOTE:-}")
+    local safe_host;  safe_host=$(_json_str "$host_name")
+    local safe_os;    safe_os=$(_json_str "$os_info")
+    local safe_bin;   safe_bin=$(_json_str "${IPERF3_BIN:-}")
+
+    # ------------------------------------------------------------------
+    # Build results array
+    # ------------------------------------------------------------------
+    local results_json="["
+    local i
+    local first_result=1
+
+    for (( i=0; i<STREAM_COUNT; i++ )); do
+        local sn=$(( i + 1 ))
+        local r_proto="${S_PROTO[$i]:-TCP}"
+        local r_target="${S_TARGET[$i]:-}"
+        local r_port="${S_PORT[$i]:-0}"
+        local r_dscp="${S_DSCP_NAME[$i]:-}"
+        local r_sbw="${RESULT_SENDER_BW[$i]:-N/A}"
+        local r_rbw="${RESULT_RECEIVER_BW[$i]:-N/A}"
+        local r_status="${S_STATUS_CACHE[$i]:-UNKNOWN}"
+        local r_rtt_avg="${S_RTT_AVG[$i]:-}"
+        local r_loss="${S_RTT_LOSS[$i]:-}"
+
+        # Fallback RTT and loss from results arrays
+        [[ -z "$r_rtt_avg" || "$r_rtt_avg" == "---" ]] && r_rtt_avg="N/A"
+        [[ -z "$r_loss"    || "$r_loss"    == "---" ]] && r_loss="N/A"
+
+        # Map post-cleanup states to their human-readable equivalents
+        case "$r_status" in
+            CLEANED|CLEANUP_PENDING) r_status="DONE" ;;
+        esac
+
+        local safe_tgt;  safe_tgt=$(_json_str "$r_target")
+        local safe_dscp; safe_dscp=$(_json_str "$r_dscp")
+        local safe_sbw;  safe_sbw=$(_json_str "$r_sbw")
+        local safe_rbw;  safe_rbw=$(_json_str "$r_rbw")
+
+        [[ $first_result -eq 0 ]] && results_json+=","
+        first_result=0
+
+        results_json+=$(printf \
+            '{"stream":%d,"proto":"%s","target":"%s","port":%s,"dscp":"%s","sender_bw":"%s","receiver_bw":"%s","rtt_avg_ms":"%s","loss_pct":"%s","status":"%s"}' \
+            "$sn" \
+            "$r_proto" \
+            "$safe_tgt" \
+            "$r_port" \
+            "$safe_dscp" \
+            "$safe_sbw" \
+            "$safe_rbw" \
+            "$r_rtt_avg" \
+            "$r_loss" \
+            "$r_status")
+    done
+    results_json+="]"
+
+    # ------------------------------------------------------------------
+    # Assemble the full JSON record (single line)
+    # ------------------------------------------------------------------
+    local json_record
+    json_record=$(printf \
+        '{"id":"%s","name":"%s","tags":%s,"note":"%s","started":%s,"finished":%s,"host":"%s","user":"%s","os":"%s","iperf3":"%s","iperf3_bin":"%s","mode":"%s","streams":%d,"results":%s}' \
+        "$SESSION_ID" \
+        "$safe_name" \
+        "$tags_json" \
+        "$safe_note" \
+        "$SESSION_RUN_TS" \
+        "$finished_ts" \
+        "$safe_host" \
+        "${USER:-unknown}" \
+        "$safe_os" \
+        "$iperf3_ver" \
+        "$safe_bin" \
+        "$mode" \
+        "$STREAM_COUNT" \
+        "$results_json")
+
+    # ------------------------------------------------------------------
+    # Write to history file
+    # Creates the directory and file if they don't exist.
+    # Appends one JSON line per session (JSON Lines format).
+    # ------------------------------------------------------------------
+    local history_dir
+    history_dir=$(dirname "$SESSION_HISTORY_FILE")
+    mkdir -p "$history_dir" 2>/dev/null
+
+    if printf '%s\n' "$json_record" >> "$SESSION_HISTORY_FILE" 2>/dev/null; then
+        printf '%b  Session history saved → %s%b\n' \
+            "$DIM" "$SESSION_HISTORY_FILE" "$NC"
+    else
+        printf '%b  WARNING: Could not write session history to %s%b\n' \
+            "$YELLOW" "$SESSION_HISTORY_FILE" "$NC"
+    fi
+}
+
+# ==============================================================================
+# _print_session_name_header
+#
+# Renders the session name, tags, and note as a header block inside the
+# standard PRISM box style. Called at the top of display_results_table()
+# and in all mode summary headers when a session name has been set.
+#
+# Only renders when SESSION_NAME is non-empty and differs from SESSION_ID
+# (i.e. the operator actually provided a meaningful name).
+# Always renders the ID even for unnamed sessions so logs are traceable.
+# ==============================================================================
+_print_session_name_header() {
+    local inner=$(( COLS - 2 ))
+
+    printf '+%s+\n' "$(rpt '=' $inner)"
+
+    # ------------------------------------------------------------------
+    # ID line — always shown
+    # ------------------------------------------------------------------
+    local id_str="Session  ${CYAN}${BOLD}${SESSION_ID}${NC}"
+    [[ -n "$SESSION_NAME" && "$SESSION_NAME" != "$SESSION_ID" ]] && \
+        id_str+="  ${DIM}→${NC}  ${BOLD}${SESSION_NAME}${NC}"
+
+    local id_vlen
+    id_vlen=$(_visible_len "$id_str")
+    local id_lpad=2
+    local id_rpad=$(( inner - id_lpad - id_vlen ))
+    [[ $id_rpad -lt 0 ]] && id_rpad=0
+    printf "|%s%b%s|\n" \
+        "$(rpt ' ' $id_lpad)" "$id_str" "$(rpt ' ' $id_rpad)"
+
+    # ------------------------------------------------------------------
+    # Tags line — only when tags are set
+    # ------------------------------------------------------------------
+    if [[ -n "$SESSION_TAGS" ]]; then
+        local tags_str="${DIM}Tags:${NC} "
+        local t
+        local IFS_SAVE="$IFS"
+        IFS=' '
+        local -a t_arr
+        read -ra t_arr <<< "$SESSION_TAGS"
+        IFS="$IFS_SAVE"
+        for t in "${t_arr[@]}"; do
+            tags_str+="${CYAN}[${t}]${NC} "
+        done
+        local tags_vlen
+        tags_vlen=$(_visible_len "$tags_str")
+        local tags_rpad=$(( inner - 2 - tags_vlen ))
+        [[ $tags_rpad -lt 0 ]] && tags_rpad=0
+        printf "|  %b%s|\n" "$tags_str" "$(rpt ' ' $tags_rpad)"
+    fi
+
+    # ------------------------------------------------------------------
+    # Note line — only when note is set
+    # ------------------------------------------------------------------
+    if [[ -n "$SESSION_NOTE" ]]; then
+        local note_str="${DIM}Note:${NC}  ${SESSION_NOTE}"
+        # Truncate if note is too long for the box
+        local note_vlen
+        note_vlen=$(_visible_len "$note_str")
+        local note_max=$(( inner - 4 ))
+        if (( note_vlen > note_max )); then
+            # Truncate the raw note text, then rebuild
+            local trunc_len=$(( ${#SESSION_NOTE} - (note_vlen - note_max) - 1 ))
+            [[ $trunc_len -lt 0 ]] && trunc_len=0
+            note_str="${DIM}Note:${NC}  ${SESSION_NOTE:0:$trunc_len}~"
+            note_vlen=$(_visible_len "$note_str")
+        fi
+        local note_rpad=$(( inner - 2 - note_vlen ))
+        [[ $note_rpad -lt 0 ]] && note_rpad=0
+        printf "|  %b%s|\n" "$note_str" "$(rpt ' ' $note_rpad)"
+    fi
+
+    printf '+%s+\n' "$(rpt '=' $inner)"
+    printf '\n'
+}
+
+# ==============================================================================
 # CAPABILITY MATRIX GLOBALS
 # Populated by _check_capabilities() at startup.
 # Values are ANSI-colored strings used directly in the TUI renderer.
@@ -9456,6 +10050,7 @@ display_results_table() {
     echo ""
     print_header "PRISM — Final Results"
     _print_session_header "Final Results"
+    _print_session_name_header
     echo ""
 
     # ── Fixed column widths for results table ─────────────────────────────
@@ -11220,6 +11815,7 @@ run_mixed_traffic_mode() {
     _mtp_show_summary
 
     confirm_proceed "Launch ${STREAM_COUNT} mixed traffic stream(s)?" || return 0
+    _prompt_session_name
 
     # ── Step 6: Pre-flight, MTU discovery, and launch ─────────────────────
     apply_netem
@@ -11265,6 +11861,7 @@ run_mixed_traffic_mode() {
 
     parse_final_results
     display_results_table
+    _session_append_history "mtp"
     offer_log_view
 
     local _ci
@@ -11291,7 +11888,7 @@ run_client_mode() {
     configure_client_streams "$n" "" ""
     show_stream_summary "client"
     confirm_proceed "Launch ${n} stream(s)?" || return
-
+    _prompt_session_name
     apply_netem
 
     echo ""
@@ -11342,6 +11939,7 @@ run_client_mode() {
     # Log files are still present at this point for results parsing.
     parse_final_results
     display_results_table
+    _session_append_history "client"
     offer_log_view
 
     # Phase 2: delete log files now that results have been read and displayed
@@ -11428,6 +12026,7 @@ run_loopback_mode() {
 
     show_stream_summary "client"
     confirm_proceed "Launch loopback test?" || return
+    _prompt_session_name
     echo ""; launch_servers; echo ""; wait_for_servers
     echo ""; launch_clients
     echo ""; printf '%b\n' "${GREEN}  Running. Opening dashboard...${NC}"; sleep 1
@@ -11435,6 +12034,7 @@ run_loopback_mode() {
     echo ""
     parse_final_results
     display_results_table
+    _session_append_history "loopback"
     offer_log_view
 
     # Phase 2: delete log files after results are displayed
