@@ -974,3 +974,76 @@ Contains one word: `dark`, `light`, or `mono`. Written when a theme is selected 
 /tmp/iperf3_streams_events.log
 ```
 During a running test, per-stream process cleanup events are written here (since stdout belongs to the dashboard). The file is read and printed to the terminal after the dashboard exits, then deleted.
+
+## Cleanup and Signal Handling
+
+PRISM registers handlers for all common termination signals so that iperf3 processes, ping processes, and tc qdiscs are always cleaned up — even when the operator interrupts the test.
+
+### Signal map
+|  **Signal** |   **Trigger**   |              **PRISM Response**             |
+|:-----------:|:---------------:|:-------------------------------------------:|
+| SIGINT      | Ctrl+C          | Graceful stop: SIGTERM → 3 s wait → SIGKILL |
+| SIGTERM     | kill <pid>      | Same as SIGINT                              |
+| SIGQUIT     | Ctrl+\          | Same as SIGINT                              |
+| SIGHUP      | Terminal closed | Same as SIGINT                              |
+| SIGTSTP     | Ctrl+Z          | Blocked — message printed, no background    |
+| EXIT (trap) | Normal exit     | Runs full cleanup if not already done       |
+
+### Why Ctrl+Z is blocked
+
+Sending **PRISM** to the background would leave iperf3 child processes, ping processes, and `tc tbf` qdiscs running unmanaged. The `SIGTSTP` trap intercepts `Ctrl+Z` and prints a warning instead of suspending. Use `Ctrl+C` to stop cleanly.
+
+### Two-phase stream cleanup
+
+**PRISM** uses a non-blocking two-phase cleanup design so the dashboard remains responsive while streams are being torn down:
+
+| **Phase** |            **When**           |                                                                         **Actions**                                                                        |
+|:---------:|:-----------------------------:|:----------------------------------------------------------------------------------------------------------------------------------------------------------:|
+| Phase A   | Stream reaches DONE or FAILED | Set state to CLEANUP_PENDING, show "CLEANING…" in dashboard                                                                                                |
+| Phase B   | Next dashboard tick           | Kill iperf3 PID → kill ping PID → kill bidir PID → remove netem →  remove tc tbf → clear sparkline buffers → capture ramp snapshot → set  state to CLEANED |
+
+**Phase 2** (file deletion) runs after `display_results_table()` completes, ensuring log files are available for final bandwidth parsing.
+
+### Cleanup output example
+
+```
++======================================================================+
+  PRISM — Cleanup  [signal: SIGINT (Ctrl+C)]
++======================================================================+
+
+  Client Streams:
+    [STOP  ]  PID 12345  stream 1 [TCP->10.0.0.1:5201]
+    [DONE  ]  PID 12346  stream 2 [UDP->10.0.0.1:5004]  (already exited)
+
+  RTT Ping Processes:
+    [STOP  ]  PID 12347  rtt-ping stream 1
+
+  Temporary Files:
+    [DEL]  /tmp/iperf3_streams.Ab3xY9/stream_1.log  (48291 bytes)
+    [REMOVED]  /tmp/iperf3_streams.Ab3xY9
+
+  Processes stopped : 1
+  Already exited    : 1
+  Cleanup complete. All resources released.
++======================================================================+
+```
+
+### JSON export cleanup prompt
+
+On exit, if JSON export files were created during the session, PRISM prompts:
+```
++======================================================================+
+  JSON Export Files — Cleanup
++======================================================================+
+
+  The following JSON results file(s) were created this session:
+
+    /opt/prism/prism_20260425-143022-a3f1.json  (18432 bytes)
+
+  Delete these JSON file(s)?
+    Y  Delete all listed files
+    N  Keep all files  (default — press Enter)
+
+  Choice [N]:
+```
+The default is always **keep** (`N`) to prevent accidental data loss.
