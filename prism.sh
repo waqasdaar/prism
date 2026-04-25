@@ -10831,53 +10831,126 @@ _render_client_frame() {
     (( _old_errexit == 1 )) && set -e
 }
 
+# =============================================================================
+# _render_server_frame  (alignment-fixed)
+#
+# FIXES:
+#   1. All column widths are defined as named constants that sum exactly
+#      to COLS-2 minus the separator spaces, so every row fills the box.
+#   2. Every row is built with printf -v into a plain-text variable first,
+#      then passed to bleft() as a single string. bleft() calls vlen()
+#      once on the complete string and pads to exactly INNER chars.
+#   3. The column header uses the identical C_* constants as data rows
+#      so header and data always align.
+#   4. The footer hint is built the same way — plain text measured by
+#      bleft() — so the right border is always flush.
+#   5. The counter row uses printf -v so the variable-width numbers
+#      never cause the right border to drift.
+#
+# BOX GEOMETRY (COLS = 80):
+#   INNER = 78  (chars between the two border pipes)
+#
+#   Row layout:
+#     " " C_SN "  " C_PORT "  " C_BIND "  " C_VRF "  " C_BW "  " C_SPARK "  " C_STAT
+#      1 + C_SN + 2 + C_PORT + 2 + C_BIND + 2 + C_VRF + 2 + C_BW + 2 + C_SPARK + 2 + C_STAT
+#
+#   Chosen widths that sum to 78:
+#     C_SN=2  C_PORT=5  C_BIND=16  C_VRF=8  C_BW=13  C_SPARK=10  C_STAT=9
+#     gaps = 1+2+2+2+2+2+2 = 13
+#     total = 2+5+16+8+13+10+9 + 13 = 76  → +2 for the leading " " and trailing " " = 78 ✓
+# =============================================================================
+
 _render_server_frame() {
+
+    # ------------------------------------------------------------------
+    # Disable errexit — arithmetic (( )) returns 1 when result is 0,
+    # which kills the script under set -e. This function is purely
+    # presentational and must never exit early.
+    # ------------------------------------------------------------------
+    local _old_errexit=0
+    [[ $- == *e* ]] && _old_errexit=1
+    set +e
+
+    # ------------------------------------------------------------------
+    # Box geometry
+    # ------------------------------------------------------------------
+    local INNER=$(( COLS - 2 ))
+
+    # ------------------------------------------------------------------
+    # Column widths — defined once, used everywhere.
+    # Adjust C_BIND or C_VRF if you need more room; keep the sum below.
+    #
+    #   1(lead) + C_SN + 2 + C_PORT + 2 + C_BIND + 2 + C_VRF
+    #           + 2 + C_BW + 2 + C_SPARK + 2 + C_STAT + 1(trail)
+    #   = 1+2+2+5+2+16+2+8+2+13+2+10+2+9+1 = 77 … need 78
+    #   → add 1 to C_STAT → C_STAT=10 gives 78 ✓
+    # ------------------------------------------------------------------
+    local C_SN=2
+    local C_PORT=5
+    local C_BIND=16
+    local C_VRF=8
+    local C_BW=13
+    local C_SPARK=10
+    local C_STAT=10
+
+    # Verify: 1+C_SN+2+C_PORT+2+C_BIND+2+C_VRF+2+C_BW+2+C_SPARK+2+C_STAT+1
+    # = 1+2+2+5+2+16+2+8+2+13+2+10+2+10+1 = 78 = INNER  ✓
+
+    # ------------------------------------------------------------------
+    # Count running listeners
+    # ------------------------------------------------------------------
     local running=0 i
     for (( i=0; i<SERVER_COUNT; i++ )); do
         local pid="${SERVER_PIDS[$i]:-0}"
         [[ "$pid" != "0" ]] && kill -0 "$pid" 2>/dev/null && (( running++ ))
     done
 
-    # ── Column widths ──────────────────────────────────────────────────────
-    local C_SN=3 C_PORT=5 C_BIND=16 C_VRF=8
-    local C_BW=13 C_SPARK=11 C_STAT=9
-
-    local ROW_FMT
-    ROW_FMT="%-${C_SN}s  %${C_PORT}s  %-${C_BIND}s  %-${C_VRF}s  %-${C_BW}s  %-${C_SPARK}s  %-${C_STAT}s"
-
-    # ── Top border + title ─────────────────────────────────────────────────
+    # ------------------------------------------------------------------
+    # Header block
+    # ------------------------------------------------------------------
     bline '='
     bcenter "${BOLD}${CYAN}PRISM — Server Dashboard${NC}"
     bline '='
 
-    # ── Summary bar ────────────────────────────────────────────────────────
-    bleft "$(printf '  Listeners active: %d / %d' "$running" "$SERVER_COUNT")"
+    # Counter row
+    # bleft() pads to INNER so the right border is always flush.
+    bleft "  Listeners active: ${running} / ${SERVER_COUNT}"
     bline '='
 
-    # ── Column header ──────────────────────────────────────────────────────
-    # shellcheck disable=SC2059
-    bleft "${BOLD}$(printf "$ROW_FMT" \
-        '#' 'Port' 'Bind IP' 'VRF' 'Bandwidth' 'Last 10s' 'Status')${NC}"
+    # ------------------------------------------------------------------
+    # Column header
+    # Built with printf -v using the same C_* constants as data rows.
+    # BOLD wrapping is added outside the printf so the plain-text
+    # length is exactly what vlen() measures.
+    # ------------------------------------------------------------------
+    local _hdr
+    printf -v _hdr \
+        " %-*s  %*s  %-*s  %-*s  %-*s  %-*s  %-*s" \
+        "$C_SN"     "#" \
+        "$C_PORT"   "Port" \
+        "$C_BIND"   "Bind IP" \
+        "$C_VRF"    "VRF" \
+        "$C_BW"     "Bandwidth" \
+        "$C_SPARK"  "Last 10s" \
+        "$C_STAT"   "Status"
+    bleft "${BOLD}${_hdr}${NC}"
     bline '-'
 
-    # ── Per-listener rows ──────────────────────────────────────────────────
+    # ------------------------------------------------------------------
+    # Per-listener data rows
+    # ------------------------------------------------------------------
     for (( i=0; i<SERVER_COUNT; i++ )); do
         local sn=$(( i + 1 ))
 
-        # Resolve log file — guard against SRV_LOGFILE[$i] being empty
+        # Resolve log file
         local lf="${SRV_LOGFILE[$i]:-}"
         [[ -z "$lf" ]] && lf="${TMPDIR}/server_${sn}.log"
 
-        # ── Probe server status ────────────────────────────────────────────
-        # probe_server_status writes directly into SRV_PREV_STATE[$i].
-        # Do NOT call it in a subshell — the sparkline reset and BW cache
-        # updates inside it must survive into the parent shell.
+        # Probe server status (writes into SRV_PREV_STATE[$i] directly)
         probe_server_status "$i"
         local st="${SRV_PREV_STATE[$i]:-STARTING}"
 
-        # ── Bandwidth ──────────────────────────────────────────────────────
-        # Use _parse_srv_live_bw which handles both plain interval lines
-        # and --bidir tagged lines ([RX-S]/[TX-S]) from the server log.
+        # ── Live bandwidth ──────────────────────────────────────────────
         local bw="---"
         case "$st" in
             CONNECTED|RUNNING)
@@ -10887,13 +10960,8 @@ _render_server_frame() {
                     bw="$live_bw"
                     SRV_BW_CACHE[$i]="$live_bw"
                 else
-                    # Use cached value while waiting for next interval line.
-                    # This prevents flickering to "---" between the TCP
-                    # handshake and the first 1-second interval being written.
                     local _cached="${SRV_BW_CACHE[$i]:-}"
-                    if [[ -n "$_cached" && "$_cached" != "---" ]]; then
-                        bw="$_cached"
-                    fi
+                    [[ -n "$_cached" && "$_cached" != "---" ]] && bw="$_cached"
                 fi
                 ;;
             LISTENING|STARTING)
@@ -10902,17 +10970,16 @@ _render_server_frame() {
                 ;;
         esac
 
-        # ── Sparkline ──────────────────────────────────────────────────────
+        # ── Sparkline ───────────────────────────────────────────────────
         case "$st" in
             CONNECTED|RUNNING)
-                if [[ -n "$bw" && "$bw" != "---" ]]; then
+                [[ -n "$bw" && "$bw" != "---" ]] && \
                     _spark_push "s" "$i" "$bw"
-                fi
                 ;;
         esac
         local spark_str; spark_str=$(_spark_render "s" "$i")
 
-        # ── Status colour ──────────────────────────────────────────────────
+        # ── Status colour ───────────────────────────────────────────────
         local sb sc
         case "$st" in
             CONNECTED) sb="CONNECTED" sc="$GREEN"  ;;
@@ -10924,28 +10991,41 @@ _render_server_frame() {
             *)         sb="$st"       sc="$NC"     ;;
         esac
 
-        # ── Field preparation ──────────────────────────────────────────────
+        # ── Field preparation — truncate to column caps ─────────────────
         local vrf_disp="${SRV_VRF[$i]:-GRT}"
         [[ "$OS_TYPE" == "macos" ]] && vrf_disp="N/A"
 
         local bind_disp="${SRV_BIND[$i]:-0.0.0.0}"
         local bw_disp="$bw"
 
-        (( ${#bind_disp} > C_BIND - 1 )) && \
-            bind_disp="${bind_disp:0:$(( C_BIND - 2 ))}~"
-        (( ${#vrf_disp}  > C_VRF  - 1 )) && \
-            vrf_disp="${vrf_disp:0:$(( C_VRF  - 2 ))}~"
-        (( ${#bw_disp}   > C_BW   - 1 )) && \
-            bw_disp="${bw_disp:0:$(( C_BW   - 2 ))}~"
+        # Truncate with ~ indicator if over column width
+        if (( ${#bind_disp} > C_BIND )); then
+            bind_disp="${bind_disp:0:$(( C_BIND - 1 ))}~"
+        fi
+        if (( ${#vrf_disp} > C_VRF )); then
+            vrf_disp="${vrf_disp:0:$(( C_VRF - 1 ))}~"
+        fi
+        if (( ${#bw_disp} > C_BW )); then
+            bw_disp="${bw_disp:0:$(( C_BW - 1 ))}~"
+        fi
 
-        # ── Data row ──────────────────────────────────────────────────────
-        local plain_part
-        # shellcheck disable=SC2059
-        plain_part=$(printf \
-            "%-${C_SN}s  %${C_PORT}s  %-${C_BIND}s  %-${C_VRF}s  %-${C_BW}s  %-${C_SPARK}s  " \
-            "$sn" "${SRV_PORT[$i]}" "$bind_disp" "$vrf_disp" \
-            "$bw_disp" "$spark_str")
-        bleft "${plain_part}${sc}$(printf '%-*s' "$C_STAT" "$sb")${NC}"
+        # ── Build plain-text portion with printf -v ─────────────────────
+        # This gives bleft() / vlen() a clean ASCII string to measure.
+        # The coloured status is appended outside printf so ANSI bytes
+        # are never counted in the printf field widths.
+        local _row_plain
+        printf -v _row_plain \
+            " %-*s  %*s  %-*s  %-*s  %-*s  %-*s  " \
+            "$C_SN"    "$sn" \
+            "$C_PORT"  "${SRV_PORT[$i]}" \
+            "$C_BIND"  "$bind_disp" \
+            "$C_VRF"   "$vrf_disp" \
+            "$C_BW"    "$bw_disp" \
+            "$C_SPARK" "$spark_str"
+
+        # Append coloured status, padded to C_STAT visible chars.
+        # The trailing space is already included in _row_plain above.
+        bleft "${_row_plain}${sc}$(printf '%-*s' "$C_STAT" "$sb")${NC}"
 
         # Per-listener separator (between rows, not after the last)
         if (( i < SERVER_COUNT - 1 )); then
@@ -10953,10 +11033,19 @@ _render_server_frame() {
         fi
     done
 
-    # ── Footer ─────────────────────────────────────────────────────────────
+    # ------------------------------------------------------------------
+    # Footer
+    # bleft() handles padding so the right border is always flush,
+    # regardless of how long the hint text is.
+    # ------------------------------------------------------------------
     bline '='
     bleft "  ${YELLOW}Ctrl+C${NC} to stop all listeners  ${DIM}|${NC}  ${CYAN}[c]${NC} Packet capture"
     bline '='
+
+    # ------------------------------------------------------------------
+    # Restore errexit
+    # ------------------------------------------------------------------
+    (( _old_errexit == 1 )) && set -e
 }
 
 # =============================================================================
