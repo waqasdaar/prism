@@ -182,3 +182,23 @@ manager, no virtual environment is required.
 git clone https://github.com/waqasdaar/prism.git
 cd prism
 ```
+### Step 2 — Make the script executable
+
+```bash
+chmod +x prism.sh
+```
+### Step 3 — Verify iperf3 is installed
+
+#### Debian / Ubuntu
+```bash
+sudo apt install iperf3
+```
+
+#### RHEL / CentOS / Rocky Linux / Fedora
+```bash
+sudo dnf install iperf3
+```
+#### macOS (Homebrew)
+```bash
+brew install iperf3
+```
