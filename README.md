@@ -459,3 +459,49 @@ PRISM installs a `tc tbf` token bucket filter on the resolved egress interface, 
 ramp ▁▁▂▃▄▅▆▇████████████████████████▇▅▃  ↑ HOLD    cur 498M  tgt 500M
 ```
 The results table displays a frozen snapshot of the complete ramp timeline alongside the final bandwidth summary.
+
+### Use Case 6 — Bidirectional Simultaneous Test
+
+**Scenario:** Measure full-duplex performance on a 10 Gbps link to confirm there is no TX/RX asymmetry or hardware contention.
+
+```
+Menu:       3 — Client Mode
+Streams:    1
+Protocol:   TCP
+Target:     10.10.0.1
+Port:       5201
+Duration:   60
+Bidir:      Yes
+```
+
+Requires **iperf3 ≥ 3.7** on both client and server. PRISM adds `--bidir` to the iperf3 command and displays dedicated TX and RX rows in the dashboard:
+
+```
+1  TCP  ──────────────   5201   9.41 Gbps   ▃▅▇██████   00:42  EF  CONNECTED
+         ↳ 10.10.0.1
+→ TX ─────────────────────────────────────────────────────────────────────────
+← RX     9.38 Gbps   ▃▅▇██████                                    CONNECTED
+    RTT  min  0.210ms  avg  0.234ms  max  0.312ms  jitter  0.021ms  loss  0%
+    cwnd  cur  8192.0KB  min  4096.0KB  max  8192.0KB  avg  7654.3KB
+```
+
+### Use Case 7 — Path MTU Discovery Before a Test
+
+**Scenario:** Identify fragmentation or MTU black holes before running a high-throughput test across a GRE or MPLS tunnel.
+
+**PRISM** automatically runs path MTU discovery as part of the pre-flight sequence using an ICMP binary-search probe with the DF bit set:
+
+```
++==============================================================================+
+|                      Path MTU Discovery Results                              |
++------------------------------------------------------------------------------+
+| Target           | VRF      | Iface MTU  | Path MTU   | Rec MSS  | Status   |
+|------------------|----------|------------|------------|----------|----------|
+| 10.1.1.1         | GRT      | 1500 B     | 1450 B     | 1410 B   | FRAG WARN|
++==============================================================================+
+  ⚠  FRAGMENTATION RISK: Path MTU is 1450 bytes
+     Common causes: MPLS label (+4-20 B), GRE tunnel (+24 B), IPsec ESP
+     Recommended MSS: 1410 bytes  (configure with iperf3 -M 1410)
+```
+
+If critical fragmentation is detected, PRISM prompts before proceeding and recommends the MSS value to pass to iperf3 with `-M`.
