@@ -438,3 +438,24 @@ Port mode:     Auto sequential (from 5201)
 | Custom Per-Class | Specify a different base port for each traffic class.                |
 | Single Port All  | All streams across all classes share one port.                       |
 
+### Use Case 5 — TCP Traffic Ramp-Up Profile
+
+**Scenario:** Simulate a CDN origin gradually increasing throughput to avoid TCP incast on a shared uplink, and observe the congestion window growth curve.
+
+```
+Menu:          3 — Client Mode
+Streams:       1
+Protocol:      TCP
+Target:        203.0.113.50
+Bandwidth:     500M
+Duration:      120
+Ramp-up:       Yes
+  Ramp-up:     20s
+  Ramp-down:   10s
+```
+PRISM installs a `tc tbf` token bucket filter on the resolved egress interface, linearly increases the shaped rate from a floor of 8 Kbps to 500 Mbps over 20 seconds, holds at full rate for the test body, then ramps down over 10 seconds. The live dashboard shows the real-time ramp curve using Unicode block characters and the active phase:
+
+```
+ramp ▁▁▂▃▄▅▆▇████████████████████████▇▅▃  ↑ HOLD    cur 498M  tgt 500M
+```
+The results table displays a frozen snapshot of the complete ramp timeline alongside the final bandwidth summary.
