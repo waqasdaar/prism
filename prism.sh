@@ -2,7 +2,7 @@
 # =============================================================================
 # PRISM — Performance Real-time iPerf3 Stream Manager
 # Enterprise-grade multi-stream traffic orchestration with live QoS dashboard
-# Version: 8.3.9
+# Version: 8.3.9.1
 # Author : Waqas Daar (waqasdaar@gmail.com)
 # =============================================================================
 
@@ -14349,7 +14349,7 @@ show_main_menu() {
     # Title — uses _mh_center with _visible_len so BOLD/NC bytes are
     # excluded from the centering calculation.
     local _title
-    _title="${BOLD}PRISM${NC}  ${DIM}Performance Real-time iPerf3 Stream Manager${NC}  ${BOLD}v8.3.9${NC}"
+    _title="${BOLD}PRISM${NC}  ${DIM}Performance Real-time iPerf3 Stream Manager${NC}  ${BOLD}v8.3.9.1${NC}"
     _mh_center "$_title"
 
     _mh_rule "+" "=" "+"
