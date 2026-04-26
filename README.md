@@ -118,6 +118,7 @@ and stream health in real time.
 | DSCP verification | None | Live tcpdump packet capture overlay |
 | Theme support | None | Dark / Light / Mono terminal themes |
 
+<br><br>
 <img width="1672" height="941" alt="PRISM-UseCases" src="https://github.com/user-attachments/assets/a83f9057-cf3f-4902-b71b-c51ad1d686d1" />
 
 ---
