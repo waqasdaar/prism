@@ -9973,7 +9973,6 @@ _render_completed_panel() {
     (( _tgt_max < 14 )) && _tgt_max=14
     (( _tgt_col_w > _tgt_max )) && _tgt_col_w=$_tgt_max
 
-    printf "\n\n"
     printf '+%s+\033[K\n' "$(rpt '=' $(( COLS - 2 )))"
     bcenter "${BOLD}${CYAN}Completed Streams${NC}"
     printf '+%s+\033[K\n' "$(rpt '=' $(( COLS - 2 )))"
